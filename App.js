@@ -1,4 +1,9 @@
 import React, { useEffect, useState } from 'react';
+<<<<<<< HEAD
+=======
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+>>>>>>> 7800efc ( comit desde la mac con ajustes de diseno sugeridos por limberg)
 import {
   View,
   ActivityIndicator,
@@ -37,6 +42,7 @@ export default function App() {
         setUsuario(null);
       } else {
         setUsuario(user);
+
       }
     } catch (e) {
       console.log('Error al verificar sesión:', e.message);
@@ -73,6 +79,7 @@ export default function App() {
 
       if (!error) await eliminarFormularioLocal(id);
       else console.log('Error al sincronizar:', error.message);
+
     }
 
     contarFormulariosLocales();
@@ -84,6 +91,7 @@ export default function App() {
     await AsyncStorage.removeItem('session');
     setUsuario(null);
     setPlazaSeleccionada(null); // Reinicia la plaza al cerrar sesión
+
   };
 
   if (loading) {
@@ -94,6 +102,7 @@ export default function App() {
     );
   }
 
+<<<<<<< HEAD
   if (!usuario) {
     return <AuthScreen onLogin={setUsuario} />;
   }
@@ -127,6 +136,7 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
+
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
