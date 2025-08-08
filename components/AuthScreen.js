@@ -7,6 +7,8 @@ import {
   StyleSheet,
   Alert,
 } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 
@@ -14,70 +16,94 @@ export default function AuthScreen({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [nombre, setNombre] = useState('');
-  const [esRegistro, setEsRegistro] = useState(false);
+  
+  // forzamos siempre inicio de sesión
+  const esRegistro = false;
 
   const manejarAutenticacion = async () => {
+    const netState = await NetInfo.fetch();
+
+    if (!netState.isConnected) {
+      Alert.alert('Sin conexión', 'Necesitas conexión a internet para autenticarte.');
+      return;
+    }
+
     if (!email || !password || (esRegistro && !nombre)) {
       Alert.alert('Error', 'Completa todos los campos');
       return;
     }
 
-    if (esRegistro) {
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: { nombre }, // guarda en user_metadata
-        },
-      });
-
-      if (error) {
-        Alert.alert('Error', error.message);
-        return;
-      }
-
-      const user = data.user;
-      if (user) {
-        // Guarda en tabla "activadores"
-        await supabase.from('activadores').upsert({
-          id: user.id,
-          nombre,
+    try {
+      if (esRegistro) {
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { data: { nombre } },
         });
-        Alert.alert('✅ Registro exitoso', 'Ahora inicia sesión');
-        setEsRegistro(false); // Cambia a modo login
-        setEmail('');
-        setPassword('');
-        setNombre('');
-      }
-    } else {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
 
-      if (error) {
-        Alert.alert('Error', error.message);
+        if (error) {
+          Alert.alert('Error', error.message);
+          return;
+        }
+
+        const user = data.user;
+        if (user) {
+          await supabase.from('activadores').upsert({
+            usuario_id: user.id,
+            nombre,
+          });
+          Alert.alert('✅ Registro exitoso', 'Ahora inicia sesión');
+        }
       } else {
-        onLogin(data.user);
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+
+        if (error) {
+          Alert.alert('Error', error.message);
+        } else {
+          const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+
+          if (sessionError) {
+            Alert.alert('Error', sessionError.message);
+            return;
+          }
+
+          const usuario = session?.user || data.user;
+
+          const { data: perfil, error: errorPerfil } = await supabase
+            .from('activadores')
+            .select('*')
+            .eq('usuario_id', usuario.id)
+            .single();
+
+          if (errorPerfil) {
+            console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
+          }
+
+          await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify({
+            id: usuario.id,
+            email: usuario.email,
+            nombre: perfil?.nombre || '',
+            plaza: perfil?.plaza || '',
+          }));
+
+          onLogin(usuario);
+        }
       }
+    } catch (err) {
+      Alert.alert('Error crítico', err.message || 'Ocurrió un error inesperado');
+      console.error('Error en autenticación:', err);
     }
   };
 
   return (
     <View style={styles.container}>
-      <Text style={styles.titulo}>
-        {esRegistro ? 'Registro de Usuario' : 'Inicio de Sesión'}
-      </Text>
+      <Text style={styles.titulo}>Inicio de Sesión</Text>
 
-      {esRegistro && (
-        <TextInput
-          style={styles.input}
-          placeholder="Nombre completo"
-          placeholderTextColor={colors.muted}
-          value={nombre}
-          onChangeText={setNombre}
-        />
-      )}
+      {/* no mostramos campo de nombre porque registro está desactivado */}
+      {/* no mostramos botón de alternar a registro */}
 
       <TextInput
         style={styles.input}
@@ -99,16 +125,10 @@ export default function AuthScreen({ onLogin }) {
       />
 
       <TouchableOpacity onPress={manejarAutenticacion} style={styles.boton}>
-        <Text style={styles.botonTexto}>
-          {esRegistro ? 'Registrarse' : 'Iniciar Sesión'}
-        </Text>
+        <Text style={styles.botonTexto}>Iniciar Sesión</Text>
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={() => setEsRegistro(!esRegistro)} style={{ marginTop: spacing.md }}>
-        <Text style={{ color: colors.primary, textAlign: 'center' }}>
-          {esRegistro ? '¿Ya tienes cuenta? Inicia sesión' : '¿No tienes cuenta? Regístrate'}
-        </Text>
-      </TouchableOpacity>
+      {/* se elimina la opción de alternar registro */}
     </View>
   );
 }

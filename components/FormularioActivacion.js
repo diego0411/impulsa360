@@ -19,7 +19,7 @@ const formularioInicial = {
   cash_in: false, cash_out: false, p2p: false, qr_fisico: false,
   hubo_error: false, descripcion_error: '', tipo_activacion: '',
   tamano_tienda: '', tipo_comercio: '', foto_url: '',
-  reactivacion_comercio: false, // nuevo campo
+  reactivacion_comercio: false,
 };
 
 export default function FormularioActivacion({ cantidadOffline, contarFormulariosLocales, onSincronizar, usuario }) {
@@ -76,15 +76,27 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       Alert.alert('Error crítico', `No se pudo procesar la imagen. ${error.message || ''}`);
     }
   };
+  const tiposActivacion = [
+    'Comercio', 'Transeúnte', 'Configuración de Cuenta',
+    'Tienda de Barrio', 'No Habilitado', 'Reactivación de Transeúntes'
+  ];
 
-  const validarFormulario = () => {
+  const tiposComercio = ['Comercio', 'Hogar y Muebles', 'Transporte y Servico', 'Cuidado Personal y Belleza', 'Educación y Entretenimiento', 'Consumo'];
+  const tamanosTienda = ['Grande (Almacén)', 'Mediana (Sobre avenida)', 'Pequeña (En una calle)'];
+
+  const esComercio = formulario.tipo_activacion === 'Comercio';
+  const esTiendaBarrio = formulario.tipo_activacion === 'Tienda de Barrio';
+  const esNoHabilitado = formulario.tipo_activacion === 'No Habilitado';
+  const esReactivacionTrans = formulario.tipo_activacion === 'Reactivación de Transeúntes';
+
+  const guardarFormulario = async () => {
     if (!formulario.nombres_cliente.trim()) return Alert.alert('Campo requerido', 'Ingresa los nombres del cliente.');
     if (!formulario.apellidos_cliente.trim()) return Alert.alert('Campo requerido', 'Ingresa los apellidos del cliente.');
     if (!/^\d{7,8}$/.test(formulario.ci_cliente)) return Alert.alert('Campo inválido', 'La cédula debe tener 7 u 8 números.');
     if (!/^\d{8}$/.test(formulario.telefono_cliente)) return Alert.alert('Campo inválido', 'El teléfono debe tener exactamente 8 números.');
     if (!formulario.tipo_activacion) return Alert.alert('Campo requerido', 'Selecciona el tipo de activación.');
 
-    const tiposRequierenFoto = ['Comercio', 'Configuración de Cuenta', 'Reactivación Comercio', 'Tienda de Barrio', 'No Habilitado'];
+    const tiposRequierenFoto = ['Comercio', 'Configuración de Cuenta', 'Tienda de Barrio', 'No Habilitado'];
     const requiereFoto = tiposRequierenFoto.includes(formulario.tipo_activacion);
     const hayFoto = formulario.foto_url || fotoUri;
 
@@ -92,29 +104,18 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       return Alert.alert('Campo requerido', 'Debes tomar una foto para este tipo de activación.');
     }
 
-    return true;
-  };
-
-  const guardarFormulario = async () => {
-    if (!validarFormulario()) return;
-
     try {
       let latitud = null, longitud = null;
       const { status } = await Location.requestForegroundPermissionsAsync();
-
       if (status === 'granted') {
         const ubicacion = await Location.getCurrentPositionAsync({});
         latitud = ubicacion.coords.latitude;
         longitud = ubicacion.coords.longitude;
-      } else {
-        Alert.alert('Ubicación no habilitada', 'No se pudo obtener la ubicación actual.');
       }
-
-      const fechaActual = new Date().toISOString().split('T')[0];
 
       const datosFormulario = {
         ...formulario,
-        fecha_activacion: fechaActual,
+        fecha_activacion: new Date().toISOString().split('T')[0],
         latitud,
         longitud,
         usuario_id: usuario.id,
@@ -133,19 +134,6 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       Alert.alert('Error', `No se pudo guardar el formulario. ${err.message || ''}`);
     }
   };
-
-  const tiposActivacion = [
-    'Comercio', 'Transeúnte', 'Configuración de Cuenta',
-    'Reactivación Comercio', 'Tienda de Barrio', 'No Habilitado', 'Reactivación de Transeúntes'
-  ];
-
-  const tiposComercio = ['Comercio', 'Hogar y Muebles', 'Transporte y Servico', 'Cuidado Personal y Belleza', 'Educación y Entretenimiento', 'Consumo'];
-  const tamanosTienda = ['Grande (Almacén)', 'Mediana (Sobre avenida)', 'Pequeña (En una calle)'];
-
-  const esComercio = ['Comercio', 'Reactivación Comercio'].includes(formulario.tipo_activacion);
-  const esTiendaBarrio = formulario.tipo_activacion === 'Tienda de Barrio';
-  const esNoHabilitado = formulario.tipo_activacion === 'No Habilitado';
-  const esReactivacionTrans = formulario.tipo_activacion === 'Reactivación de Transeúntes';
 
   return (
     <ScrollView style={styles.container}>
@@ -176,18 +164,10 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
             <Picker.Item label="Seleccionar..." value="" />
             {tamanosTienda.map((tam, i) => <Picker.Item key={i} label={tam} value={tam} />)}
           </Picker>
-
-          <View style={styles.switchRow}>
-            <Text style={styles.label}>Reactivación Comercio</Text>
-            <Switch
-              value={formulario.reactivacion_comercio}
-              onValueChange={(v) => actualizarCampo('reactivacion_comercio', v)}
-              trackColor={{ false: colors.inputBorder, true: colors.primary }}
-            />
-          </View>
         </>
       )}
 
+      {/* Inputs comunes */}
       <Text style={styles.label}>Nombres del Cliente</Text>
       <TextInput style={styles.input} value={formulario.nombres_cliente} onChangeText={(v) => actualizarCampo('nombres_cliente', v)} />
 
@@ -203,6 +183,16 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       <Text style={styles.label}>Correo Electrónico</Text>
       <TextInput style={styles.input} keyboardType="email-address" autoCapitalize="none" value={formulario.email_cliente} onChangeText={(v) => actualizarCampo('email_cliente', v)} />
 
+      {esTiendaBarrio && (
+        <View style={styles.switchRow}>
+          <Text style={styles.label}>REACTIVACIÓN COMERCIO</Text>
+          <Switch
+            value={formulario.reactivacion_comercio}
+            onValueChange={(v) => actualizarCampo('reactivacion_comercio', v)}
+            trackColor={{ false: colors.inputBorder, true: colors.primary }}
+          />
+        </View>
+      )}
       {['descargo_app', 'registro', 'cash_in', 'cash_out'].map(key => {
         if (esNoHabilitado) return null;
         return (
@@ -250,13 +240,11 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
         </>
       )}
 
-      <>
-        <Text style={styles.label}>📷 Imagen</Text>
-        <TouchableOpacity onPress={tomarFotoYSubirImagen} style={[styles.botonMini, { backgroundColor: colors.primary }]}>
-          <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
-        </TouchableOpacity>
-        {fotoUri && <Image source={{ uri: fotoUri }} style={styles.imagenMiniatura} />}
-      </>
+      <Text style={styles.label}>📷 Imagen</Text>
+      <TouchableOpacity onPress={tomarFotoYSubirImagen} style={[styles.botonMini, { backgroundColor: colors.primary }]}>
+        <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
+      </TouchableOpacity>
+      {fotoUri && <Image source={{ uri: fotoUri }} style={styles.imagenMiniatura} />}
 
       <View style={styles.botonesRow}>
         <TouchableOpacity onPress={guardarFormulario} style={[styles.botonMini, { backgroundColor: colors.primary }]}>
