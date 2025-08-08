@@ -1,16 +1,16 @@
 {
   "expo": {
-    "name": "yolov3",
-    "slug": "yolov3",
+    "name": "Impulsa360",
+    "slug": "impulsa360",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "icon": "./assets/icon.png",
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/splash.png",
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#FFFFFF"
     },
     "ios": {
       "supportsTablet": true
@@ -18,7 +18,7 @@
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#FFFFFF"
       },
       "package": "com.diegord.yolov3"
     },
@@ -28,11 +28,11 @@
     "plugins": [
       "expo-sqlite"
     ],
+    "owner": "integrat360",
     "extra": {
       "eas": {
-        "projectId": "a266c3a8-c9e0-4c4a-995b-7c9a17824c83"
+        "projectId": "001c3d4e-a378-4ba9-ac48-27f8c482d88e"
       }
-    },
-    "owner": "integrat360"
+    }
   }
 }

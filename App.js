@@ -1,3 +1,4 @@
+// App.js
 import React, { useEffect, useState } from 'react';
 import {
   View,
@@ -15,7 +16,10 @@ import { colors, spacing, fontSizes } from './styles/theme';
 import AuthScreen from './components/AuthScreen';
 import FormularioActivacion from './components/FormularioActivacion';
 import FormulariosPorImpulsador from './components/FormulariosPorImpulsador';
-import { obtenerFormulariosLocales, eliminarFormularioLocal } from './lib/storage';
+import {
+  obtenerFormulariosLocales,
+  eliminarFormularioLocal,
+} from './lib/storage';
 import { subirImagenASupabase } from './lib/upload';
 
 export default function App() {
@@ -25,8 +29,9 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(null);
   const [verActivaciones, setVerActivaciones] = useState(false);
 
-  // Detectar cambios de conexión
+  // Detectar cambios de conexión + estado inicial
   useEffect(() => {
+    NetInfo.fetch().then(state => setIsConnected(!!state.isConnected));
     const unsubscribe = NetInfo.addEventListener(state => {
       setIsConnected(state.isConnected);
     });
@@ -36,19 +41,23 @@ export default function App() {
   // Verificar sesión una vez detectado el estado de conexión
   useEffect(() => {
     if (isConnected !== null) verificarSesion();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isConnected]);
 
   const verificarSesion = async () => {
     setLoading(true);
     try {
+      // Siempre intenta cargar usuario local primero (útil si tarda la red)
+      const storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
+      if (storedUser) {
+        try {
+          const parsed = JSON.parse(storedUser);
+          if (parsed?.id) setUsuario(parsed);
+        } catch {}
+      }
+
       if (!isConnected) {
-        const storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
-        if (storedUser) {
-          console.debug('📦 Usuario offline cargado:', storedUser);
-          setUsuario(JSON.parse(storedUser));
-        } else {
-          console.warn('⚠️ No se encontró usuario local.');
-        }
+        if (!storedUser) console.warn('⚠️ No se encontró usuario local (offline).');
       } else {
         const { data: { user }, error } = await supabase.auth.getUser();
         if (error || !user) throw new Error(error?.message || 'No user');
@@ -72,7 +81,7 @@ export default function App() {
         await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
       }
     } catch (e) {
-      console.error('❌ Error verificando sesión:', e.message || e);
+      console.error('❌ Error verificando sesión:', e?.message || e);
       setUsuario(null);
     } finally {
       contarFormulariosLocales();
@@ -90,21 +99,39 @@ export default function App() {
       Alert.alert('Sin conexión', 'Conéctate a internet para sincronizar.');
       return;
     }
-
     try {
       const formularios = await obtenerFormulariosLocales();
-      for (const f of formularios) {
-        const { id, ...formulario } = f;
+      if (!formularios.length) {
+        Alert.alert('Sin formularios', 'No hay formularios pendientes.');
+        return;
+      }
 
+      let ok = 0;
+      const errores = [];
+
+      for (const f of formularios) {
+        // En tu storage nuevo puede existir _id_local; mantenemos compatibilidad
+        const localId = f._id_local ?? f.id;
+
+        // Clonamos para no mutar el original
+        const { id: _omit, _id_local, _created_at, _updated_at, _sync, ...formulario } = f;
+
+        // Asegura fecha
         formulario.fecha_activacion ??= new Date().toISOString().split('T')[0];
+        // Limpia campos que no existan en la tabla
         delete formulario.fecha_hora;
 
+        // Sube imagen si quedó file://
         if (formulario.foto_url?.startsWith('file://')) {
-          console.debug(`📷 Subiendo imagen del formulario ${id}`);
-          const url = await subirImagenASupabase(formulario.foto_url);
-          if (url) formulario.foto_url = url;
+          try {
+            const url = await subirImagenASupabase(formulario.foto_url);
+            if (url) formulario.foto_url = url;
+          } catch (e) {
+            console.warn(`⚠️ No se pudo subir foto del formulario ${localId}:`, e?.message || e);
+          }
         }
 
+        // Añade datos del usuario actual
         const datosConUsuario = {
           ...formulario,
           usuario_id: usuario?.id,
@@ -115,18 +142,28 @@ export default function App() {
         const { error } = await supabase.from('activaciones').insert([datosConUsuario]);
 
         if (!error) {
-          await eliminarFormularioLocal(id);
-          console.debug(`✅ Formulario ${id} sincronizado.`);
+          await eliminarFormularioLocal(localId);
+          ok += 1;
+          await contarFormulariosLocales();
         } else {
-          console.error(`❌ Error en formulario ${id}:`, error.message);
+          console.error(`❌ Error en formulario ${localId}:`, error.message);
+          errores.push(`ID local ${localId}: ${error.message}`);
         }
       }
 
-      contarFormulariosLocales();
-      Alert.alert('Sincronización completa', 'Todos los formularios fueron sincronizados.');
+      // Resumen
+      if (errores.length === 0) {
+        Alert.alert('Sincronización completa', `Se sincronizaron ${ok} formulario(s).`);
+      } else if (ok > 0) {
+        Alert.alert('Parcialmente sincronizado', `OK: ${ok}\nErrores: ${errores.length}\n\n${errores.slice(0, 3).join('\n')}${errores.length > 3 ? '\n…' : ''}`);
+      } else {
+        Alert.alert('Sincronización fallida', errores.slice(0, 5).join('\n'));
+      }
     } catch (err) {
-      console.error('❌ Error general al sincronizar:', err.message || err);
+      console.error('❌ Error general al sincronizar:', err?.message || err);
       Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
+    } finally {
+      contarFormulariosLocales();
     }
   };
 
@@ -158,10 +195,12 @@ export default function App() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.bienvenida}>Hola, {usuario.nombre?.split(' ')[0] || 'Usuario'}</Text>
+        <Text style={styles.bienvenida}>
+          Hola, {usuario.nombre?.split(' ')[0] || 'Usuario'}
+        </Text>
         <View style={styles.actionsRow}>
           <TouchableOpacity onPress={() => setVerActivaciones(v => !v)}>
-            <Text style={styles.logout}>
+            <Text style={styles.link}>
               {verActivaciones ? '📝 Volver al Formulario' : '📋 Ver Activaciones'}
             </Text>
           </TouchableOpacity>
@@ -210,6 +249,12 @@ const styles = StyleSheet.create({
     fontSize: fontSizes.medium,
     color: colors.text,
     fontWeight: '600',
+  },
+  link: {
+    color: colors.primary,
+    fontSize: fontSizes.small,
+    fontWeight: '600',
+    marginLeft: spacing.md,
   },
   logout: {
     color: colors.danger,
