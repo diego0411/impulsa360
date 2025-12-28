@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View, Text, FlatList, ActivityIndicator, StyleSheet, RefreshControl, Alert,
-  Modal, TouchableOpacity, Image, ScrollView
+  Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
 } from 'react-native';
 import { supabase } from '../lib/supabase';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
@@ -25,6 +25,9 @@ export default function FormulariosPorImpulsador({ usuario }) {
   const channelRef = useRef(null);
 
   const usuarioId = usuario?.id;
+  const { height } = useWindowDimensions();
+  const modalMaxHeight = Math.min(height * 0.85, 640);
+  const fotoHeight = Math.min(height * 0.35, 260);
 
   const fetchPage = useCallback(async ({ reset = false } = {}) => {
     if (!usuarioId) return;
@@ -222,18 +225,21 @@ export default function FormulariosPorImpulsador({ usuario }) {
         onRequestClose={cerrarDetalle}
       >
         <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
+          <View style={[styles.modalCard, { maxHeight: modalMaxHeight }]}>
             <Text style={styles.modalTitulo}>Detalle de Activación</Text>
 
             {detalleLoading ? (
               <ActivityIndicator size="large" color={colors.primary} />
             ) : detalle ? (
-              <ScrollView style={{ maxHeight: 480 }} showsVerticalScrollIndicator={false}>
+              <ScrollView
+                style={{ maxHeight: Math.max(220, modalMaxHeight - 140) }}
+                showsVerticalScrollIndicator={false}
+              >
                 {/* Foto si hay */}
                 {!!detalle.foto_url && (
                   <Image
                     source={{ uri: detalle.foto_url }}
-                    style={styles.foto}
+                    style={[styles.foto, { height: fotoHeight }]}
                   />
                 )}
 

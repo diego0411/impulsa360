@@ -1,5 +1,5 @@
 // App.js
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   ActivityIndicator,
@@ -7,9 +7,11 @@ import {
   Text,
   Alert,
   StyleSheet,
+  AppState,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import { v4 as uuidv4 } from 'uuid';
 
 import { supabase } from './lib/supabase';
 import { colors, spacing, fontSizes } from './styles/theme';
@@ -19,6 +21,7 @@ import FormulariosPorImpulsador from './components/FormulariosPorImpulsador';
 import {
   obtenerFormulariosLocales,
   eliminarFormularioLocal,
+  actualizarFormularioLocal,
 } from './lib/storage';
 import { subirImagenASupabase } from './lib/upload';
 
@@ -28,6 +31,7 @@ export default function App() {
   const [cantidadOffline, setCantidadOffline] = useState(0);
   const [isConnected, setIsConnected] = useState(null);
   const [verActivaciones, setVerActivaciones] = useState(false);
+  const syncingRef = useRef(false);
 
   // Detectar cambios de conexión + estado inicial
   useEffect(() => {
@@ -42,6 +46,22 @@ export default function App() {
   useEffect(() => {
     if (isConnected !== null) verificarSesion();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isConnected]);
+
+  // Auto-sync al volver a conexión o primer plano
+  useEffect(() => {
+    if (isConnected) {
+      sincronizarFormularios();
+    }
+  }, [isConnected]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && isConnected) {
+        sincronizarFormularios();
+      }
+    });
+    return () => sub.remove();
   }, [isConnected]);
 
   const verificarSesion = async () => {
@@ -95,10 +115,16 @@ export default function App() {
   };
 
   const sincronizarFormularios = async () => {
+    if (syncingRef.current) return;
+    if (!usuario?.id) {
+      Alert.alert('Sesión requerida', 'Vuelve a iniciar sesión antes de sincronizar.');
+      return;
+    }
     if (!isConnected) {
       Alert.alert('Sin conexión', 'Conéctate a internet para sincronizar.');
       return;
     }
+    syncingRef.current = true;
     try {
       const formularios = await obtenerFormulariosLocales();
       if (!formularios.length) {
@@ -108,6 +134,38 @@ export default function App() {
 
       let ok = 0;
       const errores = [];
+      const allowedFields = [
+        'id',
+        'nombres_cliente',
+        'apellidos_cliente',
+        'ci_cliente',
+        'telefono_cliente',
+        'email_cliente',
+        'descargo_app',
+        'registro',
+        'cash_in',
+        'cash_out',
+        'p2p',
+        'qr_fisico',
+        'hubo_error',
+        'descripcion_error',
+        'tipo_activacion',
+        'base_activacion',
+        'es_reactivacion',
+        'tamano_tienda',
+        'tipo_comercio',
+        'foto_url',
+        'foto_respaldo_url',
+        'fecha_activacion',
+        'latitud',
+        'longitud',
+        'reactivacion_comercio',
+        'respaldo',
+        'ciudad_activacion',
+        'zona_activacion',
+        'estado_sync',
+        'dispositivo',
+      ];
 
       for (const f of formularios) {
         // En tu storage nuevo puede existir _id_local; mantenemos compatibilidad
@@ -116,30 +174,64 @@ export default function App() {
         // Clonamos para no mutar el original
         const { id: _omit, _id_local, _created_at, _updated_at, _sync, ...formulario } = f;
 
+        // Asegura id UUID estable
+        const recordId = (formulario.id && typeof formulario.id === 'string' && formulario.id.length > 20)
+          ? formulario.id
+          : uuidv4();
+        if (!formulario.id || formulario.id !== recordId) {
+          formulario.id = recordId;
+          await actualizarFormularioLocal(localId, { id: recordId });
+        }
+
         // Asegura fecha
         formulario.fecha_activacion ??= new Date().toISOString().split('T')[0];
+        formulario.estado_sync ??= 'offline_pending';
         // Limpia campos que no existan en la tabla
         delete formulario.fecha_hora;
 
-        // Sube imagen si quedó file://
-        if (formulario.foto_url?.startsWith('file://')) {
-          try {
-            const url = await subirImagenASupabase(formulario.foto_url);
-            if (url) formulario.foto_url = url;
-          } catch (e) {
-            console.warn(`⚠️ No se pudo subir foto del formulario ${localId}:`, e?.message || e);
+        // Sube imágenes pendientes
+        const fotoKeys = ['foto_url', 'foto_respaldo_url'];
+        for (const key of fotoKeys) {
+          if (formulario[key]?.startsWith?.('file://')) {
+            try {
+              const path = key === 'foto_respaldo_url'
+                ? `activaciones/${recordId}_respaldo.jpg`
+                : `activaciones/${recordId}.jpg`;
+              const storagePath = await subirImagenASupabase(formulario[key], path);
+              if (storagePath) {
+                formulario[key] = storagePath;
+                await actualizarFormularioLocal(localId, { [key]: storagePath });
+              } else {
+                errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
+                continue;
+              }
+            } catch (e) {
+              console.warn(`⚠️ No se pudo subir foto (${key}) del formulario ${localId}:`, e?.message || e);
+              errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
+              continue;
+            }
           }
         }
 
+        // Solo enviamos columnas permitidas para evitar errores de esquema
+        const payload = allowedFields.reduce((acc, key) => {
+          if (formulario[key] !== undefined) acc[key] = formulario[key];
+          return acc;
+        }, {});
+
         // Añade datos del usuario actual
         const datosConUsuario = {
-          ...formulario,
+          ...payload,
+          id: recordId,
           usuario_id: usuario?.id,
           impulsador: usuario?.nombre,
           plaza: usuario?.plaza,
+          estado_sync: 'online',
         };
 
-        const { error } = await supabase.from('activaciones').insert([datosConUsuario]);
+        const { error } = await supabase
+          .from('activaciones')
+          .upsert(datosConUsuario, { onConflict: 'id' });
 
         if (!error) {
           await eliminarFormularioLocal(localId);
@@ -164,6 +256,7 @@ export default function App() {
       Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
     } finally {
       contarFormulariosLocales();
+      syncingRef.current = false;
     }
   };
 

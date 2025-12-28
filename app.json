@@ -2,7 +2,7 @@
   "expo": {
     "name": "Impulsa360",
     "slug": "impulsa360",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
@@ -13,14 +13,15 @@
       "backgroundColor": "#FFFFFF"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.integrat360.impulsa360"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FFFFFF"
       },
-      "package": "com.diegord.yolov3"
+      "package": "ccom.integrat360.impulsa360"
     },
     "web": {
       "favicon": "./assets/favicon.png"

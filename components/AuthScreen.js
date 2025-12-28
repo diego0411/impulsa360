@@ -82,14 +82,15 @@ export default function AuthScreen({ onLogin }) {
             console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
           }
 
-          await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify({
+          const usuarioFinal = {
             id: usuario.id,
             email: usuario.email,
-            nombre: perfil?.nombre || '',
-            plaza: perfil?.plaza || '',
-          }));
+            nombre: (perfil?.nombre || usuario.user_metadata?.nombre || usuario.email || '').trim(),
+            plaza: (perfil?.plaza || '').trim() || 'No especificada',
+          };
 
-          onLogin(usuario);
+          await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+          onLogin(usuarioFinal);
         }
       }
     } catch (err) {

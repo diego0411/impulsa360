@@ -1,45 +1,110 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import {
-  View, Text, TextInput, Alert, ScrollView, Switch, StyleSheet,
-  TouchableOpacity, Image, Dimensions
+  View,
+  Text,
+  TextInput,
+  Alert,
+  ScrollView,
+  Switch,
+  StyleSheet,
+  TouchableOpacity,
+  Image,
+  useWindowDimensions,
+  Platform,
 } from 'react-native';
 import { Picker } from '@react-native-picker/picker';
 import * as Location from 'expo-location';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { v4 as uuidv4 } from 'uuid';
 import { guardarFormularioLocal } from '../lib/storage';
-import { subirImagenASupabase } from '../lib/upload';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
 
-const screenWidth = Dimensions.get('window').width;
+const DEVICE_INFO = `react-native-${Platform.OS}`;
 
-/** TIPOS en el ORDEN solicitado, con metadatos para derivar lógicas */
-const TIPOS_ACTIVACION = [
-  { key: 'comercio',                        label: 'Comercio',                             base: 'comercio',      reactivacion: false },
-  { key: 'reactivacion_comercio',           label: 'Reactivación de comercio',             base: 'comercio',      reactivacion: true  },
-  { key: 'tiendas_barrio',                  label: 'Tiendas de barrio',                    base: 'tienda_barrio', reactivacion: false },
-  { key: 'reactivacion_tiendas_barrio',     label: 'Reactivación de tiendas de barrio',    base: 'tienda_barrio', reactivacion: true  },
-  { key: 'transeuntes',                     label: 'Transeúntes',                          base: 'transeuntes',   reactivacion: false },
-  { key: 'reactivacion_transeuntes',        label: 'Reactivación transeúntes',             base: 'transeuntes',   reactivacion: true  },
-  { key: 'config_cuenta_limbo',             label: 'Configuración de cuenta (limbo)',      base: 'limbo',         reactivacion: false },
-  { key: 'no_habilitado',                   label: 'No habilitado',                        base: 'none',          reactivacion: false },
+const GRUPOS_ACTIVACION = [
+  { key: 'tienda_barrio', label: 'Tiendas de Barrio' },
+  { key: 'mercados', label: 'Mercados' },
+];
+
+const TIPOS_TIENDAS = [
+  { key: 'comercio', label: 'Comercio' },
+  { key: 'no_habilitado', label: 'No habilitado' },
+  { key: 'reactivacion', label: 'Reactivación' },
+  { key: 'config_cuenta', label: 'Configuración de cuenta' },
+  { key: 'reimpresion_qr', label: 'Reimpresión QR' },
+];
+
+const TIPOS_MERCADOS = [
+  { key: 'comercio', label: 'Comercio' },
+  { key: 'reactivacion_comercio', label: 'Reactivación comercio' },
+  { key: 'transeunte', label: 'Transeúnte' },
+  { key: 'reactivacion_transeunte', label: 'Reactivación transeúnte' },
+  { key: 'limbo', label: 'Limbo' },
+  { key: 'no_habilitado', label: 'No habilitado' },
+  { key: 'reimpresion_qr', label: 'Reimpresión QR' },
+];
+
+const TAMANOS_TIENDA = ['Pequeña', 'Mediana', 'Grande'];
+const TIPOS_COMERCIO = ['Comercio', 'Hogar y Muebles', 'Transporte y Servicio', 'Cuidado Personal y Belleza', 'Educación y Entretenimiento', 'Consumo'];
+
+const CIUDADES = [
+  { key: 'santa_cruz', label: 'Santa Cruz', zonas: ['Centro', 'Equipetrol', 'Satelite Norte'] },
+  { key: 'la_paz', label: 'La Paz', zonas: ['Centro', 'Sopocachi', 'Miraflores'] },
+  { key: 'el_alto', label: 'El Alto', zonas: ['Ceja', 'Villa Adela', '16 de Julio'] },
+  { key: 'cochabamba', label: 'Cochabamba', zonas: ['Centro', 'Sarco', 'Queru Queru'] },
 ];
 
 const formularioInicial = {
-  nombres_cliente: '', apellidos_cliente: '', ci_cliente: '',
-  telefono_cliente: '', email_cliente: '',
-  descargo_app: false, registro: false, cash_in: false, cash_out: false,
-  p2p: false, qr_fisico: false,
-  hubo_error: false, descripcion_error: '',
-  /** Guardamos el KEY del tipo de activación (no el label) */
+  tipo_grupo: '',
   tipo_activacion: '',
-  tamano_tienda: '', tipo_comercio: '',
+  id: '',
+  tamano_tienda: '',
+  ciudad_activacion: '',
+  zona_activacion: '',
+  impulsador: '',
+  fecha_activacion: '',
+  nombres_cliente: '',
+  apellidos_cliente: '',
+  ci_cliente: '',
+  telefono_cliente: '',
+  email_cliente: '',
+  descargo_app: false,
+  registro: false,
+  cash_in: false,
+  cash_out: false,
+  p2p: false,
+  qr_fisico: false,
+  respaldo: false,
+  hubo_error: false,
+  descripcion_error: '',
+  latitud: null,
+  longitud: null,
+  base_activacion: '',
+  es_reactivacion: false,
+  foto_respaldo_url: '',
   foto_url: '',
+  estado_sync: 'offline_pending',
+  dispositivo: DEVICE_INFO,
 };
 
-export default function FormularioActivacion({ cantidadOffline, contarFormulariosLocales, onSincronizar, usuario }) {
+export default function FormularioActivacion({
+  cantidadOffline,
+  contarFormulariosLocales,
+  onSincronizar,
+  usuario,
+}) {
   const [formulario, setFormulario] = useState(formularioInicial);
-  const [fotoUri, setFotoUri] = useState(null);
+  const [fotoRespaldo, setFotoRespaldo] = useState(null);
+  const [fotoPrincipal, setFotoPrincipal] = useState(null);
+  const [mostrandoFecha, setMostrandoFecha] = useState(false);
+  const { width } = useWindowDimensions();
+  const imagenComercioWidth = Math.max(200, Math.min(width - spacing.lg * 2, 720));
+  const imagenComercioHeight = Math.round(imagenComercioWidth / (16 / 9));
+  const botonShadow = Platform.OS === 'web'
+    ? { boxShadow: '0px 2px 6px rgba(0,0,0,0.3)' }
+    : shadow.base;
 
   if (!usuario || !usuario.id) {
     return <Text style={{ padding: 20, color: colors.text }}>Cargando usuario...</Text>;
@@ -49,73 +114,83 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
     setFormulario(prev => ({ ...prev, [campo]: valor }));
   };
 
-  /** Helpers derivados del tipo seleccionado */
-  const tipoActual = TIPOS_ACTIVACION.find(t => t.key === formulario.tipo_activacion) || null;
-  const esReactivacion = !!tipoActual?.reactivacion;
-  const base = tipoActual?.base || null;
+  const tiposDisponibles = formulario.tipo_grupo === 'tienda_barrio' ? TIPOS_TIENDAS
+    : formulario.tipo_grupo === 'mercados' ? TIPOS_MERCADOS
+    : [];
 
-  const esComercio = base === 'comercio' && !esReactivacion;
-  const esReactivacionComercio = base === 'comercio' && esReactivacion;
+  const tipoSeleccionado = tiposDisponibles.find(t => t.key === formulario.tipo_activacion) || null;
 
-  const esTiendaBarrio = base === 'tienda_barrio' && !esReactivacion;
-  const esReactivacionTiendaBarrio = base === 'tienda_barrio' && esReactivacion;
+  const ciudadSeleccionada = useMemo(
+    () => CIUDADES.find(c => c.key === formulario.ciudad_activacion) || null,
+    [formulario.ciudad_activacion],
+  );
+  const zonasDisponibles = ciudadSeleccionada?.zonas || [];
 
-  const esTranseuntes = base === 'transeuntes' && !esReactivacion;
-  const esReactivacionTranseuntes = base === 'transeuntes' && esReactivacion;
+  const baseActivacionPreview = useMemo(() => {
+    if (formulario.tipo_grupo === 'tienda_barrio') return 'tienda_barrio';
+    switch (formulario.tipo_activacion) {
+      case 'comercio':
+      case 'reactivacion_comercio':
+        return 'comercio';
+      case 'transeunte':
+      case 'reactivacion_transeunte':
+        return 'transeunte';
+      case 'limbo':
+        return 'limbo';
+      case 'no_habilitado':
+      case 'reimpresion_qr':
+      default:
+        return 'none';
+    }
+  }, [formulario.tipo_grupo, formulario.tipo_activacion]);
 
-  const esNoHabilitado = tipoActual?.key === 'no_habilitado';
-  const esLimbo = tipoActual?.key === 'config_cuenta_limbo';
+  const requiereTipoComercio =
+    (formulario.tipo_grupo === 'tienda_barrio' && ['comercio', 'reactivacion'].includes(formulario.tipo_activacion)) ||
+    baseActivacionPreview === 'comercio';
 
-  const tiposComercio = ['Comercio', 'Hogar y Muebles', 'Transporte y Servicio', 'Cuidado Personal y Belleza', 'Educación y Entretenimiento', 'Consumo'];
-  const tamanosTienda = ['Grande (Almacén)', 'Mediana (Sobre avenida)', 'Pequeña (En una calle)'];
+  const requiereTamano = formulario.tipo_grupo === 'tienda_barrio'
+    && ['comercio', 'reactivacion'].includes(formulario.tipo_activacion);
 
-  /** Limpieza automática al cambiar de tipo */
+  const requiereFotos = formulario.tipo_activacion
+    && !['transeunte', 'reactivacion_transeunte'].includes(formulario.tipo_activacion);
+
+  const onGrupoChange = (grupo) => {
+    setFormulario(prev => ({
+      ...prev,
+      tipo_grupo: grupo,
+      tipo_activacion: '',
+      tamano_tienda: '',
+    }));
+  };
+
   const onTipoActivacionChange = (key) => {
-    const nuevo = TIPOS_ACTIVACION.find(t => t.key === key);
-    const newBase = nuevo?.base || null;
+    setFormulario(prev => ({
+      ...prev,
+      tipo_activacion: key,
+    }));
+  };
 
-    setFormulario(prev => {
-      const prevTipo = TIPOS_ACTIVACION.find(t => t.key === prev.tipo_activacion);
-      const prevBase = prevTipo?.base || null;
-      const cambiaDeGrupo = newBase !== prevBase;
+  // Auto-set de datos provenientes del usuario y fecha actual
+  useEffect(() => {
+    const hoy = new Date().toISOString().split('T')[0];
+    setFormulario(prev => ({
+      ...prev,
+      fecha_activacion: prev.fecha_activacion || hoy,
+      impulsador: prev.impulsador || usuario?.nombre || '',
+      ciudad_activacion: prev.ciudad_activacion || usuario?.plaza || '',
+    }));
+  }, [usuario]);
 
-      // reset comunes si es "no_habilitado"
-      const resetIfNoHabilitado = key === 'no_habilitado'
-        ? {
-            descargo_app: false,
-            registro: false,
-            cash_in: false,
-            cash_out: false,
-            qr_fisico: false,
-            p2p: false,
-          }
-        : {};
-
-      return {
-        ...prev,
-        tipo_activacion: key,
-
-        // Limpia campos dependientes si cambias de grupo
-        tipo_comercio: (newBase === 'comercio' && prevBase === 'comercio') ? prev.tipo_comercio : '',
-        tamano_tienda: (newBase === 'tienda_barrio' && prevBase === 'tienda_barrio') ? prev.tamano_tienda : '',
-
-        // Si el nuevo tipo oculta QR, apágalo
-        qr_fisico: (key === 'reactivacion_transeuntes' || key === 'no_habilitado') ? false : (resetIfNoHabilitado.qr_fisico ?? prev.qr_fisico),
-
-        // Limpia foto si cambias de grupo (evita datos colgados)
-        foto_url: cambiaDeGrupo ? '' : prev.foto_url,
-        ...resetIfNoHabilitado,
-      };
-    });
-
-    // si cambiamos de grupo, limpia también la miniatura local
-    const prevBase = (TIPOS_ACTIVACION.find(t => t.key === formulario.tipo_activacion)?.base) || null;
-    if ((nuevo?.base || null) !== prevBase) {
-      setFotoUri(null);
+  const resetFotosSiNoSeUsan = () => {
+    if (!requiereFotos) {
+      setFotoRespaldo(null);
+      setFotoPrincipal(null);
+      actualizarCampo('foto_respaldo_url', '');
+      actualizarCampo('foto_url', '');
     }
   };
 
-  const tomarFotoYSubirImagen = async () => {
+  const tomarFoto = async (setter, fieldName) => {
     try {
       const camPerm = await ImagePicker.requestCameraPermissionsAsync();
       if (camPerm.status !== 'granted') {
@@ -123,9 +198,10 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       }
 
       const result = await ImagePicker.launchCameraAsync({
+        // MediaTypeOptions es la opción estable; MediaType puede no estar definido en ciertas versiones
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         quality: 0.5,
-        allowsEditing: true
+        allowsEditing: true,
       });
 
       if (result.canceled) return;
@@ -140,63 +216,80 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
         const info = await FileSystem.getInfoAsync(uri, { size: true });
         sizeMB = info?.size ? Number(info.size) / 1024 / 1024 : 0;
       } catch {
-        // en Android a veces no viene size; seguimos
+        // en algunos dispositivos no retorna size; continuamos
       }
 
-      if (sizeMB > 3) {
-        return Alert.alert('❌ Imagen demasiado grande', 'Por favor, intenta tomar una foto más liviana (≤ 3 MB).');
+      if (sizeMB > 6) {
+        return Alert.alert('❌ Imagen demasiado grande', 'Intenta una foto más liviana (≤ 6 MB).');
       }
 
-      setFotoUri(uri);
-      actualizarCampo('foto_url', uri);
+      setter(uri);
+      actualizarCampo(fieldName, uri);
 
-      const url = await subirImagenASupabase(uri);
-      if (url) {
-        actualizarCampo('foto_url', url);
-        Alert.alert('✅ Imagen subida correctamente');
-      } else {
-        console.warn('⚠️ No se pudo subir la imagen ahora. Se usará URI local para sincronizar luego.');
-      }
     } catch (error) {
       console.error('❌ Error al tomar o subir imagen:', error);
       Alert.alert('Error crítico', `No se pudo procesar la imagen. ${error?.message || ''}`);
     }
   };
 
-  const validar = () => {
-    if (!formulario.nombres_cliente.trim()) return 'Ingresa los nombres del cliente.';
-    if (!formulario.apellidos_cliente.trim()) return 'Ingresa los apellidos del cliente.';
-    if (!/^\d{7,9}$/.test(formulario.ci_cliente)) return 'La cédula debe tener 7 a 9 números.';
-    if (!/^\d{8}$/.test(formulario.telefono_cliente)) return 'El teléfono debe tener exactamente 8 números.';
-    if (!formulario.tipo_activacion) return 'Selecciona el tipo de activación.';
+  const validar = (data = formulario) => {
+    const impulsadorActual = data.impulsador || usuario?.nombre || '';
+    if (!data.tipo_grupo) return 'Selecciona el tipo de activación (Tiendas de Barrio o Mercados).';
+    if (!data.tipo_activacion) return 'Selecciona el tipo de activación específico.';
+    if (!data.ciudad_activacion) return 'Selecciona la ciudad de activación.';
+    if (!data.zona_activacion) return 'Selecciona la zona de activación.';
+    if (!impulsadorActual) return 'No se pudo obtener el nombre del activador.';
 
-    // Validación suave de email si viene algo escrito
-    if (formulario.email_cliente && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formulario.email_cliente)) {
-      return 'El correo no parece válido.';
+    if (!data.nombres_cliente.trim()) return 'Ingresa los nombres del cliente.';
+    if (!data.apellidos_cliente.trim()) return 'Ingresa los apellidos del cliente.';
+    if (!/^\d{7,9}$/.test(data.ci_cliente)) return 'La cédula debe tener 7 a 9 números.';
+    if (!/^\d{8}$/.test(data.telefono_cliente)) return 'El teléfono debe tener exactamente 8 números.';
+    if (data.email_cliente && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email_cliente)) return 'El correo no parece válido.';
+
+    if (requiereTamano && !data.tamano_tienda) {
+      return 'Selecciona el tamaño de la tienda.';
     }
-
-    // Reglas de foto: comercio/tienda/limbo/no_habilitado requieren foto
-    const requiereFoto = ['comercio', 'tienda_barrio', 'config_cuenta_limbo', 'no_habilitado'].includes(tipoActual?.key || '');
-    const hayFoto = formulario.foto_url || fotoUri;
-    if (requiereFoto && !hayFoto) return 'Debes tomar una foto para este tipo de activación.';
-
-    // Reglas específicas por base
-    if ((esComercio || esReactivacionComercio) && !formulario.tipo_comercio) {
+    if (requiereTipoComercio && !data.tipo_comercio) {
       return 'Selecciona el tipo de comercio.';
     }
-    if ((esTiendaBarrio || esReactivacionTiendaBarrio) && !formulario.tamano_tienda) {
-      return 'Selecciona el tamaño de la tienda.';
+
+    if (!data.fecha_activacion) {
+      return 'No se pudo obtener la fecha de activación.';
+    }
+
+    if (requiereFotos && Platform.OS !== 'web') {
+      if (!data.foto_url && !fotoPrincipal) return 'Debes cargar la foto principal (QR/comercio).';
+      if (!data.foto_respaldo_url && !fotoRespaldo) return 'Debes cargar la foto de respaldo del activador.';
     }
 
     return null;
   };
 
   const guardarFormulario = async () => {
-    const errorMsg = validar();
-    if (errorMsg) return Alert.alert('Campo requerido', errorMsg);
+    // Asegura fecha e id si no están seteados (fallback a hoy)
+    const fecha = formulario.fecha_activacion || new Date().toISOString().split('T')[0];
+    const formId = formulario.id || uuidv4();
+    const formularioConBasicos = {
+      ...formulario,
+      fecha_activacion: fecha,
+      id: formId,
+      impulsador: formulario.impulsador || usuario?.nombre || '',
+    };
+    if (!formulario.fecha_activacion || !formulario.id) {
+      setFormulario(prev => ({ ...prev, fecha_activacion: fecha, id: formId }));
+    }
+
+    const errorMsg = validar(formularioConBasicos);
+    if (errorMsg) {
+      Alert.alert('Campo requerido', errorMsg);
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        window.alert(errorMsg);
+      }
+      return;
+    }
 
     try {
-      let latitud = null, longitud = null;
+      let latitud = null; let longitud = null;
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status === 'granted') {
         const ubicacion = await Location.getCurrentPositionAsync({});
@@ -204,138 +297,229 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
         longitud = ubicacion.coords.longitude;
       }
 
+      const baseActivacion = (() => {
+        if (formularioConBasicos.tipo_grupo === 'tienda_barrio') return 'tienda_barrio';
+        switch (formularioConBasicos.tipo_activacion) {
+          case 'comercio':
+          case 'reactivacion_comercio':
+            return 'comercio';
+          case 'transeunte':
+          case 'reactivacion_transeunte':
+            return 'transeunte';
+          case 'limbo':
+            return 'limbo';
+          case 'no_habilitado':
+          case 'reimpresion_qr':
+          default:
+            return 'none';
+        }
+      })();
+      const esReactivacion = /reactivacion/i.test(formulario.tipo_activacion || '');
+
       const datosFormulario = {
-        ...formulario,
-        // guardar también el label para reportes
-        tipo_activacion_label: tipoActual?.label || '',
-        es_reactivacion: esReactivacion,
-        base_activacion: base, // 'comercio' | 'tienda_barrio' | 'transeuntes' | 'limbo' | 'none'
-        fecha_activacion: new Date().toISOString().split('T')[0],
+        ...formularioConBasicos,
+        base_activacion: baseActivacion,
+        fecha_activacion: fecha,
         latitud,
         longitud,
+        es_reactivacion: esReactivacion,
         usuario_id: usuario.id,
-        impulsador: usuario.nombre || 'Desconocido',
-        plaza: usuario.plaza || null,
-        foto_url: formulario.foto_url || fotoUri || null,
+        impulsador: formulario.impulsador || usuario?.nombre || '',
+        plaza: formulario.ciudad_activacion,
+        foto_url: formulario.foto_url || fotoPrincipal || null,
+        foto_respaldo_url: formulario.foto_respaldo_url || fotoRespaldo || null,
+        estado_sync: 'offline_pending',
+        dispositivo: DEVICE_INFO,
       };
 
       await guardarFormularioLocal(datosFormulario);
-      Alert.alert('Guardado local', 'Formulario guardado localmente.');
+      Alert.alert('Guardado local', 'Formulario guardado localmente. ⏳');
       contarFormulariosLocales?.();
+      resetFotosSiNoSeUsan();
 
-      // reset
-      setFormulario(formularioInicial);
-      setFotoUri(null);
+      setFormulario({
+        ...formularioInicial,
+        id: '',
+        impulsador: usuario?.nombre || '',
+        ciudad_activacion: usuario?.plaza || '',
+      });
+      setFotoRespaldo(null);
+      setFotoPrincipal(null);
     } catch (err) {
       console.error('Error al guardar formulario:', err);
-      Alert.alert('Error', `No se pudo guardar el formulario. ${err?.message || ''}`);
+      Alert.alert('Error', err?.message ? err.message : 'No se pudo guardar el formulario.');
     }
   };
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={{ paddingBottom: spacing.xl }}
+      keyboardShouldPersistTaps="handled"
+    >
       <Text style={styles.titulo}>Formulario de Activación</Text>
       <Text style={styles.subtitulo}>Guardados localmente: {cantidadOffline}</Text>
 
-      {/* Tipo de Activación (usa KEY) */}
+      <Text style={styles.sectionTitle}>Datos automáticos</Text>
+      <Text style={styles.helper}>Ciudad: {formulario.ciudad_activacion || '—'}</Text>
+      <Text style={styles.helper}>Zona: {formulario.zona_activacion || '—'}</Text>
+      <Text style={styles.helper}>Impulsador: {formulario.impulsador || usuario?.nombre || '—'}</Text>
+      <Text style={styles.helper}>Fecha: {formulario.fecha_activacion || '—'}</Text>
+
+      {/* Grupo y tipo de activación */}
       <Text style={styles.label}>Tipo de Activación</Text>
       <Picker
-        selectedValue={formulario.tipo_activacion}
-        onValueChange={onTipoActivacionChange}
+        selectedValue={formulario.tipo_grupo}
+        onValueChange={onGrupoChange}
         style={styles.picker}
       >
         <Picker.Item label="Seleccionar..." value="" />
-        {TIPOS_ACTIVACION.map((t) => (
-          <Picker.Item key={t.key} label={t.label} value={t.key} />
+        {GRUPOS_ACTIVACION.map(item => (
+          <Picker.Item key={item.key} label={item.label} value={item.key} />
         ))}
       </Picker>
 
-      {/* Comercio (y su reactivación): tipo_comercio + imagen */}
-      {(esComercio || esReactivacionComercio) && (
+      {formulario.tipo_grupo ? (
         <>
+          <Text style={styles.label}>
+            {formulario.tipo_grupo === 'tienda_barrio'
+              ? 'Tipo de Activación Tienda de Barrio'
+              : 'Tipo de Activación Mercados'}
+          </Text>
+          <Picker
+            selectedValue={formulario.tipo_activacion}
+            onValueChange={onTipoActivacionChange}
+            style={styles.picker}
+          >
+            <Picker.Item label="Seleccionar..." value="" />
+            {tiposDisponibles.map(item => (
+              <Picker.Item key={item.key} label={item.label} value={item.key} />
+            ))}
+          </Picker>
+        </>
+      ) : null}
+
+      {requiereTipoComercio && (
+        <>
+          <Text style={styles.label}>Referencia visual</Text>
+          <Image
+            source={require('../assets/comercio.png')}
+            style={[styles.imagenComercio, { width: imagenComercioWidth, height: imagenComercioHeight }]}
+            resizeMode="cover"
+          />
+
           <Text style={styles.label}>Tipo de Comercio</Text>
-          <Image source={require('../assets/comercio.png')} style={styles.imagenComercio} resizeMode="cover" />
           <Picker
             selectedValue={formulario.tipo_comercio}
             onValueChange={(v) => actualizarCampo('tipo_comercio', v)}
             style={styles.picker}
           >
             <Picker.Item label="Seleccionar..." value="" />
-            {tiposComercio.map((tipo, i) => <Picker.Item key={i} label={tipo} value={tipo} />)}
+            {TIPOS_COMERCIO.map(item => (
+              <Picker.Item key={item} label={item} value={item} />
+            ))}
           </Picker>
         </>
       )}
 
-      {/* Tiendas de barrio (y su reactivación): tamaño */}
-      {(esTiendaBarrio || esReactivacionTiendaBarrio) && (
+      {requiereTamano && (
         <>
-          <Text style={styles.label}>Tamaño de Tienda</Text>
+          <Text style={styles.label}>Tamaño de la tienda</Text>
           <Picker
             selectedValue={formulario.tamano_tienda}
             onValueChange={(v) => actualizarCampo('tamano_tienda', v)}
             style={styles.picker}
           >
             <Picker.Item label="Seleccionar..." value="" />
-            {tamanosTienda.map((tam, i) => <Picker.Item key={i} label={tam} value={tam} />)}
+            {TAMANOS_TIENDA.map(item => (
+              <Picker.Item key={item} label={item} value={item} />
+            ))}
           </Picker>
         </>
       )}
 
-      {/* Inputs comunes */}
-      <Text style={styles.label}>Nombres del Cliente</Text>
-      <TextInput style={styles.input} value={formulario.nombres_cliente} onChangeText={(v) => actualizarCampo('nombres_cliente', v)} />
+      <Text style={styles.label}>Ciudad de Activación</Text>
+      <Picker
+        selectedValue={formulario.ciudad_activacion}
+        onValueChange={(v) => {
+          actualizarCampo('ciudad_activacion', v);
+          actualizarCampo('zona_activacion', '');
+        }}
+        style={styles.picker}
+      >
+        <Picker.Item label="Seleccionar..." value="" />
+        {CIUDADES.map(item => (
+          <Picker.Item key={item.key} label={item.label} value={item.key} />
+        ))}
+      </Picker>
+
+      <Text style={styles.label}>Zona de Activación</Text>
+      <Picker
+        selectedValue={formulario.zona_activacion}
+        onValueChange={(v) => actualizarCampo('zona_activacion', v)}
+        style={styles.picker}
+        enabled={!!formulario.ciudad_activacion}
+      >
+        <Picker.Item label="Seleccionar..." value="" />
+        {zonasDisponibles.map(z => (
+          <Picker.Item key={z} label={z} value={z} />
+        ))}
+      </Picker>
+
+      <Text style={styles.sectionTitle}>Datos del Cliente</Text>
+      <Text style={styles.label}>Nombres</Text>
+      <TextInput
+        style={styles.input}
+        value={formulario.nombres_cliente}
+        onChangeText={(v) => actualizarCampo('nombres_cliente', v)}
+      />
 
       <Text style={styles.label}>Apellidos</Text>
-      <TextInput style={styles.input} value={formulario.apellidos_cliente} onChangeText={(v) => actualizarCampo('apellidos_cliente', v)} />
+      <TextInput
+        style={styles.input}
+        value={formulario.apellidos_cliente}
+        onChangeText={(v) => actualizarCampo('apellidos_cliente', v)}
+      />
 
       <Text style={styles.label}>Cédula de Identidad</Text>
-      <TextInput style={styles.input} keyboardType="numeric" maxLength={9} value={formulario.ci_cliente} onChangeText={(v) => actualizarCampo('ci_cliente', v)} />
+      <TextInput
+        style={styles.input}
+        keyboardType="numeric"
+        maxLength={9}
+        value={formulario.ci_cliente}
+        onChangeText={(v) => actualizarCampo('ci_cliente', v)}
+      />
 
       <Text style={styles.label}>Teléfono</Text>
-      <TextInput style={styles.input} keyboardType="numeric" maxLength={8} value={formulario.telefono_cliente} onChangeText={(v) => actualizarCampo('telefono_cliente', v)} />
+      <TextInput
+        style={styles.input}
+        keyboardType="numeric"
+        maxLength={8}
+        value={formulario.telefono_cliente}
+        onChangeText={(v) => actualizarCampo('telefono_cliente', v)}
+      />
 
       <Text style={styles.label}>Correo Electrónico</Text>
-      <TextInput style={styles.input} keyboardType="email-address" autoCapitalize="none" value={formulario.email_cliente} onChangeText={(v) => actualizarCampo('email_cliente', v)} />
+      <TextInput
+        style={styles.input}
+        keyboardType="email-address"
+        autoCapitalize="none"
+        value={formulario.email_cliente}
+        onChangeText={(v) => actualizarCampo('email_cliente', v)}
+      />
 
-      {/* Switches generales (ocultos si es No habilitado) */}
-      {!esNoHabilitado && (
-        <>
-          {['descargo_app', 'registro', 'cash_in', 'cash_out'].map(key => (
-            <View key={key} style={styles.switchRow}>
-              <Text style={styles.label}>{key.replace(/_/g, ' ').toUpperCase()}</Text>
-              <Switch
-                value={formulario[key]}
-                onValueChange={(v) => actualizarCampo(key, v)}
-                trackColor={{ false: colors.inputBorder, true: colors.primary }}
-              />
-            </View>
-          ))}
-        </>
-      )}
-
-      {/* QR físico: oculto solo en reactivación de transeúntes y en No habilitado */}
-      {!esNoHabilitado && !esReactivacionTranseuntes && (
-        <View style={styles.switchRow}>
-          <Text style={styles.label}>QR FÍSICO</Text>
+      <Text style={styles.sectionTitle}>Datos de la Activación</Text>
+      {['descargo_app', 'registro', 'cash_in', 'cash_out', 'p2p', 'qr_fisico', 'respaldo'].map(key => (
+        <View key={key} style={styles.switchRow}>
+          <Text style={styles.label}>{key.replace(/_/g, ' ').toUpperCase()}</Text>
           <Switch
-            value={formulario.qr_fisico}
-            onValueChange={(v) => actualizarCampo('qr_fisico', v)}
+            value={formulario[key]}
+            onValueChange={(v) => actualizarCampo(key, v)}
             trackColor={{ false: colors.inputBorder, true: colors.primary }}
           />
         </View>
-      )}
+      ))}
 
-      {/* P2P (siempre visible) */}
-      <View style={styles.switchRow}>
-        <Text style={styles.label}>P2P</Text>
-        <Switch
-          value={formulario.p2p}
-          onValueChange={(v) => actualizarCampo('p2p', v)}
-          trackColor={{ false: colors.inputBorder, true: colors.primary }}
-        />
-      </View>
-
-      {/* Errores */}
       <Text style={styles.label}>¿Hubo error?</Text>
       <Switch
         value={formulario.hubo_error}
@@ -345,23 +529,44 @@ export default function FormularioActivacion({ cantidadOffline, contarFormulario
       {formulario.hubo_error && (
         <>
           <Text style={styles.label}>Descripción del error</Text>
-          <TextInput value={formulario.descripcion_error} onChangeText={(v) => actualizarCampo('descripcion_error', v)} style={styles.input} />
+          <TextInput
+            value={formulario.descripcion_error}
+            onChangeText={(v) => actualizarCampo('descripcion_error', v)}
+            style={styles.input}
+          />
         </>
       )}
 
-      {/* Foto */}
-      <Text style={styles.label}>📷 Imagen</Text>
-      <TouchableOpacity onPress={tomarFotoYSubirImagen} style={[styles.botonMini, { backgroundColor: colors.primary }]}>
+      <Text style={styles.sectionTitle}>Fotografías</Text>
+      <Text style={styles.label}>Foto principal (QR/Comercio)</Text>
+      <TouchableOpacity
+        onPress={() => tomarFoto(setFotoPrincipal, 'foto_url')}
+        style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
+      >
         <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
       </TouchableOpacity>
-      {fotoUri && <Image source={{ uri: fotoUri }} style={styles.imagenMiniatura} />}
+      {fotoPrincipal ? <Image source={{ uri: fotoPrincipal }} style={styles.imagenMiniatura} /> : null}
 
-      {/* Botones */}
+      <Text style={styles.label}>Respaldo del activador</Text>
+      <TouchableOpacity
+        onPress={() => tomarFoto(setFotoRespaldo, 'foto_respaldo_url')}
+        style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
+      >
+        <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
+      </TouchableOpacity>
+      {fotoRespaldo ? <Image source={{ uri: fotoRespaldo }} style={styles.imagenMiniatura} /> : null}
+
       <View style={styles.botonesRow}>
-        <TouchableOpacity onPress={guardarFormulario} style={[styles.botonMini, { backgroundColor: colors.primary }]}>
+        <TouchableOpacity
+          onPress={guardarFormulario}
+          style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
+        >
           <Text style={styles.botonTextoMini}>💾 Guardar</Text>
         </TouchableOpacity>
-        <TouchableOpacity onPress={onSincronizar} style={[styles.botonMini, { backgroundColor: colors.success }]}>
+        <TouchableOpacity
+          onPress={onSincronizar}
+          style={[styles.botonMini, { backgroundColor: colors.success, ...botonShadow }]}
+        >
           <Text style={styles.botonTextoMini}>🔄 Sincronizar</Text>
         </TouchableOpacity>
       </View>
@@ -373,21 +578,32 @@ const styles = StyleSheet.create({
   container: { padding: spacing.lg, marginTop: spacing.md, backgroundColor: colors.background },
   titulo: { fontSize: fontSizes.xlarge, fontWeight: '600', marginBottom: spacing.sm, color: colors.text, textAlign: 'center' },
   subtitulo: { fontSize: fontSizes.small, fontWeight: '500', textAlign: 'center', marginBottom: spacing.md, color: colors.muted },
+  sectionTitle: { fontSize: fontSizes.large, fontWeight: '600', marginTop: spacing.lg, color: colors.primary },
   label: { fontSize: fontSizes.medium, marginTop: spacing.sm, marginBottom: spacing.xs, color: colors.text },
-  input: { borderWidth: 1, borderColor: colors.inputBorder, backgroundColor: colors.inputBackground, padding: spacing.md, borderRadius: radius.md, marginBottom: spacing.sm },
+  input: { borderWidth: 1, borderColor: colors.inputBorder, backgroundColor: colors.inputBackground, padding: spacing.md, borderRadius: radius.md, marginBottom: spacing.sm, color: colors.text },
   picker: { backgroundColor: colors.inputBackground, borderRadius: radius.md, marginBottom: spacing.sm },
+  helper: { color: colors.muted, marginBottom: spacing.xs },
   switchRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-    marginVertical: spacing.xs, paddingVertical: spacing.xs, borderBottomWidth: 1, borderBottomColor: colors.inputBorder
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginVertical: spacing.xs,
+    paddingVertical: spacing.xs,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.inputBorder,
   },
   botonesRow: {
-    flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center',
-    marginTop: spacing.lg, marginBottom: spacing.xl,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    marginTop: spacing.lg,
+    marginBottom: spacing.xl,
   },
   botonMini: {
-    paddingVertical: spacing.sm, paddingHorizontal: spacing.md, borderRadius: radius.lg,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.lg,
     minWidth: 90,
-    ...shadow.base,
   },
   botonTextoMini: { color: '#fff', fontSize: fontSizes.medium, fontWeight: '600', textAlign: 'center' },
   imagenMiniatura: {
@@ -397,8 +613,6 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   imagenComercio: {
-    width: screenWidth - spacing.lg * 2,
-    height: 200,
     borderRadius: radius.md,
     marginBottom: spacing.sm,
     alignSelf: 'center',
