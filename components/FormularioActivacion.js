@@ -16,7 +16,6 @@ import { Picker } from '@react-native-picker/picker';
 import * as Location from 'expo-location';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
-import DateTimePicker from '@react-native-community/datetimepicker';
 import { v4 as uuidv4 } from 'uuid';
 import { guardarFormularioLocal } from '../lib/storage';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
@@ -55,6 +54,30 @@ const CIUDADES = [
   { key: 'el_alto', label: 'El Alto', zonas: ['Ceja', 'Villa Adela', '16 de Julio'] },
   { key: 'cochabamba', label: 'Cochabamba', zonas: ['Centro', 'Sarco', 'Queru Queru'] },
 ];
+
+const normalizarCiudad = (valor = '') =>
+  String(valor)
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '_');
+
+const resolverCiudadKey = (valor = '') => {
+  const normalized = normalizarCiudad(valor);
+  if (!normalized) return '';
+  const porKey = CIUDADES.find((c) => c.key === normalized);
+  if (porKey) return porKey.key;
+  const porLabel = CIUDADES.find((c) => normalizarCiudad(c.label) === normalized);
+  return porLabel?.key || '';
+};
+
+const extraerExtension = (uri = '') => {
+  const limpio = String(uri).split('?')[0].split('#')[0];
+  const nombre = limpio.split('/').pop() || '';
+  const ext = nombre.includes('.') ? nombre.split('.').pop().toLowerCase() : '';
+  return /^[a-z0-9]{2,5}$/.test(ext) ? ext : 'jpg';
+};
 
 const formularioInicial = {
   tipo_grupo: '',
@@ -98,17 +121,12 @@ export default function FormularioActivacion({
   const [formulario, setFormulario] = useState(formularioInicial);
   const [fotoRespaldo, setFotoRespaldo] = useState(null);
   const [fotoPrincipal, setFotoPrincipal] = useState(null);
-  const [mostrandoFecha, setMostrandoFecha] = useState(false);
   const { width } = useWindowDimensions();
   const imagenComercioWidth = Math.max(200, Math.min(width - spacing.lg * 2, 720));
   const imagenComercioHeight = Math.round(imagenComercioWidth / (16 / 9));
   const botonShadow = Platform.OS === 'web'
     ? { boxShadow: '0px 2px 6px rgba(0,0,0,0.3)' }
     : shadow.base;
-
-  if (!usuario || !usuario.id) {
-    return <Text style={{ padding: 20, color: colors.text }}>Cargando usuario...</Text>;
-  }
 
   const actualizarCampo = (campo, valor) => {
     setFormulario(prev => ({ ...prev, [campo]: valor }));
@@ -117,8 +135,6 @@ export default function FormularioActivacion({
   const tiposDisponibles = formulario.tipo_grupo === 'tienda_barrio' ? TIPOS_TIENDAS
     : formulario.tipo_grupo === 'mercados' ? TIPOS_MERCADOS
     : [];
-
-  const tipoSeleccionado = tiposDisponibles.find(t => t.key === formulario.tipo_activacion) || null;
 
   const ciudadSeleccionada = useMemo(
     () => CIUDADES.find(c => c.key === formulario.ciudad_activacion) || null,
@@ -160,6 +176,7 @@ export default function FormularioActivacion({
       tipo_grupo: grupo,
       tipo_activacion: '',
       tamano_tienda: '',
+      tipo_comercio: '',
     }));
   };
 
@@ -173,15 +190,16 @@ export default function FormularioActivacion({
   // Auto-set de datos provenientes del usuario y fecha actual
   useEffect(() => {
     const hoy = new Date().toISOString().split('T')[0];
+    const ciudadUsuario = resolverCiudadKey(usuario?.plaza);
     setFormulario(prev => ({
       ...prev,
       fecha_activacion: prev.fecha_activacion || hoy,
       impulsador: prev.impulsador || usuario?.nombre || '',
-      ciudad_activacion: prev.ciudad_activacion || usuario?.plaza || '',
+      ciudad_activacion: prev.ciudad_activacion || ciudadUsuario || '',
     }));
   }, [usuario]);
 
-  const resetFotosSiNoSeUsan = () => {
+  const limpiarFotosSiNoSeUsan = () => {
     if (!requiereFotos) {
       setFotoRespaldo(null);
       setFotoPrincipal(null);
@@ -189,6 +207,11 @@ export default function FormularioActivacion({
       actualizarCampo('foto_url', '');
     }
   };
+
+  useEffect(() => {
+    limpiarFotosSiNoSeUsan();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requiereFotos]);
 
   const tomarFoto = async (setter, fieldName) => {
     try {
@@ -206,15 +229,21 @@ export default function FormularioActivacion({
 
       if (result.canceled) return;
 
-      const uri = result.assets?.[0]?.uri;
-      if (!uri || !uri.startsWith('file://')) {
+      const asset = result.assets?.[0];
+      const uri = asset?.uri;
+      if (!uri) {
         return Alert.alert('Error', 'La ruta de imagen no es válida');
       }
 
       let sizeMB = 0;
       try {
-        const info = await FileSystem.getInfoAsync(uri, { size: true });
-        sizeMB = info?.size ? Number(info.size) / 1024 / 1024 : 0;
+        const assetSize = typeof asset?.fileSize === 'number' ? asset.fileSize : null;
+        if (assetSize !== null) {
+          sizeMB = Number(assetSize) / 1024 / 1024;
+        } else {
+          const info = await FileSystem.getInfoAsync(uri, { size: true });
+          sizeMB = info?.size ? Number(info.size) / 1024 / 1024 : 0;
+        }
       } catch {
         // en algunos dispositivos no retorna size; continuamos
       }
@@ -223,8 +252,15 @@ export default function FormularioActivacion({
         return Alert.alert('❌ Imagen demasiado grande', 'Intenta una foto más liviana (≤ 6 MB).');
       }
 
-      setter(uri);
-      actualizarCampo(fieldName, uri);
+      // Persistimos la foto en documentDirectory para que no se pierda antes de sincronizar.
+      const baseDir = `${FileSystem.documentDirectory || FileSystem.cacheDirectory}activaciones-pendientes`;
+      await FileSystem.makeDirectoryAsync(baseDir, { intermediates: true });
+      const ext = extraerExtension(uri);
+      const destino = `${baseDir}/${fieldName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      await FileSystem.copyAsync({ from: uri, to: destino });
+
+      setter(destino);
+      actualizarCampo(fieldName, destino);
 
     } catch (error) {
       console.error('❌ Error al tomar o subir imagen:', error);
@@ -335,13 +371,13 @@ export default function FormularioActivacion({
       await guardarFormularioLocal(datosFormulario);
       Alert.alert('Guardado local', 'Formulario guardado localmente. ⏳');
       contarFormulariosLocales?.();
-      resetFotosSiNoSeUsan();
+      limpiarFotosSiNoSeUsan();
 
       setFormulario({
         ...formularioInicial,
         id: '',
         impulsador: usuario?.nombre || '',
-        ciudad_activacion: usuario?.plaza || '',
+        ciudad_activacion: resolverCiudadKey(usuario?.plaza),
       });
       setFotoRespaldo(null);
       setFotoPrincipal(null);
@@ -350,6 +386,10 @@ export default function FormularioActivacion({
       Alert.alert('Error', err?.message ? err.message : 'No se pudo guardar el formulario.');
     }
   };
+
+  if (!usuario || !usuario.id) {
+    return <Text style={{ padding: 20, color: colors.text }}>Cargando usuario...</Text>;
+  }
 
   return (
     <ScrollView
@@ -487,7 +527,7 @@ export default function FormularioActivacion({
         keyboardType="numeric"
         maxLength={9}
         value={formulario.ci_cliente}
-        onChangeText={(v) => actualizarCampo('ci_cliente', v)}
+        onChangeText={(v) => actualizarCampo('ci_cliente', v.replace(/\D/g, ''))}
       />
 
       <Text style={styles.label}>Teléfono</Text>
@@ -496,7 +536,7 @@ export default function FormularioActivacion({
         keyboardType="numeric"
         maxLength={8}
         value={formulario.telefono_cliente}
-        onChangeText={(v) => actualizarCampo('telefono_cliente', v)}
+        onChangeText={(v) => actualizarCampo('telefono_cliente', v.replace(/\D/g, ''))}
       />
 
       <Text style={styles.label}>Correo Electrónico</Text>
@@ -537,24 +577,28 @@ export default function FormularioActivacion({
         </>
       )}
 
-      <Text style={styles.sectionTitle}>Fotografías</Text>
-      <Text style={styles.label}>Foto principal (QR/Comercio)</Text>
-      <TouchableOpacity
-        onPress={() => tomarFoto(setFotoPrincipal, 'foto_url')}
-        style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
-      >
-        <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
-      </TouchableOpacity>
-      {fotoPrincipal ? <Image source={{ uri: fotoPrincipal }} style={styles.imagenMiniatura} /> : null}
+      {requiereFotos ? (
+        <>
+          <Text style={styles.sectionTitle}>Fotografías</Text>
+          <Text style={styles.label}>Foto principal (QR/Comercio)</Text>
+          <TouchableOpacity
+            onPress={() => tomarFoto(setFotoPrincipal, 'foto_url')}
+            style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
+          >
+            <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
+          </TouchableOpacity>
+          {fotoPrincipal ? <Image source={{ uri: fotoPrincipal }} style={styles.imagenMiniatura} /> : null}
 
-      <Text style={styles.label}>Respaldo del activador</Text>
-      <TouchableOpacity
-        onPress={() => tomarFoto(setFotoRespaldo, 'foto_respaldo_url')}
-        style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
-      >
-        <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
-      </TouchableOpacity>
-      {fotoRespaldo ? <Image source={{ uri: fotoRespaldo }} style={styles.imagenMiniatura} /> : null}
+          <Text style={styles.label}>Respaldo del activador</Text>
+          <TouchableOpacity
+            onPress={() => tomarFoto(setFotoRespaldo, 'foto_respaldo_url')}
+            style={[styles.botonMini, { backgroundColor: colors.primary, ...botonShadow }]}
+          >
+            <Text style={styles.botonTextoMini}>📷 Tomar Foto</Text>
+          </TouchableOpacity>
+          {fotoRespaldo ? <Image source={{ uri: fotoRespaldo }} style={styles.imagenMiniatura} /> : null}
+        </>
+      ) : null}
 
       <View style={styles.botonesRow}>
         <TouchableOpacity

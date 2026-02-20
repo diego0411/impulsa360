@@ -1,5 +1,5 @@
 // App.js
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   ActivityIndicator,
@@ -11,9 +11,11 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import * as FileSystem from 'expo-file-system';
 import { v4 as uuidv4 } from 'uuid';
 
 import { supabase } from './lib/supabase';
+import { HAS_SUPABASE_CONFIG, SUPABASE_CONFIG_ERROR } from './lib/config';
 import { colors, spacing, fontSizes } from './styles/theme';
 import AuthScreen from './components/AuthScreen';
 import FormularioActivacion from './components/FormularioActivacion';
@@ -32,103 +34,39 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(null);
   const [verActivaciones, setVerActivaciones] = useState(false);
   const syncingRef = useRef(false);
+  const lastSyncRef = useRef(0);
 
-  // Detectar cambios de conexión + estado inicial
-  useEffect(() => {
-    NetInfo.fetch().then(state => setIsConnected(!!state.isConnected));
-    const unsubscribe = NetInfo.addEventListener(state => {
-      setIsConnected(state.isConnected);
-    });
-    return unsubscribe;
-  }, []);
-
-  // Verificar sesión una vez detectado el estado de conexión
-  useEffect(() => {
-    if (isConnected !== null) verificarSesion();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConnected]);
-
-  // Auto-sync al volver a conexión o primer plano
-  useEffect(() => {
-    if (isConnected) {
-      sincronizarFormularios();
-    }
-  }, [isConnected]);
-
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active' && isConnected) {
-        sincronizarFormularios();
-      }
-    });
-    return () => sub.remove();
-  }, [isConnected]);
-
-  const verificarSesion = async () => {
-    setLoading(true);
-    try {
-      // Siempre intenta cargar usuario local primero (útil si tarda la red)
-      const storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
-      if (storedUser) {
-        try {
-          const parsed = JSON.parse(storedUser);
-          if (parsed?.id) setUsuario(parsed);
-        } catch {}
-      }
-
-      if (!isConnected) {
-        if (!storedUser) console.warn('⚠️ No se encontró usuario local (offline).');
-      } else {
-        const { data: { user }, error } = await supabase.auth.getUser();
-        if (error || !user) throw new Error(error?.message || 'No user');
-
-        const { data: perfil, error: errorPerfil } = await supabase
-          .from('activadores')
-          .select('*')
-          .eq('usuario_id', user.id)
-          .single();
-
-        if (errorPerfil) console.warn('⚠️ Perfil no encontrado:', errorPerfil.message);
-
-        const usuarioFinal = {
-          id: user.id,
-          email: user.email,
-          nombre: perfil?.nombre?.trim() || user.user_metadata?.nombre || user.email,
-          plaza: perfil?.plaza?.trim() || 'No especificada',
-        };
-
-        setUsuario(usuarioFinal);
-        await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
-      }
-    } catch (e) {
-      console.error('❌ Error verificando sesión:', e?.message || e);
-      setUsuario(null);
-    } finally {
-      contarFormulariosLocales();
-      setLoading(false);
-    }
-  };
-
-  const contarFormulariosLocales = async () => {
+  const contarFormulariosLocales = useCallback(async () => {
     const datos = await obtenerFormulariosLocales();
     setCantidadOffline(datos.length);
-  };
+  }, []);
 
-  const sincronizarFormularios = async () => {
+  const sincronizarFormularios = useCallback(async ({ showAlerts = true } = {}) => {
     if (syncingRef.current) return;
     if (!usuario?.id) {
-      Alert.alert('Sesión requerida', 'Vuelve a iniciar sesión antes de sincronizar.');
+      if (showAlerts) {
+        Alert.alert('Sesión requerida', 'Vuelve a iniciar sesión antes de sincronizar.');
+      }
       return;
     }
     if (!isConnected) {
-      Alert.alert('Sin conexión', 'Conéctate a internet para sincronizar.');
+      if (showAlerts) {
+        Alert.alert('Sin conexión', 'Conéctate a internet para sincronizar.');
+      }
       return;
     }
+
+    const now = Date.now();
+    if (!showAlerts && now - lastSyncRef.current < 10000) return;
+    lastSyncRef.current = now;
+
     syncingRef.current = true;
     try {
       const formularios = await obtenerFormulariosLocales();
       if (!formularios.length) {
-        Alert.alert('Sin formularios', 'No hay formularios pendientes.');
+        if (showAlerts) {
+          Alert.alert('Sin formularios', 'No hay formularios pendientes.');
+        }
         return;
       }
 
@@ -191,26 +129,42 @@ export default function App() {
 
         // Sube imágenes pendientes
         const fotoKeys = ['foto_url', 'foto_respaldo_url'];
+        let fotoUploadFailed = false;
         for (const key of fotoKeys) {
-          if (formulario[key]?.startsWith?.('file://')) {
+          const fotoLocalUri = formulario[key];
+          const isLocalPhotoUri = typeof fotoLocalUri === 'string' && /^(file|content):\/\//i.test(fotoLocalUri);
+          if (isLocalPhotoUri) {
+            const fileInfo = await FileSystem.getInfoAsync(fotoLocalUri, { size: true }).catch(() => null);
+            if (!fileInfo?.exists) {
+              errores.push(`ID local ${localId}: La foto (${key}) ya no está en el dispositivo. Debes tomarla nuevamente.`);
+              fotoUploadFailed = true;
+              break;
+            }
             try {
               const path = key === 'foto_respaldo_url'
                 ? `activaciones/${recordId}_respaldo.jpg`
                 : `activaciones/${recordId}.jpg`;
-              const storagePath = await subirImagenASupabase(formulario[key], path);
+              const storagePath = await subirImagenASupabase(fotoLocalUri, path);
               if (storagePath) {
                 formulario[key] = storagePath;
                 await actualizarFormularioLocal(localId, { [key]: storagePath });
+                // Si el upload fue exitoso, limpiamos la copia local persistida.
+                await FileSystem.deleteAsync(fotoLocalUri, { idempotent: true }).catch(() => {});
               } else {
                 errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
-                continue;
+                fotoUploadFailed = true;
+                break;
               }
             } catch (e) {
               console.warn(`⚠️ No se pudo subir foto (${key}) del formulario ${localId}:`, e?.message || e);
               errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
-              continue;
+              fotoUploadFailed = true;
+              break;
             }
           }
+        }
+        if (fotoUploadFailed) {
+          continue;
         }
 
         // Solo enviamos columnas permitidas para evitar errores de esquema
@@ -236,7 +190,6 @@ export default function App() {
         if (!error) {
           await eliminarFormularioLocal(localId);
           ok += 1;
-          await contarFormulariosLocales();
         } else {
           console.error(`❌ Error en formulario ${localId}:`, error.message);
           errores.push(`ID local ${localId}: ${error.message}`);
@@ -244,21 +197,127 @@ export default function App() {
       }
 
       // Resumen
-      if (errores.length === 0) {
-        Alert.alert('Sincronización completa', `Se sincronizaron ${ok} formulario(s).`);
-      } else if (ok > 0) {
-        Alert.alert('Parcialmente sincronizado', `OK: ${ok}\nErrores: ${errores.length}\n\n${errores.slice(0, 3).join('\n')}${errores.length > 3 ? '\n…' : ''}`);
-      } else {
-        Alert.alert('Sincronización fallida', errores.slice(0, 5).join('\n'));
+      if (showAlerts) {
+        if (errores.length === 0) {
+          Alert.alert('Sincronización completa', `Se sincronizaron ${ok} formulario(s).`);
+        } else if (ok > 0) {
+          Alert.alert('Parcialmente sincronizado', `OK: ${ok}\nErrores: ${errores.length}\n\n${errores.slice(0, 3).join('\n')}${errores.length > 3 ? '\n…' : ''}`);
+        } else {
+          Alert.alert('Sincronización fallida', errores.slice(0, 5).join('\n'));
+        }
       }
     } catch (err) {
       console.error('❌ Error general al sincronizar:', err?.message || err);
-      Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
+      if (showAlerts) {
+        Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
+      }
     } finally {
       contarFormulariosLocales();
       syncingRef.current = false;
     }
-  };
+  }, [contarFormulariosLocales, isConnected, usuario?.id, usuario?.nombre, usuario?.plaza]);
+
+  const verificarSesion = useCallback(async () => {
+    setLoading(true);
+    try {
+      // Siempre intenta cargar usuario local primero (útil si tarda la red)
+      const storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
+      if (storedUser) {
+        try {
+          const parsed = JSON.parse(storedUser);
+          if (parsed?.id) setUsuario(parsed);
+        } catch {
+          // ignorar usuario local corrupto
+        }
+      }
+
+      if (!isConnected) {
+        if (!storedUser) console.warn('⚠️ No se encontró usuario local (offline).');
+      } else {
+        const { data: { user }, error } = await supabase.auth.getUser();
+        if (error || !user) throw new Error(error?.message || 'No user');
+
+        const { data: perfil, error: errorPerfil } = await supabase
+          .from('activadores')
+          .select('*')
+          .eq('usuario_id', user.id)
+          .single();
+
+        if (errorPerfil) console.warn('⚠️ Perfil no encontrado:', errorPerfil.message);
+
+        const usuarioFinal = {
+          id: user.id,
+          email: user.email,
+          nombre: perfil?.nombre?.trim() || user.user_metadata?.nombre || user.email,
+          plaza: perfil?.plaza?.trim() || 'No especificada',
+        };
+
+        setUsuario(usuarioFinal);
+        await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+      }
+    } catch (e) {
+      console.error('❌ Error verificando sesión:', e?.message || e);
+      setUsuario(null);
+    } finally {
+      contarFormulariosLocales();
+      setLoading(false);
+    }
+  }, [contarFormulariosLocales, isConnected]);
+
+  // Detectar cambios de conexión + estado inicial
+  useEffect(() => {
+    let mounted = true;
+    const fallbackTimer = globalThis.setTimeout(() => {
+      if (mounted) {
+        setIsConnected((prev) => (prev === null ? false : prev));
+      }
+    }, 3000);
+
+    NetInfo.fetch()
+      .then((state) => {
+        if (mounted) {
+          setIsConnected(!!state?.isConnected);
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setIsConnected(false);
+        }
+      });
+
+    const unsubscribe = NetInfo.addEventListener((state) => {
+      setIsConnected(!!state.isConnected);
+    });
+
+    return () => {
+      mounted = false;
+      globalThis.clearTimeout(fallbackTimer);
+      unsubscribe();
+    };
+  }, []);
+
+  // Verificar sesión una vez detectado el estado de conexión
+  useEffect(() => {
+    if (isConnected !== null) {
+      verificarSesion();
+    }
+  }, [isConnected, verificarSesion]);
+
+  // Auto-sync al volver a conexión o primer plano (sin alertas intrusivas)
+  useEffect(() => {
+    if (isConnected) {
+      sincronizarFormularios({ showAlerts: false });
+    }
+  }, [isConnected, sincronizarFormularios]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active' && isConnected) {
+        sincronizarFormularios({ showAlerts: false });
+      }
+    });
+    return () => sub.remove();
+  }, [isConnected, sincronizarFormularios]);
 
   const cerrarSesion = async () => {
     try {
@@ -274,6 +333,15 @@ export default function App() {
     setUsuario(user);
     contarFormulariosLocales();
   };
+
+  if (!HAS_SUPABASE_CONFIG) {
+    return (
+      <View style={styles.errorContainer}>
+        <Text style={styles.errorTitle}>Configuración incompleta</Text>
+        <Text style={styles.errorText}>{SUPABASE_CONFIG_ERROR}</Text>
+      </View>
+    );
+  }
 
   if (loading) {
     return (
@@ -325,7 +393,27 @@ const styles = StyleSheet.create({
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
+    alignItems: 'center',
     backgroundColor: colors.background,
+  },
+  errorContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: spacing.lg,
+    backgroundColor: colors.background,
+  },
+  errorTitle: {
+    color: colors.danger,
+    fontSize: fontSizes.large,
+    fontWeight: '700',
+    marginBottom: spacing.sm,
+    textAlign: 'center',
+  },
+  errorText: {
+    color: colors.text,
+    fontSize: fontSizes.medium,
+    textAlign: 'center',
   },
   header: {
     paddingTop: spacing.lg,

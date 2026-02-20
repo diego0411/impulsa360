@@ -21,7 +21,7 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FFFFFF"
       },
-      "package": "ccom.integrat360.impulsa360"
+      "package": "com.integrat360.impulsa360"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -31,6 +31,8 @@
     ],
     "owner": "integrat360",
     "extra": {
+      "supabaseUrl": "https://mjfuiimdiwhzvbnanquu.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1qZnVpaW1kaXdoenZibmFucXV1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDI4NTE2OTQsImV4cCI6MjA1ODQyNzY5NH0.PGWk10r1zLXDY3A00kYy7N0gD7lI3abL4S55McKJROg",
       "eas": {
         "projectId": "001c3d4e-a378-4ba9-ac48-27f8c482d88e"
       }

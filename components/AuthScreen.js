@@ -15,12 +15,13 @@ import { colors, spacing, fontSizes, radius } from '../styles/theme';
 export default function AuthScreen({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [nombre, setNombre] = useState('');
-  
-  // forzamos siempre inicio de sesión
-  const esRegistro = false;
+  const [submitting, setSubmitting] = useState(false);
 
   const manejarAutenticacion = async () => {
+    if (submitting) return;
+
+    const emailNormalizado = email.trim().toLowerCase();
+    const passwordNormalizado = password;
     const netState = await NetInfo.fetch();
 
     if (!netState.isConnected) {
@@ -28,74 +29,59 @@ export default function AuthScreen({ onLogin }) {
       return;
     }
 
-    if (!email || !password || (esRegistro && !nombre)) {
+    if (!emailNormalizado || !passwordNormalizado) {
       Alert.alert('Error', 'Completa todos los campos');
       return;
     }
 
+    setSubmitting(true);
     try {
-      if (esRegistro) {
-        const { data, error } = await supabase.auth.signUp({
-          email,
-          password,
-          options: { data: { nombre } },
-        });
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: emailNormalizado,
+        password: passwordNormalizado,
+      });
 
-        if (error) {
-          Alert.alert('Error', error.message);
+      if (error) {
+        Alert.alert('Error', error.message);
+      } else {
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+
+        if (sessionError) {
+          Alert.alert('Error', sessionError.message);
           return;
         }
 
-        const user = data.user;
-        if (user) {
-          await supabase.from('activadores').upsert({
-            usuario_id: user.id,
-            nombre,
-          });
-          Alert.alert('✅ Registro exitoso', 'Ahora inicia sesión');
+        const usuario = session?.user || data.user;
+        if (!usuario?.id) {
+          Alert.alert('Error', 'No se pudo recuperar la sesión del usuario.');
+          return;
         }
-      } else {
-        const { data, error } = await supabase.auth.signInWithPassword({
-          email,
-          password,
-        });
 
-        if (error) {
-          Alert.alert('Error', error.message);
-        } else {
-          const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+        const { data: perfil, error: errorPerfil } = await supabase
+          .from('activadores')
+          .select('*')
+          .eq('usuario_id', usuario.id)
+          .single();
 
-          if (sessionError) {
-            Alert.alert('Error', sessionError.message);
-            return;
-          }
-
-          const usuario = session?.user || data.user;
-
-          const { data: perfil, error: errorPerfil } = await supabase
-            .from('activadores')
-            .select('*')
-            .eq('usuario_id', usuario.id)
-            .single();
-
-          if (errorPerfil) {
-            console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
-          }
-
-          const usuarioFinal = {
-            id: usuario.id,
-            email: usuario.email,
-            nombre: (perfil?.nombre || usuario.user_metadata?.nombre || usuario.email || '').trim(),
-            plaza: (perfil?.plaza || '').trim() || 'No especificada',
-          };
-
-          await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
-          onLogin(usuarioFinal);
+        if (errorPerfil) {
+          console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
         }
+
+        const usuarioFinal = {
+          id: usuario.id,
+          email: usuario.email,
+          nombre: (perfil?.nombre || usuario.user_metadata?.nombre || usuario.email || '').trim(),
+          plaza: (perfil?.plaza || '').trim() || 'No especificada',
+        };
+
+        await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+        onLogin(usuarioFinal);
       }
     } catch (err) {
       Alert.alert('Error crítico', err.message || 'Ocurrió un error inesperado');
       console.error('Error en autenticación:', err);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -125,8 +111,12 @@ export default function AuthScreen({ onLogin }) {
         secureTextEntry
       />
 
-      <TouchableOpacity onPress={manejarAutenticacion} style={styles.boton}>
-        <Text style={styles.botonTexto}>Iniciar Sesión</Text>
+      <TouchableOpacity
+        onPress={manejarAutenticacion}
+        style={[styles.boton, submitting && styles.botonDisabled]}
+        disabled={submitting}
+      >
+        <Text style={styles.botonTexto}>{submitting ? 'Ingresando...' : 'Iniciar Sesión'}</Text>
       </TouchableOpacity>
 
       {/* se elimina la opción de alternar registro */}
@@ -163,6 +153,9 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.md,
     borderRadius: radius.md,
     alignItems: 'center',
+  },
+  botonDisabled: {
+    opacity: 0.7,
   },
   botonTexto: {
     color: '#fff',

@@ -4,6 +4,7 @@ import {
   Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
 } from 'react-native';
 import { supabase } from '../lib/supabase';
+import { resolverUrlDeFoto } from '../lib/upload';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 
 const PAGE_SIZE = 20;
@@ -20,6 +21,7 @@ export default function FormulariosPorImpulsador({ usuario }) {
   const [detalleVisible, setDetalleVisible] = useState(false);
   const [detalle, setDetalle] = useState(null);
   const [detalleLoading, setDetalleLoading] = useState(false);
+  const [detalleFotoUrl, setDetalleFotoUrl] = useState('');
 
   const pageRef = useRef(0);
   const channelRef = useRef(null);
@@ -127,6 +129,7 @@ export default function FormulariosPorImpulsador({ usuario }) {
     try {
       setDetalleLoading(true);
       setDetalle(null);
+      setDetalleFotoUrl('');
       setDetalleVisible(true);
 
       const { data, error } = await supabase
@@ -141,6 +144,9 @@ export default function FormulariosPorImpulsador({ usuario }) {
         setDetalleVisible(false);
         return;
       }
+
+      const fotoUrl = await resolverUrlDeFoto(data?.foto_url);
+      setDetalleFotoUrl(fotoUrl);
       setDetalle(data);
     } catch (e) {
       console.error('❌ Detalle catch:', e);
@@ -154,12 +160,13 @@ export default function FormulariosPorImpulsador({ usuario }) {
   const cerrarDetalle = () => {
     setDetalleVisible(false);
     setDetalle(null);
+    setDetalleFotoUrl('');
   };
 
   const renderItem = ({ item }) => {
     const fecha = item.fecha_activacion || item.creado_en || item.created_at || '—';
     const tipo = item.tipo_activacion || '—';
-    const esReactiv = !!item.reactivacion_comercio || /reactivaci[óo]n/i.test(tipo);
+    const esReactiv = !!item.es_reactivacion || !!item.reactivacion_comercio || /reactivaci[óo]n/i.test(tipo);
     const cliente = [item.nombres_cliente, item.apellidos_cliente].filter(Boolean).join(' ').trim();
 
     return (
@@ -236,9 +243,9 @@ export default function FormulariosPorImpulsador({ usuario }) {
                 showsVerticalScrollIndicator={false}
               >
                 {/* Foto si hay */}
-                {!!detalle.foto_url && (
+                {!!detalleFotoUrl && (
                   <Image
-                    source={{ uri: detalle.foto_url }}
+                    source={{ uri: detalleFotoUrl }}
                     style={[styles.foto, { height: fotoHeight }]}
                   />
                 )}
@@ -246,7 +253,7 @@ export default function FormulariosPorImpulsador({ usuario }) {
                 {/* Campos principales */}
                 {renderCampo('Fecha', (detalle.fecha_activacion || detalle.creado_en || detalle.created_at || '').toString().slice(0,10))}
                 {renderCampo('Tipo de activación', detalle.tipo_activacion)}
-                {renderCampo('Reactivación comercio', detalle.reactivacion_comercio ? 'Sí' : 'No')}
+                {renderCampo('Reactivación comercio', booleanPretty(!!detalle.es_reactivacion || !!detalle.reactivacion_comercio))}
                 {renderCampo('Tipo de comercio', detalle.tipo_comercio)}
                 {renderCampo('Tamaño de tienda', detalle.tamano_tienda)}
                 {renderCampo('Cliente', [detalle.nombres_cliente, detalle.apellidos_cliente].filter(Boolean).join(' ').trim())}

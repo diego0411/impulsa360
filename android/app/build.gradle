@@ -2,7 +2,44 @@ apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
 
+import java.io.FileInputStream
+import java.util.Properties
+
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+def releaseStoreFile = findProperty("android.releaseStoreFile")
+        ?: System.getenv("ANDROID_RELEASE_STORE_FILE")
+        ?: keystoreProperties.getProperty("storeFile")
+def releaseStorePassword = findProperty("android.releaseStorePassword")
+        ?: System.getenv("ANDROID_RELEASE_STORE_PASSWORD")
+        ?: keystoreProperties.getProperty("storePassword")
+def releaseKeyAlias = findProperty("android.releaseKeyAlias")
+        ?: System.getenv("ANDROID_RELEASE_KEY_ALIAS")
+        ?: keystoreProperties.getProperty("keyAlias")
+def releaseKeyPassword = findProperty("android.releaseKeyPassword")
+        ?: System.getenv("ANDROID_RELEASE_KEY_PASSWORD")
+        ?: keystoreProperties.getProperty("keyPassword")
+
+def hasReleaseSigning = [releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { it }
+def requestedTasks = gradle.startParameter.taskNames*.toLowerCase()
+def isReleaseTask = requestedTasks.any { it.contains("release") || it.contains("bundle") }
+def allowDebugSigningInRelease = (findProperty("android.allowDebugSigningInRelease") ?: "false").toBoolean()
+if (isReleaseTask && !hasReleaseSigning && !allowDebugSigningInRelease) {
+    throw new GradleException(
+            "Missing release signing credentials.\n" +
+            "Set ANDROID_RELEASE_* env vars, android.release* properties, or android/keystore.properties.\n" +
+            "For local non-production testing only, use -Pandroid.allowDebugSigningInRelease=true."
+    )
+}
+if (!hasReleaseSigning && allowDebugSigningInRelease) {
+    logger.lifecycle("WARNING: Missing release signing credentials. Using debug signing due to android.allowDebugSigningInRelease=true")
+}
 
 /**
  * This is the configuration block to customize your React Native Android app.
@@ -86,13 +123,13 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace 'ccom.integrat360.impulsa360'
+    namespace 'com.integrat360.impulsa360'
     defaultConfig {
-        applicationId 'ccom.integrat360.impulsa360'
+        applicationId 'com.integrat360.impulsa360'
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0.2"
+        versionCode Integer.parseInt((findProperty("android.versionCode") ?: "1").toString())
+        versionName (findProperty("android.versionName") ?: "1.0.2").toString()
     }
     signingConfigs {
         debug {
@@ -101,15 +138,21 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
             shrinkResources (findProperty('android.enableShrinkResourcesInReleaseBuilds')?.toBoolean() ?: false)
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"

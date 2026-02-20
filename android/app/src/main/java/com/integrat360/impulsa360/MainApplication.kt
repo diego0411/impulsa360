@@ -1,4 +1,4 @@
-package ccom.integrat360.impulsa360
+package com.integrat360.impulsa360
 
 import android.app.Application
 import android.content.res.Configuration

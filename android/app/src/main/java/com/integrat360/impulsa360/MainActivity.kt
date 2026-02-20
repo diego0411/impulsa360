@@ -1,4 +1,4 @@
-package ccom.integrat360.impulsa360
+package com.integrat360.impulsa360
 import expo.modules.splashscreen.SplashScreenManager
 
 import android.os.Build
