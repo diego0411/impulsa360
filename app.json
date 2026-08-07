@@ -2,7 +2,7 @@
   "expo": {
     "name": "Impulsa360",
     "slug": "impulsa360",
-    "version": "1.0.2",
+    "version": "1.0.12",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
@@ -10,13 +10,18 @@
     "splash": {
       "image": "./assets/splash.png",
       "resizeMode": "contain",
-      "backgroundColor": "#FFFFFF"
+      "backgroundColor": "#071223"
     },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.integrat360.impulsa360"
     },
     "android": {
+      "permissions": [
+        "CAMERA",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FFFFFF"
@@ -26,9 +31,6 @@
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "plugins": [
-      "expo-sqlite"
-    ],
     "owner": "integrat360",
     "extra": {
       "supabaseUrl": "https://mjfuiimdiwhzvbnanquu.supabase.co",
@@ -36,6 +38,9 @@
       "eas": {
         "projectId": "001c3d4e-a378-4ba9-ac48-27f8c482d88e"
       }
-    }
+    },
+    "plugins": [
+      "expo-asset"
+    ]
   }
 }

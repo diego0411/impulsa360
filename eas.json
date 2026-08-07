@@ -12,7 +12,11 @@
       }
     },
     "preview": {
-      "distribution": "internal"
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -Pandroid.allowDebugSigningInRelease=true"
+      }
     },
     "production": {
       "autoIncrement": true,
@@ -21,11 +25,6 @@
       },
       "android": {
         "buildType": "app-bundle"
-      }
-    },
-    "preview-apk": {
-      "android": {
-        "buildType": "apk"
       }
     }
   },

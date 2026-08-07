@@ -1,14 +1,24 @@
 // styles/theme.js
 
 export const colors = {
-  background: '#6802AA',        // Fondo oscuro total
-  text: '#FFFFFF',              // Texto blanco puro
-  inputBackground: '#E0DFE1',   // Input gris oscuro
-  inputBorder: '#2D0149',       // Borde gris neutro
-  primary: '#FF6D00',           // Naranja brillante para botones
-  success: '#00E676',           // Verde brillante
-  danger: '#FF3D00',            // Rojo brillante
-  muted: '#F8F9FA',             // Gris para etiquetas o texto auxiliar
+  background: '#EDF3F9',
+  surface: '#FFFFFF',
+  surfaceAlt: '#E8F0F8',
+  text: '#13263A',
+  textMuted: '#5B7590',
+  inputBackground: '#FFFFFF',
+  inputBorder: '#C8D7E6',
+  primary: '#1769FF',
+  primaryDark: '#0E4ECC',
+  accent: '#FF8A00',
+  success: '#0FA968',
+  warning: '#D89216',
+  danger: '#D63A45',
+  muted: '#6B839B',
+  headerBg: '#101E2E',
+  headerText: '#F4F8FF',
+  cardBorder: '#D6E3F0',
+  overlay: 'rgba(16, 30, 46, 0.35)',
 };
 
 export const spacing = {
@@ -23,21 +33,21 @@ export const fontSizes = {
   small: 14,
   medium: 16,
   large: 20,
-  xlarge: 26,
+  xlarge: 28,
 };
 
 export const radius = {
-  sm: 6,
-  md: 10,
-  lg: 16,
+  sm: 8,
+  md: 14,
+  lg: 20,
 };
 
 export const shadow = {
   base: {
-    shadowColor: '#000',
+    shadowColor: '#0D243A',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
-    elevation: 5,
+    shadowOpacity: 0.14,
+    shadowRadius: 10,
+    elevation: 4,
   },
 };

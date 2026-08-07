@@ -1,0 +1,145 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="1100" viewBox="0 0 1700 1100" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1700" y2="1100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F2F6FB"/>
+      <stop offset="1" stop-color="#E8EFF7"/>
+    </linearGradient>
+    <linearGradient id="phoneTop" x1="0" y1="0" x2="0" y2="760" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F2238"/>
+      <stop offset="1" stop-color="#122B47"/>
+    </linearGradient>
+    <linearGradient id="cta" x1="0" y1="0" x2="230" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFB703"/>
+      <stop offset="1" stop-color="#FF8A00"/>
+    </linearGradient>
+    <filter id="drop" x="130" y="120" width="1440" height="860" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="16"/>
+      <feGaussianBlur stdDeviation="20"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.039 0 0 0 0 0.102 0 0 0 0 0.176 0 0 0 0.19 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+  </defs>
+
+  <rect width="1700" height="1100" fill="url(#bg)"/>
+  <circle cx="1550" cy="980" r="220" fill="#D8EAF9" fill-opacity="0.5"/>
+  <circle cx="130" cy="120" r="120" fill="#D4EED5" fill-opacity="0.5"/>
+
+  <text x="140" y="92" fill="#13273D" font-size="44" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Sugerencias UX/UI - App movil Impulsa 360
+  </text>
+  <text x="140" y="130" fill="#4B657E" font-size="22" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Flujo sugerido: inicio operativo, formulario guiado y control de sincronizacion
+  </text>
+
+  <g filter="url(#drop)">
+    <rect x="170" y="170" width="380" height="780" rx="42" fill="#0E1D31"/>
+    <rect x="660" y="170" width="380" height="780" rx="42" fill="#0E1D31"/>
+    <rect x="1150" y="170" width="380" height="780" rx="42" fill="#0E1D31"/>
+
+    <rect x="186" y="190" width="348" height="740" rx="30" fill="#F5F9FE"/>
+    <rect x="676" y="190" width="348" height="740" rx="30" fill="#F5F9FE"/>
+    <rect x="1166" y="190" width="348" height="740" rx="30" fill="#F5F9FE"/>
+
+    <rect x="186" y="190" width="348" height="170" rx="30" fill="url(#phoneTop)"/>
+    <rect x="676" y="190" width="348" height="170" rx="30" fill="url(#phoneTop)"/>
+    <rect x="1166" y="190" width="348" height="170" rx="30" fill="url(#phoneTop)"/>
+  </g>
+
+  <rect x="300" y="206" width="120" height="24" rx="12" fill="#FFFFFF" fill-opacity="0.25"/>
+  <text x="211" y="266" fill="#FFFFFF" font-size="19" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Hola, Ray</text>
+  <text x="211" y="294" fill="#D2E4FF" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">3 formularios sin sincronizar</text>
+
+  <rect x="211" y="324" width="144" height="32" rx="16" fill="#0FA968"/>
+  <text x="226" y="345" fill="#FFFFFF" font-size="14" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Conectado</text>
+
+  <text x="211" y="405" fill="#11283D" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Panel rapido</text>
+
+  <rect x="211" y="428" width="146" height="110" rx="18" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="228" y="462" fill="#607A94" font-size="14" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Hoy</text>
+  <text x="228" y="500" fill="#132A40" font-size="32" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">12</text>
+  <text x="228" y="523" fill="#607A94" font-size="13" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">activaciones</text>
+
+  <rect x="374" y="428" width="146" height="110" rx="18" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="391" y="462" fill="#607A94" font-size="14" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Pendiente</text>
+  <text x="391" y="500" fill="#132A40" font-size="32" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">3</text>
+  <text x="391" y="523" fill="#607A94" font-size="13" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">por subir</text>
+
+  <rect x="211" y="562" width="309" height="120" rx="20" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="232" y="596" fill="#1A334A" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Ultima actividad</text>
+  <text x="232" y="624" fill="#4E6780" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Mercado - Zona Centro</text>
+  <text x="232" y="647" fill="#4E6780" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Foto subida correctamente</text>
+  <rect x="419" y="614" width="84" height="34" rx="17" fill="#E8F5EE"/>
+  <text x="436" y="636" fill="#127A4B" font-size="13" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">OK</text>
+
+  <rect x="211" y="704" width="309" height="56" rx="18" fill="url(#cta)"/>
+  <text x="273" y="739" fill="#1B2229" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Nueva activacion</text>
+
+  <rect x="211" y="780" width="309" height="56" rx="18" fill="#1769FF"/>
+  <text x="301" y="815" fill="#FFFFFF" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Sincronizar</text>
+
+  <text x="701" y="266" fill="#FFFFFF" font-size="19" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Formulario guiado</text>
+  <text x="701" y="294" fill="#D2E4FF" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Paso 2 de 4 - Datos cliente</text>
+
+  <rect x="701" y="324" width="293" height="12" rx="6" fill="#254465"/>
+  <rect x="701" y="324" width="157" height="12" rx="6" fill="#FFB703"/>
+
+  <text x="701" y="400" fill="#11283D" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Tipo de activacion</text>
+  <rect x="701" y="416" width="293" height="54" rx="14" fill="#FFFFFF" stroke="#D3E2F2"/>
+  <text x="721" y="450" fill="#2C465F" font-size="15" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Comercio</text>
+
+  <text x="701" y="505" fill="#11283D" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Nombre del cliente</text>
+  <rect x="701" y="520" width="293" height="54" rx="14" fill="#FFFFFF" stroke="#D3E2F2"/>
+  <text x="721" y="554" fill="#2C465F" font-size="15" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Juan Perez</text>
+
+  <text x="701" y="608" fill="#11283D" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Telefono</text>
+  <rect x="701" y="623" width="293" height="54" rx="14" fill="#FFFFFF" stroke="#D3E2F2"/>
+  <text x="721" y="657" fill="#2C465F" font-size="15" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">70000000</text>
+
+  <text x="701" y="711" fill="#11283D" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Foto de evidencia</text>
+  <rect x="701" y="726" width="293" height="96" rx="16" fill="#EAF2FA" stroke="#C8DDF1" stroke-dasharray="6 6"/>
+  <text x="787" y="780" fill="#4C6882" font-size="16" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Tomar foto</text>
+
+  <text x="1191" y="266" fill="#FFFFFF" font-size="19" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Historial y estados</text>
+  <text x="1191" y="294" fill="#D2E4FF" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Filtro por fecha / estado</text>
+
+  <rect x="1191" y="324" width="148" height="40" rx="14" fill="#FFFFFF" fill-opacity="0.2"/>
+  <text x="1230" y="349" fill="#FFFFFF" font-size="14" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Hoy</text>
+
+  <rect x="1351" y="324" width="143" height="40" rx="14" fill="#FFFFFF" fill-opacity="0.2"/>
+  <text x="1392" y="349" fill="#FFFFFF" font-size="14" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Estado</text>
+
+  <rect x="1191" y="396" width="303" height="104" rx="18" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="1212" y="429" fill="#122C44" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">ID: AC-00128</text>
+  <text x="1212" y="456" fill="#52708A" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Mercado / Centro</text>
+  <rect x="1380" y="421" width="96" height="32" rx="16" fill="#E8F5EE"/>
+  <text x="1405" y="442" fill="#127A4B" font-size="12" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Subido</text>
+
+  <rect x="1191" y="520" width="303" height="104" rx="18" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="1212" y="553" fill="#122C44" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">ID: AC-00129</text>
+  <text x="1212" y="580" fill="#52708A" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Tienda / Satelite Norte</text>
+  <rect x="1368" y="545" width="108" height="32" rx="16" fill="#FFF2E1"/>
+  <text x="1391" y="566" fill="#B86A00" font-size="12" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Pendiente</text>
+
+  <rect x="1191" y="644" width="303" height="104" rx="18" fill="#FFFFFF" stroke="#D5E4F3"/>
+  <text x="1212" y="677" fill="#122C44" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">ID: AC-00130</text>
+  <text x="1212" y="704" fill="#52708A" font-size="14" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Comercio / Equipetrol</text>
+  <rect x="1375" y="669" width="101" height="32" rx="16" fill="#FDE8EA"/>
+  <text x="1400" y="690" fill="#A7313C" font-size="12" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Error</text>
+
+  <rect x="1191" y="780" width="303" height="56" rx="18" fill="#1769FF"/>
+  <text x="1274" y="815" fill="#FFFFFF" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Reintentar</text>
+
+  <text x="218" y="983" fill="#3D5873" font-size="18" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    1) Home operativo
+  </text>
+  <text x="708" y="983" fill="#3D5873" font-size="18" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    2) Formulario por pasos
+  </text>
+  <text x="1198" y="983" fill="#3D5873" font-size="18" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    3) Historial con estados claros
+  </text>
+</svg>

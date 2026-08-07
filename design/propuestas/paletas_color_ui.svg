@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1600" y2="1100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7F9FC"/>
+      <stop offset="1" stop-color="#ECF2F7"/>
+    </linearGradient>
+    <linearGradient id="cardGradA" x1="120" y1="170" x2="480" y2="940" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F8FAFF"/>
+    </linearGradient>
+    <linearGradient id="cardGradB" x1="620" y1="170" x2="980" y2="940" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F2FAFB"/>
+    </linearGradient>
+    <linearGradient id="cardGradC" x1="1120" y1="170" x2="1480" y2="940" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F7FBF6"/>
+    </linearGradient>
+    <filter id="shadow" x="80" y="150" width="1480" height="850" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="14"/>
+      <feGaussianBlur stdDeviation="18"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.066 0 0 0 0 0.133 0 0 0 0 0.2 0 0 0 0.16 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1100" fill="url(#bgGrad)"/>
+
+  <circle cx="1450" cy="120" r="170" fill="#D8E7F7" fill-opacity="0.55"/>
+  <circle cx="190" cy="1020" r="220" fill="#DDEFD8" fill-opacity="0.45"/>
+
+  <text x="120" y="95" fill="#13263A" font-size="44" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Propuestas visuales - Paletas para Impulsa 360
+  </text>
+  <text x="120" y="132" fill="#45607A" font-size="22" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Cada paleta incluye fondo, texto, primario, acento, exito y alerta
+  </text>
+
+  <g filter="url(#shadow)">
+    <rect x="120" y="170" rx="28" width="420" height="780" fill="url(#cardGradA)"/>
+    <rect x="620" y="170" rx="28" width="420" height="780" fill="url(#cardGradB)"/>
+    <rect x="1120" y="170" rx="28" width="420" height="780" fill="url(#cardGradC)"/>
+  </g>
+
+  <text x="150" y="240" fill="#0E2A47" font-size="30" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Ruta Urbana</text>
+  <text x="150" y="272" fill="#5D7690" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Alta legibilidad + foco operativo</text>
+
+  <rect x="150" y="315" width="360" height="80" rx="16" fill="#101E2E"/>
+  <text x="170" y="365" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Fondo #101E2E</text>
+
+  <rect x="150" y="415" width="360" height="80" rx="16" fill="#EDF3F9"/>
+  <text x="170" y="465" fill="#22384D" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Superficie #EDF3F9</text>
+
+  <rect x="150" y="515" width="360" height="80" rx="16" fill="#1769FF"/>
+  <text x="170" y="565" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Primario #1769FF</text>
+
+  <rect x="150" y="615" width="360" height="80" rx="16" fill="#FF8A00"/>
+  <text x="170" y="665" fill="#1C2229" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Acento #FF8A00</text>
+
+  <rect x="150" y="715" width="360" height="80" rx="16" fill="#0FA968"/>
+  <text x="170" y="765" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Exito #0FA968</text>
+
+  <rect x="150" y="815" width="360" height="80" rx="16" fill="#D63A45"/>
+  <text x="170" y="865" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Alerta #D63A45</text>
+
+  <text x="650" y="240" fill="#0F2B32" font-size="30" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Confianza Productiva</text>
+  <text x="650" y="272" fill="#4A717A" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Perfil profesional y limpio</text>
+
+  <rect x="650" y="315" width="360" height="80" rx="16" fill="#102A43"/>
+  <text x="670" y="365" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Fondo #102A43</text>
+
+  <rect x="650" y="415" width="360" height="80" rx="16" fill="#F4FBFD"/>
+  <text x="670" y="465" fill="#0D2A33" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Superficie #F4FBFD</text>
+
+  <rect x="650" y="515" width="360" height="80" rx="16" fill="#00A8B5"/>
+  <text x="670" y="565" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Primario #00A8B5</text>
+
+  <rect x="650" y="615" width="360" height="80" rx="16" fill="#FFB703"/>
+  <text x="670" y="665" fill="#232323" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Acento #FFB703</text>
+
+  <rect x="650" y="715" width="360" height="80" rx="16" fill="#22A06B"/>
+  <text x="670" y="765" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Exito #22A06B</text>
+
+  <rect x="650" y="815" width="360" height="80" rx="16" fill="#C73E1D"/>
+  <text x="670" y="865" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Alerta #C73E1D</text>
+
+  <text x="1150" y="240" fill="#1E321D" font-size="30" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Campo Activo</text>
+  <text x="1150" y="272" fill="#58735A" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Calido, cercano y funcional</text>
+
+  <rect x="1150" y="315" width="360" height="80" rx="16" fill="#1E2D24"/>
+  <text x="1170" y="365" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Fondo #1E2D24</text>
+
+  <rect x="1150" y="415" width="360" height="80" rx="16" fill="#F6FAF3"/>
+  <text x="1170" y="465" fill="#203328" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Superficie #F6FAF3</text>
+
+  <rect x="1150" y="515" width="360" height="80" rx="16" fill="#2D6A4F"/>
+  <text x="1170" y="565" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Primario #2D6A4F</text>
+
+  <rect x="1150" y="615" width="360" height="80" rx="16" fill="#F4A261"/>
+  <text x="1170" y="665" fill="#2C1B10" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Acento #F4A261</text>
+
+  <rect x="1150" y="715" width="360" height="80" rx="16" fill="#3FA34D"/>
+  <text x="1170" y="765" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Exito #3FA34D</text>
+
+  <rect x="1150" y="815" width="360" height="80" rx="16" fill="#D1495B"/>
+  <text x="1170" y="865" fill="#FFFFFF" font-size="22" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Alerta #D1495B</text>
+
+  <text x="120" y="1010" fill="#3C536A" font-size="20" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Recomendacion: empezar con Ruta Urbana para mantener contraste y rendimiento en campo.
+  </text>
+</svg>
