@@ -3,14 +3,18 @@ import {
   ActivityIndicator,
   Image,
   Modal,
+  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
   useWindowDimensions,
 } from 'react-native';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { Picker } from '@react-native-picker/picker';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
 import { resolverUrlDeFoto } from '../lib/upload';
@@ -30,9 +34,35 @@ const esRolAdministrador = (value) => {
   );
 };
 
-const claveDetalle = (equipoId, activadorId) => `${equipoId}:${activadorId}`;
+const TIPOS_ACTIVACION = [
+  { key: 'comercio', label: 'Comercio' },
+  { key: 'no_habilitado', label: 'No habilitado' },
+  { key: 'reactivacion', label: 'Reactivación' },
+  { key: 'config_cuenta', label: 'Configuración de cuenta' },
+  { key: 'reimpresion_qr', label: 'Reimpresión QR' },
+  { key: 'reactivacion_comercio', label: 'Reactivación Comercio' },
+  { key: 'limbo', label: 'Limbo (Configuración de Cuenta)' },
+  { key: 'transeunte', label: 'Transeúnte' },
+  { key: 'reactivacion_transeunte', label: 'Reactivación Transeúnte' },
+];
+
+const claveDetalleFiltrada = (equipoId, activadorId, desde, hasta) => [
+  equipoId,
+  activadorId,
+  desde || '',
+  hasta || '',
+].join(':');
 const nombreVisible = (value, fallback) => normalizarNombreVisible(value || '') || fallback;
 const fechaVisible = (item) => String(item?.fecha_activacion || item?.created_at || '').slice(0, 10) || 'Sin fecha';
+const clienteVisible = (item) => [item?.nombres_cliente, item?.apellidos_cliente].filter(Boolean).join(' ').trim();
+const fechaPicker = (value) => (value ? new Date(`${value}T12:00:00`) : new Date());
+const fechaIso = (date) => date.toISOString().slice(0, 10);
+const fechaLegible = (value) => {
+  if (!value) return 'Todas';
+  const [year, month, day] = String(value).split('-');
+  if (!year || !month || !day) return value;
+  return `${day}/${month}/${year}`;
+};
 const resumirActivadores = (activadores) => (activadores || []).reduce((resumen, activador) => ({
   activadores: resumen.activadores + 1,
   hoy: resumen.hoy + Number(activador?.hoy || 0),
@@ -97,10 +127,16 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
-  const [abiertos, setAbiertos] = useState({});
   const [detalles, setDetalles] = useState({});
   const [detalleLoading, setDetalleLoading] = useState({});
   const [detalleErrores, setDetalleErrores] = useState({});
+  const [vistaDetalle, setVistaDetalle] = useState(false);
+  const [filtros, setFiltros] = useState({ desde: '', hasta: '', activador: '', tipo: '' });
+  const [filtrosAplicados, setFiltrosAplicados] = useState({ desde: '', hasta: '' });
+  const [filtrosError, setFiltrosError] = useState('');
+  const [selectorFecha, setSelectorFecha] = useState(null);
+  const [activadorSeleccionado, setActivadorSeleccionado] = useState(null);
+  const [activacionSeleccionada, setActivacionSeleccionada] = useState(null);
   const [foto, setFoto] = useState(null);
   const [fotoLoading, setFotoLoading] = useState(false);
   const [fotoError, setFotoError] = useState('');
@@ -121,8 +157,8 @@ export default function ControlActivadores({ usuario, isConnected }) {
 
     try {
       const { data, error: queryError } = await supabase.rpc('control_activadores_jerarquia', {
-        p_desde: null,
-        p_hasta: null,
+        p_desde: filtrosAplicados.desde || null,
+        p_hasta: filtrosAplicados.hasta || null,
       });
       if (queryError) throw queryError;
       setRows(Array.isArray(data) ? data : []);
@@ -137,26 +173,36 @@ export default function ControlActivadores({ usuario, isConnected }) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [isConnected]);
+  }, [filtrosAplicados.desde, filtrosAplicados.hasta, isConnected]);
 
   useEffect(() => {
     cargar();
   }, [cargar]);
 
   const jerarquia = useMemo(() => agruparJerarquia(rows), [rows]);
+  const activadoresGlobales = useMemo(
+    () => jerarquia.flatMap((lider) => lider.equipos.flatMap((equipo) => equipo.activadores)),
+    [jerarquia],
+  );
+  const resumenGlobal = useMemo(() => resumirActivadores(activadoresGlobales), [activadoresGlobales]);
+  const integrantes = useMemo(
+    () => jerarquia.flatMap((lider) => lider.equipos.flatMap((equipo) => equipo.activadores.map((activador) => ({
+      ...activador,
+      liderId: lider.id,
+      liderNombre: lider.nombre,
+      equipoId: equipo.id,
+      equipoNombre: equipo.nombre,
+      equipoNumero: equipo.numero,
+    })))),
+    [jerarquia],
+  );
+  const integrantesFiltrados = useMemo(() => {
+    if (!filtros.activador) return integrantes;
+    return integrantes.filter((item) => item.id === filtros.activador);
+  }, [filtros.activador, integrantes]);
 
-  const alternar = useCallback((key) => {
-    setAbiertos((actual) => ({ ...actual, [key]: !actual[key] }));
-  }, []);
-
-  const alternarActivaciones = useCallback(async (equipoId, activadorId) => {
-    const key = claveDetalle(equipoId, activadorId);
-    if (abiertos[key]) {
-      alternar(key);
-      return;
-    }
-
-    setAbiertos((actual) => ({ ...actual, [key]: true }));
+  const cargarActivaciones = useCallback(async (equipoId, activadorId) => {
+    const key = claveDetalleFiltrada(equipoId, activadorId, filtrosAplicados.desde, filtrosAplicados.hasta);
     if (Object.prototype.hasOwnProperty.call(detalles, key) || detalleLoading[key]) return;
 
     setDetalleLoading((actual) => ({ ...actual, [key]: true }));
@@ -165,8 +211,8 @@ export default function ControlActivadores({ usuario, isConnected }) {
       const { data, error: queryError } = await supabase.rpc('control_activaciones_detalle', {
         p_activador_id: activadorId,
         p_equipo_id: equipoId,
-        p_desde: null,
-        p_hasta: null,
+        p_desde: filtrosAplicados.desde || null,
+        p_hasta: filtrosAplicados.hasta || null,
       });
       if (queryError) throw queryError;
       setDetalles((actual) => ({ ...actual, [key]: Array.isArray(data) ? data : [] }));
@@ -178,7 +224,86 @@ export default function ControlActivadores({ usuario, isConnected }) {
     } finally {
       setDetalleLoading((actual) => ({ ...actual, [key]: false }));
     }
-  }, [abiertos, detalleLoading, detalles, alternar]);
+  }, [detalleLoading, detalles, filtrosAplicados.desde, filtrosAplicados.hasta]);
+
+  const seleccionarActivador = useCallback((activador) => {
+    setActivadorSeleccionado(activador);
+    cargarActivaciones(activador.equipoId, activador.id);
+  }, [cargarActivaciones]);
+
+  const seleccionarFiltroActivador = useCallback((activadorId) => {
+    setFiltros((actual) => ({ ...actual, activador: activadorId }));
+    setActivacionSeleccionada(null);
+    if (!activadorId) {
+      setActivadorSeleccionado(null);
+      return;
+    }
+    const activador = integrantes.find((item) => item.id === activadorId);
+    if (activador) seleccionarActivador(activador);
+  }, [integrantes, seleccionarActivador]);
+
+  const cambiarFecha = useCallback((campo, event, date) => {
+    if (Platform.OS !== 'ios') setSelectorFecha(null);
+    if (event?.type === 'dismissed' || !date) return;
+    setFiltros((actual) => ({ ...actual, [campo]: fechaIso(date) }));
+    setFiltrosError('');
+  }, []);
+
+  const aplicarFiltros = useCallback(() => {
+    const desde = filtros.desde.trim();
+    const hasta = filtros.hasta.trim();
+    if (desde && hasta && desde > hasta) {
+      setFiltrosError('La fecha Desde no puede ser mayor que Hasta.');
+      return;
+    }
+    setFiltrosError('');
+    setDetalles({});
+    setDetalleErrores({});
+    setActivacionSeleccionada(null);
+    setFiltrosAplicados({ desde, hasta });
+  }, [filtros.desde, filtros.hasta]);
+
+  const renderControlFecha = (campo, label) => (
+    <View style={styles.filterInput}>
+      <Text style={styles.filterLabel}>{label}</Text>
+      {Platform.OS === 'web' ? (
+        <View style={styles.webDateWrapper}>
+          <Text style={styles.dateButtonText}>{fechaLegible(filtros[campo])}</Text>
+          <TextInput
+            accessibilityLabel={label}
+            value={filtros[campo]}
+            onChangeText={(value) => {
+              setFiltros((actual) => ({ ...actual, [campo]: value }));
+              setFiltrosError('');
+            }}
+            style={styles.webDateInput}
+            type="date"
+          />
+        </View>
+      ) : (
+        <TouchableOpacity style={styles.dateButton} onPress={() => setSelectorFecha(campo)}>
+          <Text style={styles.dateButtonText}>{fechaLegible(filtros[campo])}</Text>
+        </TouchableOpacity>
+      )}
+      {!!filtros[campo] && (
+        <TouchableOpacity
+          style={styles.clearDateButton}
+          onPress={() => {
+            setFiltros((actual) => ({ ...actual, [campo]: '' }));
+            setFiltrosError('');
+            if (selectorFecha === campo) setSelectorFecha(null);
+          }}
+        >
+          <Text style={styles.clearDateText}>Limpiar</Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+
+  useEffect(() => {
+    if (!activadorSeleccionado) return;
+    cargarActivaciones(activadorSeleccionado.equipoId, activadorSeleccionado.id);
+  }, [activadorSeleccionado, cargarActivaciones]);
 
   const abrirFoto = useCallback(async (ruta, titulo) => {
     if (!ruta) return;
@@ -197,140 +322,85 @@ export default function ControlActivadores({ usuario, isConnected }) {
   }, []);
 
   const renderActivacion = (item) => {
-    const cliente = [item?.nombres_cliente, item?.apellidos_cliente].filter(Boolean).join(' ').trim();
+    const cliente = clienteVisible(item);
     return (
-      <View key={item.id} style={styles.activationCard}>
+      <TouchableOpacity key={item.id} style={styles.activationCard} onPress={() => setActivacionSeleccionada(item)} activeOpacity={0.8}>
         <View style={styles.rowBetween}>
           <Text style={styles.activationDate}>{fechaVisible(item)}</Text>
           <Text style={styles.activationType}>{item?.tipo_activacion || 'Activación'}</Text>
         </View>
         {!!cliente && <Text style={styles.activationClient}>{cliente}</Text>}
         {!!item?.plaza && <Text style={styles.meta}>Plaza: {item.plaza}</Text>}
-        {(item?.foto_url || item?.foto_cash_in) ? (
-          <View style={styles.evidenceRow}>
-            {!!item.foto_url && (
-              <TouchableOpacity style={styles.evidenceButton} onPress={() => abrirFoto(item.foto_url, 'Evidencia de activación')}>
-                <Text style={styles.evidenceText}>Foto activación</Text>
-              </TouchableOpacity>
-            )}
-            {!!item.foto_cash_in && (
-              <TouchableOpacity style={styles.evidenceButton} onPress={() => abrirFoto(item.foto_cash_in, 'Evidencia Cash-In')}>
-                <Text style={styles.evidenceText}>Foto Cash-In</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        ) : <Text style={styles.meta}>Sin evidencias fotográficas.</Text>}
-      </View>
+      </TouchableOpacity>
     );
   };
 
-  const renderActivador = (equipo, activador) => {
-    const key = claveDetalle(equipo.id, activador.id);
-    const abierto = !!abiertos[key];
-    const activaciones = detalles[key] || [];
-    return (
-      <View key={activador.id} style={styles.activatorCard}>
-        <TouchableOpacity onPress={() => alternarActivaciones(equipo.id, activador.id)} activeOpacity={0.75}>
-          <View style={styles.rowBetween}>
-            <Text style={styles.activatorName}>{activador.nombre}</Text>
-            <Text style={styles.chevron}>{abierto ? '▲' : '▼'}</Text>
-          </View>
-          <View style={styles.metricsRow}>
-            {[['Hoy', activador.hoy], ['Semana', activador.semana], ['Mes', activador.mes], ['Total', activador.total]].map(([label, value]) => (
-              <View key={label} style={styles.metric}>
-                <Text style={styles.metricValue}>{value}</Text>
-                <Text style={styles.metricLabel}>{label}</Text>
-              </View>
-            ))}
-          </View>
-          <Text style={styles.actionText}>{abierto ? 'Ocultar activaciones' : 'Ver activaciones'}</Text>
-        </TouchableOpacity>
-        {abierto && (
-          <View style={styles.activationsContainer}>
-            {detalleLoading[key] ? (
-              <ActivityIndicator color={colors.primary} />
-            ) : detalleErrores[key] ? (
-              <Text style={styles.inlineError}>{detalleErrores[key]}</Text>
-            ) : activaciones.length === 0 ? (
-              <Text style={styles.emptyInline}>No hay activaciones atribuibles a este equipo.</Text>
-            ) : activaciones.map(renderActivacion)}
-          </View>
-        )}
-      </View>
-    );
-  };
-
-  const renderResumen = (activadores) => {
-    const resumen = resumirActivadores(activadores);
-    return (
-      <View style={styles.summaryRow}>
-        {[
-          ['Activadores', resumen.activadores],
-          ['Hoy', resumen.hoy],
-          ['Semana', resumen.semana],
-          ['Mes', resumen.mes],
-          ['Total', resumen.total],
-        ].map(([label, value]) => (
-          <View key={label} style={styles.summaryMetric}>
-            <Text style={styles.summaryValue}>{value}</Text>
-            <Text style={styles.summaryLabel}>{label}</Text>
-          </View>
-        ))}
-      </View>
-    );
-  };
-
-  const renderEquipo = (equipo) => {
-    const key = `equipo:${equipo.id}`;
-    const abierto = !!abiertos[key];
-    const etiqueta = equipo.numero ? `Equipo ${equipo.numero} · ${equipo.nombre}` : equipo.nombre;
-    return (
-      <View key={equipo.id} style={styles.teamCard}>
-        <TouchableOpacity style={styles.sectionButton} onPress={() => alternar(key)} activeOpacity={0.75}>
-          <View style={styles.flexOne}>
-            <Text style={styles.teamName}>{etiqueta}</Text>
-            <Text style={styles.meta}>{equipo.activadores.length} activador(es)</Text>
-          </View>
-          <Text style={styles.chevron}>{abierto ? '▲' : '▼'}</Text>
-        </TouchableOpacity>
-        {renderResumen(equipo.activadores)}
-        {abierto && (
-          <View style={styles.teamContent}>
-            {equipo.activadores.length === 0
-              ? <Text style={styles.emptyInline}>Este equipo no tiene activadores vigentes.</Text>
-              : equipo.activadores.map((activador) => renderActivador(equipo, activador))}
-          </View>
-        )}
-      </View>
-    );
-  };
-
-  const renderLider = (lider) => {
-    const activadores = lider.equipos.flatMap((equipo) => equipo.activadores);
-    if (!administrador) {
-      return (
-        <View key={lider.id}>
-          <View style={styles.ownLeaderSummary}>
-            <Text style={styles.leaderName}>{lider.nombre}</Text>
-            {renderResumen(activadores)}
-          </View>
-          {lider.equipos.map(renderEquipo)}
+  const renderResumenGlobal = () => (
+    <View style={styles.globalGrid}>
+      {[
+        ['Activadores', resumenGlobal.activadores],
+        ['Hoy', resumenGlobal.hoy],
+        ['Semana', resumenGlobal.semana],
+        ['Mes', resumenGlobal.mes],
+        ['Total', resumenGlobal.total],
+      ].map(([label, value]) => (
+        <View key={label} style={styles.globalMetric}>
+          <Text style={styles.globalValue}>{value}</Text>
+          <Text style={styles.globalLabel}>{label}</Text>
         </View>
-      );
-    }
-    const key = `lider:${lider.id}`;
-    const abierto = !!abiertos[key];
+      ))}
+    </View>
+  );
+
+  const renderDetalleActivador = () => {
+    if (!activadorSeleccionado) return null;
+    const key = claveDetalleFiltrada(
+      activadorSeleccionado.equipoId,
+      activadorSeleccionado.id,
+      filtrosAplicados.desde,
+      filtrosAplicados.hasta,
+    );
+    const tipoFiltro = filtros.tipo;
+    const activaciones = (detalles[key] || []).filter(
+      (item) => !tipoFiltro || item?.tipo_activacion === tipoFiltro,
+    );
+    const resumenFiltrado = {
+      hoy: activaciones.filter((item) => fechaVisible(item) === new Date().toISOString().slice(0, 10)).length,
+      semana: activaciones.filter((item) => {
+        const fecha = new Date(`${fechaVisible(item)}T00:00:00`);
+        const hoy = new Date();
+        const inicioSemana = new Date(hoy);
+        inicioSemana.setDate(hoy.getDate() - hoy.getDay() + 1);
+        inicioSemana.setHours(0, 0, 0, 0);
+        return fecha >= inicioSemana && fecha <= hoy;
+      }).length,
+      mes: activaciones.filter((item) => fechaVisible(item).slice(0, 7) === new Date().toISOString().slice(0, 7)).length,
+      total: activaciones.length,
+    };
     return (
-      <View key={lider.id} style={styles.leaderCard}>
-        <TouchableOpacity style={styles.sectionButton} onPress={() => alternar(key)} activeOpacity={0.75}>
-          <View style={styles.flexOne}>
-            <Text style={styles.leaderName}>{lider.nombre}</Text>
-            <Text style={styles.meta}>{lider.equipos.length} equipo(s)</Text>
-          </View>
-          <Text style={styles.chevron}>{abierto ? '▲' : '▼'}</Text>
-        </TouchableOpacity>
-        {renderResumen(activadores)}
-        {abierto && <View style={styles.leaderContent}>{lider.equipos.map(renderEquipo)}</View>}
+      <View style={styles.selectedCard}>
+        <Text style={styles.selectedName}>{activadorSeleccionado.nombre}</Text>
+        <Text style={styles.meta}>
+          {activadorSeleccionado.equipoNumero ? `Equipo ${activadorSeleccionado.equipoNumero} · ` : ''}
+          {activadorSeleccionado.equipoNombre}
+        </Text>
+        <View style={styles.metricsRow}>
+          {[['Hoy', resumenFiltrado.hoy], ['Semana', resumenFiltrado.semana], ['Mes', resumenFiltrado.mes], ['Total', resumenFiltrado.total]].map(([label, value]) => (
+            <View key={label} style={styles.metric}>
+              <Text style={styles.metricValue}>{value}</Text>
+              <Text style={styles.metricLabel}>{label}</Text>
+            </View>
+          ))}
+        </View>
+        <View style={styles.activationsContainer}>
+          {detalleLoading[key] ? (
+            <ActivityIndicator color={colors.primary} />
+          ) : detalleErrores[key] ? (
+            <Text style={styles.inlineError}>{detalleErrores[key]}</Text>
+          ) : activaciones.length === 0 ? (
+            <Text style={styles.emptyInline}>No hay activaciones atribuibles a este equipo.</Text>
+          ) : activaciones.map(renderActivacion)}
+        </View>
       </View>
     );
   };
@@ -348,9 +418,9 @@ export default function ControlActivadores({ usuario, isConnected }) {
     <View style={styles.container}>
       <View style={styles.header}>
         <View style={styles.flexOne}>
-          <Text style={styles.title}>Control Activadores</Text>
+          <Text style={styles.title}>{vistaDetalle ? 'Ver Detalle' : 'Métricas Generales'}</Text>
           <Text style={styles.subtitle}>
-            {administrador ? 'Líderes, equipos y activadores' : 'Tus equipos y activadores'}
+            {administrador ? 'Todos los equipos autorizados' : 'Tus equipos autorizados'}
           </Text>
         </View>
         <TouchableOpacity style={styles.refreshButton} onPress={() => cargar({ manual: true })} disabled={refreshing}>
@@ -362,9 +432,98 @@ export default function ControlActivadores({ usuario, isConnected }) {
         contentContainerStyle={styles.list}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => cargar({ manual: true })} tintColor={colors.primary} />}
       >
-        {jerarquia.length === 0
-          ? <View style={styles.emptyCard}><Text style={styles.message}>No hay equipos vigentes para mostrar.</Text></View>
-          : jerarquia.map(renderLider)}
+        {jerarquia.length === 0 ? (
+          <View style={styles.emptyCard}><Text style={styles.message}>No hay equipos vigentes para mostrar.</Text></View>
+        ) : vistaDetalle ? (
+          <>
+            <TouchableOpacity
+              style={styles.backButton}
+              onPress={() => {
+                setVistaDetalle(false);
+                setActivadorSeleccionado(null);
+              }}
+            >
+              <Text style={styles.backButtonText}>Volver a Métricas Generales</Text>
+            </TouchableOpacity>
+            <View style={styles.filtersCard}>
+              <Text style={styles.membersTitle}>Filtros</Text>
+              <View style={styles.filtersRow}>
+                {renderControlFecha('desde', 'Desde')}
+                {renderControlFecha('hasta', 'Hasta')}
+              </View>
+              {Platform.OS !== 'web' && selectorFecha && (
+                <DateTimePicker
+                  value={fechaPicker(filtros[selectorFecha])}
+                  mode="date"
+                  display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                  onChange={(event, date) => cambiarFecha(selectorFecha, event, date)}
+                />
+              )}
+              <Text style={styles.filterLabel}>Activador</Text>
+              <View style={styles.pickerShell}>
+                <Picker
+                  selectedValue={filtros.activador}
+                  onValueChange={seleccionarFiltroActivador}
+                  style={styles.picker}
+                >
+                  <Picker.Item label="Todos" value="" />
+                  {integrantes.map((item) => (
+                    <Picker.Item key={`${item.equipoId}:${item.id}`} label={item.nombre} value={item.id} />
+                  ))}
+                </Picker>
+              </View>
+              <Text style={styles.filterLabel}>Tipo de activación</Text>
+              <View style={styles.pickerShell}>
+                <Picker
+                  selectedValue={filtros.tipo}
+                  onValueChange={(tipo) => setFiltros((actual) => ({ ...actual, tipo }))}
+                  style={styles.picker}
+                >
+                  <Picker.Item label="Todos" value="" />
+                  {TIPOS_ACTIVACION.map((item) => (
+                    <Picker.Item key={item.key} label={item.label} value={item.key} />
+                  ))}
+                </Picker>
+              </View>
+              {!!filtrosError && <Text style={styles.inlineError}>{filtrosError}</Text>}
+              <TouchableOpacity style={styles.applyButton} onPress={aplicarFiltros}>
+                <Text style={styles.applyButtonText}>Aplicar filtros</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.membersCard}>
+              <Text style={styles.membersTitle}>Integrantes</Text>
+              {integrantesFiltrados.length === 0 ? (
+                <Text style={styles.emptyInline}>No hay integrantes con ese criterio.</Text>
+              ) : integrantesFiltrados.map((item) => {
+                const selected = activadorSeleccionado?.id === item.id && activadorSeleccionado?.equipoId === item.equipoId;
+                return (
+                  <TouchableOpacity
+                    key={`${item.equipoId}:${item.id}`}
+                    style={[styles.memberRow, selected && styles.memberRowSelected]}
+                    onPress={() => seleccionarActivador(item)}
+                  >
+                    <View style={styles.flexOne}>
+                      <Text style={styles.memberName}>{item.nombre}</Text>
+                      <Text style={styles.meta}>
+                        {item.equipoNumero ? `Equipo ${item.equipoNumero} · ` : ''}{item.equipoNombre}
+                        {administrador ? ` · ${item.liderNombre}` : ''}
+                      </Text>
+                    </View>
+                    <Text style={styles.memberTotal}>{item.total}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            {renderDetalleActivador()}
+          </>
+        ) : (
+          <View style={styles.globalCard}>
+            {renderResumenGlobal()}
+            <TouchableOpacity style={styles.detailButton} onPress={() => setVistaDetalle(true)}>
+              <Text style={styles.detailButtonText}>VER DETALLE</Text>
+            </TouchableOpacity>
+          </View>
+        )}
       </ScrollView>
 
       <Modal visible={!!foto} transparent animationType="fade" onRequestClose={() => setFoto(null)}>
@@ -381,6 +540,46 @@ export default function ControlActivadores({ usuario, isConnected }) {
             ) : foto?.uri ? (
               <Image source={{ uri: foto.uri }} style={[styles.photo, { height: height * 0.62 }]} resizeMode="contain" />
             ) : null}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={!!activacionSeleccionada} transparent animationType="slide" onRequestClose={() => setActivacionSeleccionada(null)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { maxHeight: height * 0.85 }]}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.modalTitle}>Detalle de activación</Text>
+              <TouchableOpacity onPress={() => setActivacionSeleccionada(null)}><Text style={styles.closeText}>Cerrar</Text></TouchableOpacity>
+            </View>
+            <ScrollView style={styles.detailScroll} showsVerticalScrollIndicator={false}>
+              <Text style={styles.detailLabel}>Cliente</Text>
+              <Text style={styles.detailValue}>{clienteVisible(activacionSeleccionada) || 'Sin cliente'}</Text>
+              <Text style={styles.detailLabel}>Tipo</Text>
+              <Text style={styles.detailValue}>{activacionSeleccionada?.tipo_activacion || 'Sin tipo'}</Text>
+              <Text style={styles.detailLabel}>Fecha</Text>
+              <Text style={styles.detailValue}>{fechaVisible(activacionSeleccionada)}</Text>
+              <Text style={styles.detailLabel}>Plaza</Text>
+              <Text style={styles.detailValue}>{activacionSeleccionada?.plaza || 'Sin plaza'}</Text>
+              <Text style={styles.detailLabel}>Equipo histórico</Text>
+              <Text style={styles.detailValue}>{activacionSeleccionada?.equipo_id_registro || activadorSeleccionado?.equipoNombre || 'Sin equipo'}</Text>
+              <Text style={styles.detailLabel}>Líder histórico</Text>
+              <Text style={styles.detailValue}>{activacionSeleccionada?.lider_id_registro || activadorSeleccionado?.liderNombre || 'Sin líder'}</Text>
+              <Text style={styles.detailLabel}>Evidencias</Text>
+              {(activacionSeleccionada?.foto_url || activacionSeleccionada?.foto_cash_in) ? (
+                <View style={styles.evidenceRow}>
+                  {!!activacionSeleccionada.foto_url && (
+                    <TouchableOpacity style={styles.evidenceButton} onPress={() => abrirFoto(activacionSeleccionada.foto_url, 'Evidencia de activación')}>
+                      <Text style={styles.evidenceText}>Foto activación</Text>
+                    </TouchableOpacity>
+                  )}
+                  {!!activacionSeleccionada.foto_cash_in && (
+                    <TouchableOpacity style={styles.evidenceButton} onPress={() => abrirFoto(activacionSeleccionada.foto_cash_in, 'Evidencia Cash-In')}>
+                      <Text style={styles.evidenceText}>Foto Cash-In</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              ) : <Text style={styles.detailValue}>Sin evidencias disponibles.</Text>}
+            </ScrollView>
           </View>
         </View>
       </Modal>
@@ -402,27 +601,42 @@ const styles = StyleSheet.create({
   errorText: { color: colors.danger },
   list: { paddingBottom: 100 },
   emptyCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.xl },
-  leaderCard: { backgroundColor: colors.surface, borderRadius: radius.lg, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder, overflow: 'hidden' },
-  ownLeaderSummary: { backgroundColor: colors.surface, borderRadius: radius.lg, marginBottom: spacing.md, paddingTop: spacing.md, borderWidth: 1, borderColor: colors.cardBorder, overflow: 'hidden' },
-  leaderName: { color: colors.text, fontSize: fontSizes.medium, fontWeight: '800' },
-  leaderContent: { paddingHorizontal: spacing.sm, paddingBottom: spacing.sm },
-  teamCard: { backgroundColor: colors.surface, borderRadius: radius.md, marginBottom: spacing.sm, borderWidth: 1, borderColor: colors.cardBorder, overflow: 'hidden' },
-  teamName: { color: colors.text, fontSize: fontSizes.medium, fontWeight: '700' },
-  teamContent: { paddingHorizontal: spacing.sm, paddingBottom: spacing.sm },
-  sectionButton: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, padding: spacing.md },
-  chevron: { color: colors.primary, fontSize: 12, fontWeight: '800' },
+  globalCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
+  globalGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  globalMetric: { flexGrow: 1, flexBasis: '30%', alignItems: 'center', backgroundColor: colors.surfaceAlt, borderRadius: radius.md, padding: spacing.md },
+  globalValue: { color: colors.primaryDark, fontWeight: '900', fontSize: fontSizes.xlarge },
+  globalLabel: { color: colors.textMuted, fontSize: fontSizes.small, marginTop: 3, textAlign: 'center' },
+  detailButton: { backgroundColor: colors.primary, borderRadius: radius.md, paddingVertical: spacing.md, alignItems: 'center', marginTop: spacing.md },
+  detailButtonText: { color: '#fff', fontWeight: '900', fontSize: fontSizes.small },
+  backButton: { alignSelf: 'flex-start', paddingVertical: spacing.sm, marginBottom: spacing.sm },
+  backButtonText: { color: colors.primary, fontWeight: '800' },
+  membersCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
+  filtersCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
+  filtersRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  filterInput: { flex: 1, minWidth: 140 },
+  filterLabel: { color: colors.textMuted, fontSize: 12, fontWeight: '800', marginBottom: spacing.xs },
+  dateButton: { minHeight: 44, backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, justifyContent: 'center', paddingHorizontal: spacing.md, marginBottom: spacing.md },
+  dateButtonText: { color: colors.text, fontWeight: '700' },
+  webDateWrapper: { minHeight: 44, backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, justifyContent: 'center', paddingHorizontal: spacing.md, marginBottom: spacing.md, overflow: 'hidden' },
+  webDateInput: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, opacity: 0, cursor: 'pointer' },
+  clearDateButton: { alignSelf: 'flex-start', paddingVertical: spacing.xs, marginBottom: spacing.sm },
+  clearDateText: { color: colors.primary, fontWeight: '800', fontSize: 12 },
+  pickerShell: { backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, marginBottom: spacing.md, overflow: 'hidden' },
+  picker: { color: colors.text },
+  applyButton: { backgroundColor: colors.primary, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: 'center' },
+  applyButtonText: { color: '#fff', fontWeight: '800' },
+  membersTitle: { color: colors.text, fontSize: fontSizes.medium, fontWeight: '800', marginBottom: spacing.sm },
+  memberRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, borderRadius: radius.md, padding: spacing.sm, marginBottom: spacing.xs, backgroundColor: colors.surfaceAlt },
+  memberRowSelected: { borderWidth: 1, borderColor: colors.primary },
+  memberName: { color: colors.text, fontWeight: '800' },
+  memberTotal: { color: colors.primaryDark, fontWeight: '900', minWidth: 36, textAlign: 'right' },
+  selectedCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
+  selectedName: { color: colors.text, fontSize: fontSizes.medium, fontWeight: '900' },
   meta: { color: colors.textMuted, fontSize: 12, marginTop: 3 },
-  activatorCard: { backgroundColor: colors.surfaceAlt, borderRadius: radius.md, padding: spacing.md, marginTop: spacing.sm },
-  activatorName: { flex: 1, color: colors.text, fontWeight: '800', fontSize: fontSizes.medium },
   metricsRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: spacing.md },
   metric: { flex: 1, alignItems: 'center' },
   metricValue: { color: colors.primary, fontWeight: '800', fontSize: fontSizes.large },
   metricLabel: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
-  summaryRow: { flexDirection: 'row', paddingHorizontal: spacing.sm, paddingBottom: spacing.md },
-  summaryMetric: { flex: 1, alignItems: 'center' },
-  summaryValue: { color: colors.primaryDark, fontWeight: '800', fontSize: fontSizes.small },
-  summaryLabel: { color: colors.textMuted, fontSize: 9, marginTop: 2, textAlign: 'center' },
-  actionText: { color: colors.primary, fontWeight: '700', fontSize: 12, textAlign: 'center', marginTop: spacing.sm },
   activationsContainer: { marginTop: spacing.md, borderTopWidth: 1, borderTopColor: colors.cardBorder, paddingTop: spacing.sm },
   activationCard: { backgroundColor: colors.surface, borderRadius: radius.sm, padding: spacing.sm, marginBottom: spacing.sm },
   rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: spacing.sm },
@@ -438,6 +652,9 @@ const styles = StyleSheet.create({
   modalCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md },
   modalTitle: { flex: 1, color: colors.text, fontSize: fontSizes.medium, fontWeight: '800' },
   closeText: { color: colors.primary, fontWeight: '800' },
+  detailScroll: { marginTop: spacing.md },
+  detailLabel: { color: colors.textMuted, fontSize: 12, fontWeight: '800', marginTop: spacing.sm },
+  detailValue: { color: colors.text, fontSize: fontSizes.small, fontWeight: '600', marginTop: 3 },
   photoLoader: { minHeight: 220 },
   photo: { width: '100%', marginTop: spacing.md, backgroundColor: colors.background, borderRadius: radius.md },
 });

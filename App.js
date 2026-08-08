@@ -356,6 +356,7 @@ function AppShell() {
           plaza: plazaPerfil || plazaCache || 'No especificada',
           plazas_temporales: plazasTemporales,
           rol: perfil?.rol || perfil?.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || user.user_metadata?.rol || user.user_metadata?.role || 'activador',
+          puede_activar: perfil?.puede_activar === true || cacheMismoUsuario?.puede_activar === true,
         };
 
         setUsuario(usuarioFinal);
@@ -509,8 +510,9 @@ function AppShell() {
       (rol) => rolNormalizado === rol || rolNormalizado.startsWith(`${rol}_`),
     )
     || esHibrido;
-  const puedeFormulario = esAdministrador || !esLider || esHibrido;
-  const puedeActivaciones = esAdministrador || !esLider || esHibrido;
+  const liderPuedeActivar = esLider && usuario?.puede_activar === true;
+  const puedeFormulario = esAdministrador || !esLider || esHibrido || liderPuedeActivar;
+  const puedeActivaciones = esAdministrador || !esLider || esHibrido || liderPuedeActivar;
   const puedeControl = esAdministrador || esLider;
   const vistasPermitidas = [
     ...(puedeFormulario ? ['formulario'] : []),

@@ -305,6 +305,7 @@ export default function AuthScreen({ onLogin }) {
         nombre: nombrePerfil || nombreCache || nombreMetadata || usuario.email,
         plaza: plazaPerfil || plazaCache || 'No especificada',
         rol: perfil?.rol || perfil?.role || usuarioCache?.rol || usuarioCache?.role || usuario.user_metadata?.rol || usuario.user_metadata?.role || 'activador',
+        puede_activar: perfil?.puede_activar === true || usuarioCache?.puede_activar === true,
       };
 
       await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));

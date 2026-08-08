@@ -65,16 +65,6 @@ const RUBROS_COMERCIO = [
   'Servicios Personales',
   'Reparación de Vehículos',
 ];
-const GUIA_RUBROS = [
-  ['Comercio', 'Ferreterías; Tiendas de Barrio; Frutas y Verduras; Ropa, accesorios y artículos del hogar; Tecnología y repuestos.'],
-  ['Servicios Profesionales', 'Abogados, contadores y otros.'],
-  ['Servicio de Comida', 'Restaurantes; servicios de comida.'],
-  ['Servicio de Transporte', 'Taxi, mototaxi, buses, delivery y otros.'],
-  ['Manufactura Artesanal', 'Artesanías, tejidos, bisutería y otros.'],
-  ['Ambulantes', 'Venta directa en vía pública, sin local fijo.'],
-  ['Servicios Personales', 'Salones de belleza, gimnasios y otros.'],
-  ['Reparación de Vehículos', 'Talleres, cambio de aceite y otros.'],
-];
 const TIPOS_ERROR = ['Conectividad', 'Aplicación', 'Registro', 'Cash-In', 'Otro'];
 
 const CIUDADES = [
@@ -381,7 +371,6 @@ export default function FormularioActivacion({
   const [fotoPrincipal, setFotoPrincipal] = useState(null);
   const [fotoCashIn, setFotoCashIn] = useState(null);
   const [evidenciaPreview, setEvidenciaPreview] = useState(null);
-  const [guiaRubrosVisible, setGuiaRubrosVisible] = useState(false);
   const [estadoGuardado, setEstadoGuardado] = useState('');
   const [activacionGuardada, setActivacionGuardada] = useState(false);
   const [guardando, setGuardando] = useState(false);
@@ -389,8 +378,8 @@ export default function FormularioActivacion({
   const [detectandoCiudad, setDetectandoCiudad] = useState(isConnected !== false);
   const { width, height } = useWindowDimensions();
   const guiaRubrosImageHeight = Math.max(
-    110,
-    Math.min(220, (width - spacing.md * 4) / 1.5, height * 0.25),
+    180,
+    Math.min((width - spacing.md * 4) / 1.5, height * 0.46),
   );
   const botonShadow = Platform.OS === 'web'
     ? { boxShadow: '0px 2px 6px rgba(0,0,0,0.3)' }
@@ -1062,6 +1051,13 @@ export default function FormularioActivacion({
                 <Picker.Item key={item.key} label={item.label} value={item.key} />
               ))}
             </Picker>
+            {requiereComercioGeneral && (
+              <Image
+                source={require('../assets/comercio.png')}
+                style={[styles.guiaImagen, { height: guiaRubrosImageHeight }]}
+                resizeMode="contain"
+              />
+            )}
 
           </>
         ) : null}
@@ -1090,12 +1086,7 @@ export default function FormularioActivacion({
 
         {requiereComercioGeneral && (
           <>
-            <View style={styles.rubroTitleRow}>
-              <Text style={styles.label}>Rubro *</Text>
-              <TouchableOpacity onPress={() => setGuiaRubrosVisible(true)} style={styles.guiaRubroButton}>
-                <Text style={styles.guiaRubroButtonText}>Ver guía</Text>
-              </TouchableOpacity>
-            </View>
+            <Text style={styles.label}>Rubro *</Text>
             <Picker selectedValue={formulario.rubro_comercio} onValueChange={(v) => actualizarCampo('rubro_comercio', v)} style={styles.picker}>
               <Picker.Item label="Seleccionar..." value="" />
               {RUBROS_COMERCIO.map((item) => <Picker.Item key={item} label={item} value={item} />)}
@@ -1255,30 +1246,6 @@ export default function FormularioActivacion({
               <TouchableOpacity style={styles.previewActionDanger} onPress={eliminarEvidencia}><Text style={styles.previewActionDangerText}>Eliminar foto</Text></TouchableOpacity>
             </View>
             <TouchableOpacity style={styles.previewClose} onPress={() => setEvidenciaPreview(null)}><Text style={styles.previewCloseText}>Cerrar</Text></TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-
-      <Modal visible={guiaRubrosVisible} transparent animationType="slide" onRequestClose={() => setGuiaRubrosVisible(false)}>
-        <View style={styles.previewBackdrop}>
-          <View style={styles.guiaRubrosPanel}>
-            <Text style={styles.previewTitle}>Guía de Rubros</Text>
-            <ScrollView showsVerticalScrollIndicator={false}>
-              <Image
-                source={require('../assets/comercio.png')}
-                style={[styles.guiaImagen, { height: guiaRubrosImageHeight }]}
-                resizeMode="contain"
-              />
-              {GUIA_RUBROS.map(([titulo, referencia]) => (
-                <View key={titulo} style={styles.guiaRubroItem}>
-                  <Text style={styles.guiaRubroTitle}>{titulo}</Text>
-                  <Text style={styles.guiaRubroText}>{referencia}</Text>
-                </View>
-              ))}
-            </ScrollView>
-            <TouchableOpacity style={styles.previewClose} onPress={() => setGuiaRubrosVisible(false)}>
-              <Text style={styles.previewCloseText}>Cerrar</Text>
-            </TouchableOpacity>
           </View>
         </View>
       </Modal>
@@ -1498,6 +1465,7 @@ const styles = StyleSheet.create({
   guiaImagen: {
     width: '100%',
     maxWidth: '100%',
+    aspectRatio: 1.5,
     alignSelf: 'center',
     marginBottom: spacing.sm,
   },
@@ -1698,47 +1666,6 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: fontSizes.small,
     fontWeight: '600',
-  },
-  rubroTitleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  guiaRubroButton: {
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-  },
-  guiaRubroButtonText: {
-    color: colors.primary,
-    fontSize: fontSizes.small,
-    fontWeight: '700',
-  },
-  guiaRubrosPanel: {
-    width: '100%',
-    maxWidth: 560,
-    maxHeight: '85%',
-    backgroundColor: colors.surface,
-    borderRadius: radius.lg,
-    borderWidth: 1,
-    borderColor: colors.cardBorder,
-    padding: spacing.md,
-  },
-  guiaRubroItem: {
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: radius.md,
-    padding: spacing.sm,
-    marginBottom: spacing.xs,
-  },
-  guiaRubroTitle: {
-    color: colors.primaryDark,
-    fontSize: fontSizes.small,
-    fontWeight: '800',
-    marginBottom: 3,
-  },
-  guiaRubroText: {
-    color: colors.text,
-    fontSize: fontSizes.small,
-    lineHeight: 19,
   },
   saveStatus: {
     flexDirection: 'row',
