@@ -54,7 +54,6 @@ const TIPOS_TRANSEUNTE = [
 ];
 
 const TAMANOS_TIENDA = ['Pequeña', 'Mediana', 'Grande'];
-const TIPOS_COMERCIO = ['Comercio', 'Hogar y Muebles', 'Transporte y Servicio', 'Cuidado Personal y Belleza', 'Educación y Entretenimiento', 'Consumo'];
 const RUBROS_COMERCIO = [
   'Comercio',
   'Servicios Profesionales',
@@ -64,6 +63,7 @@ const RUBROS_COMERCIO = [
   'Ambulantes',
   'Servicios Personales',
   'Reparación de Vehículos',
+  'Otro',
 ];
 const TIPOS_ERROR = ['Conectividad', 'Aplicación', 'Registro', 'Cash-In', 'Otro'];
 
@@ -372,15 +372,13 @@ export default function FormularioActivacion({
   const [fotoCashIn, setFotoCashIn] = useState(null);
   const [evidenciaPreview, setEvidenciaPreview] = useState(null);
   const [estadoGuardado, setEstadoGuardado] = useState('');
+  const [mensajeGuardado, setMensajeGuardado] = useState('');
   const [activacionGuardada, setActivacionGuardada] = useState(false);
   const [guardando, setGuardando] = useState(false);
   const guardandoRef = useRef(false);
   const [detectandoCiudad, setDetectandoCiudad] = useState(isConnected !== false);
   const { width, height } = useWindowDimensions();
-  const guiaRubrosImageHeight = Math.max(
-    180,
-    Math.min((width - spacing.md * 4) / 1.5, height * 0.46),
-  );
+  const guiaRubrosImageHeight = Math.max(150, Math.min((width - spacing.md * 4) / 1.5, height * 0.38));
   const botonShadow = Platform.OS === 'web'
     ? { boxShadow: '0px 2px 6px rgba(0,0,0,0.3)' }
     : shadow.base;
@@ -725,12 +723,10 @@ export default function FormularioActivacion({
     if (requiereTiendaBarrio && !data.tamano_tienda) {
       return 'Selecciona el tamaño de la tienda.';
     }
-    if (requiereComercioGeneral && !data.tipo_comercio) {
-      return 'Selecciona el tipo de comercio.';
-    }
     // Nota: `tipo_tienda` se mantiene en el estado para compatibilidad,
     // pero la UI ya usa `tamano_tienda` como campo único de tamaño.
     if (requiereComercioGeneral && !data.rubro_comercio) return 'Selecciona el rubro del comercio.';
+    if (requiereComercioGeneral && data.rubro_comercio === 'Otro' && !data.rubro_comercio_otro.trim()) return 'Especifica el otro rubro del comercio.';
     if (requiereComercioGeneral && data.comercio_fuera_mercado === null) return 'Indica si el comercio está fuera del mercado.';
     if (data.hubo_error && !data.tipo_error) return 'Selecciona el tipo de error.';
     if (data.hubo_error && data.tipo_error === 'Otro' && !data.descripcion_error.trim()) return 'Describe el error.';
@@ -842,17 +838,16 @@ export default function FormularioActivacion({
         try {
           syncResult = await onSincronizar?.({ showAlerts: false, force: true });
         } catch (syncError) {
-          console.error('Error al sincronizar formulario guardado:', syncError);
+          console.error('[sync] error al sincronizar formulario guardado:', syncError?.message || syncError);
           syncResult = { status: 'error' };
         }
       }
-      if (syncResult?.status === 'synced' || syncResult?.synced > 0) {
-        setEstadoGuardado('Sincronizada');
-      } else if (syncResult?.status === 'error') {
-        setEstadoGuardado('Guardada localmente · error al sincronizar');
-      } else {
-        setEstadoGuardado('Guardada localmente · pendiente de sincronización');
-      }
+      const sincronizada = syncResult?.status === 'synced' && syncResult?.synced > 0;
+      const mensajeFinal = sincronizada
+        ? 'Activación sincronizada'
+        : 'Activación guardada. Pendiente de sincronización.';
+      setEstadoGuardado(mensajeFinal);
+      setMensajeGuardado(mensajeFinal);
       setFormulario({
         ...formularioInicial,
         id: '',
@@ -864,7 +859,6 @@ export default function FormularioActivacion({
       setFotoPrincipal(null);
       setFotoCashIn(null);
       setActivacionGuardada(true);
-      setEstadoGuardado('Activación guardada correctamente. Este registro ya no puede ser modificado.');
     } catch (err) {
       console.error('Error al guardar formulario:', err);
       Alert.alert('Error', err?.message ? err.message : 'No se pudo guardar el formulario.');
@@ -883,15 +877,16 @@ export default function FormularioActivacion({
     return (
       <View style={[styles.container, width <= 430 && styles.containerMobile]}>
         <View style={styles.saveDoneCard}>
-          <Text style={styles.saveDoneTitle}>Activación guardada</Text>
+          <Text style={styles.saveDoneTitle}>{mensajeGuardado || 'Activación guardada'}</Text>
           <Text style={styles.saveDoneText}>
-            Activación guardada correctamente. Este registro ya no puede ser modificado.
+            Este registro ya no puede ser modificado.
           </Text>
           <View style={styles.saveDoneActions}>
             <TouchableOpacity
               onPress={() => {
                 setActivacionGuardada(false);
                 setEstadoGuardado('');
+                setMensajeGuardado('');
               }}
               style={[styles.saveDoneButton, { backgroundColor: colors.primary, ...botonShadow }]}
               activeOpacity={0.85}
@@ -1062,35 +1057,35 @@ export default function FormularioActivacion({
           </>
         ) : null}
 
-        {requiereComercioGeneral && (
-          <>
-            <Text style={styles.label}>Tipo de Comercio</Text>
-            <Picker
-              selectedValue={formulario.tipo_comercio}
-              onValueChange={(v) => setFormulario((prev) => ({
-                ...prev,
-                tipo_comercio: v,
-              }))}
-              style={styles.picker}
-            >
-              <Picker.Item label="Seleccionar..." value="" />
-              {TIPOS_COMERCIO.map(item => (
-                <Picker.Item key={item} label={item} value={item} />
-              ))}
-            </Picker>
-          </>
-        )}
-
         {/* `tipo_tienda` estaba duplicando el campo de tamaño; se oculta en la UI
             y se utiliza únicamente `tamano_tienda` para mantener un único valor. */}
+        {/* `tipo_comercio` se conserva solo para compatibilidad histórica. */}
 
         {requiereComercioGeneral && (
           <>
             <Text style={styles.label}>Rubro *</Text>
-            <Picker selectedValue={formulario.rubro_comercio} onValueChange={(v) => actualizarCampo('rubro_comercio', v)} style={styles.picker}>
+            <Picker
+              selectedValue={formulario.rubro_comercio}
+              onValueChange={(v) => setFormulario((prev) => ({
+                ...prev,
+                rubro_comercio: v,
+                rubro_comercio_otro: v === 'Otro' ? prev.rubro_comercio_otro : '',
+              }))}
+              style={styles.picker}
+            >
               <Picker.Item label="Seleccionar..." value="" />
               {RUBROS_COMERCIO.map((item) => <Picker.Item key={item} label={item} value={item} />)}
             </Picker>
+            {formulario.rubro_comercio === 'Otro' && (
+              <>
+                <Text style={styles.label}>Otro rubro *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={formulario.rubro_comercio_otro}
+                  onChangeText={(v) => actualizarCampo('rubro_comercio_otro', v)}
+                />
+              </>
+            )}
             <Text style={styles.label}>¿Comercio fuera del mercado?</Text>
             <Picker selectedValue={formulario.comercio_fuera_mercado} onValueChange={(v) => actualizarCampo('comercio_fuera_mercado', v)} style={styles.picker}>
               <Picker.Item label="Seleccionar..." value={null} />
@@ -1467,7 +1462,8 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
     aspectRatio: 1.5,
     alignSelf: 'center',
-    marginBottom: spacing.sm,
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
   },
   switchRow: {
     flexDirection: 'row',

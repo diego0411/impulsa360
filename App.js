@@ -35,6 +35,15 @@ import { hasOfflinePin } from './lib/offlinePin';
 import { obtenerConteoNoLeidas } from './lib/notificaciones';
 
 const MIN_BRANDED_INTRO_MS = 3200;
+const syncDebug = (...args) => {
+  if (typeof __DEV__ !== 'undefined' && __DEV__) console.log('[sync]', ...args);
+};
+const syncWarn = (...args) => {
+  if (typeof __DEV__ !== 'undefined' && __DEV__) console.warn('[sync]', ...args);
+};
+const syncError = (...args) => {
+  if (typeof __DEV__ !== 'undefined' && __DEV__) console.error('[sync]', ...args);
+};
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
 class AppErrorBoundary extends React.Component {
@@ -83,7 +92,14 @@ function AppShell() {
   }, []);
 
   const sincronizarFormularios = useCallback(async ({ showAlerts = true, force = false } = {}) => {
-    if (syncingRef.current) return { status: 'busy', synced: 0, errors: [] };
+    if (syncingRef.current) {
+      if (force) {
+        for (let attempt = 0; attempt < 20 && syncingRef.current; attempt += 1) {
+          await new Promise((resolve) => globalThis.setTimeout(resolve, 300));
+        }
+      }
+      if (syncingRef.current) return { status: 'busy', synced: 0, errors: [] };
+    }
     if (!usuario?.id) {
       if (showAlerts) {
         Alert.alert('Sesión requerida', 'Vuelve a iniciar sesión antes de sincronizar.');
@@ -102,6 +118,7 @@ function AppShell() {
     lastSyncRef.current = now;
 
     syncingRef.current = true;
+    syncDebug('inicio', { force, showAlerts });
     try {
       const formularios = await obtenerFormulariosLocales();
       if (!formularios.length) {
@@ -177,6 +194,7 @@ function AppShell() {
         delete formulario.fecha_hora;
 
         if (!formulario.foto_url || !formulario.foto_cash_in) {
+          syncWarn('fotos obligatorias faltantes', { localId, recordId });
           errores.push(`ID local ${localId}: Faltan las dos fotos obligatorias.`);
           continue;
         }
@@ -190,6 +208,7 @@ function AppShell() {
           if (isLocalPhotoUri) {
             const fileInfo = await FileSystem.getInfoAsync(fotoLocalUri, { size: true }).catch(() => null);
             if (!fileInfo?.exists) {
+              syncWarn('foto local no encontrada', { localId, recordId, key, fotoLocalUri });
               errores.push(`ID local ${localId}: La foto (${key}) ya no está en el dispositivo. Debes tomarla nuevamente.`);
               fotoUploadFailed = true;
               continue;
@@ -197,6 +216,7 @@ function AppShell() {
             try {
               const fileName = key === 'foto_cash_in' ? 'cash-in.jpg' : 'principal.jpg';
               const path = `activaciones/${usuario.id}/${recordId}/${fileName}`;
+              syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', { localId, recordId, path });
               const storagePath = await subirImagenASupabase(fotoLocalUri, path);
               if (storagePath) {
                 formulario[key] = storagePath;
@@ -204,12 +224,13 @@ function AppShell() {
                 // Si el upload fue exitoso, limpiamos la copia local persistida.
                 await FileSystem.deleteAsync(fotoLocalUri, { idempotent: true }).catch(() => {});
               } else {
+                syncWarn('upload sin storagePath', { localId, recordId, key, path });
                 errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
                 fotoUploadFailed = true;
                 continue;
               }
             } catch (e) {
-              console.warn(`⚠️ No se pudo subir foto (${key}) del formulario ${localId}:`, e?.message || e);
+              syncWarn('fallo upload foto', { localId, recordId, key, error: e?.message || e });
               errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
               fotoUploadFailed = true;
               continue;
@@ -240,12 +261,13 @@ function AppShell() {
         const { error } = await supabase
           .from('activaciones')
           .upsert(datosConUsuario, { onConflict: 'id' });
+        syncDebug('upsert', { localId, recordId, ok: !error });
 
         if (!error) {
           await eliminarFormularioLocal(localId);
           ok += 1;
         } else {
-          console.error(`❌ Error en formulario ${localId}:`, error.message);
+          syncError('fallo upsert activacion', { localId, recordId, error: error.message });
           errores.push(`ID local ${localId}: ${error.message}`);
         }
       }
@@ -260,9 +282,11 @@ function AppShell() {
           Alert.alert('Sincronización fallida', errores.slice(0, 5).join('\n'));
         }
       }
-      return { status: errores.length ? 'error' : 'synced', synced: ok, errors: errores };
+      const result = { status: errores.length ? 'error' : 'synced', synced: ok, errors: errores };
+      syncDebug('finalizacion', result);
+      return result;
     } catch (err) {
-      console.error('❌ Error general al sincronizar:', err?.message || err);
+      syncError('error general', err?.message || err);
       if (showAlerts) {
         Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
       }
@@ -270,6 +294,7 @@ function AppShell() {
     } finally {
       contarFormulariosLocales();
       syncingRef.current = false;
+      syncDebug('lock liberado');
     }
   }, [contarFormulariosLocales, isConnected, usuario?.email, usuario?.id, usuario?.nombre, usuario?.plaza]);
 
