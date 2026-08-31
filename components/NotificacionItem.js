@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 
 function formatearFecha(value) {
@@ -16,8 +17,10 @@ function formatearFecha(value) {
   });
 }
 
-export default function NotificacionItem({ item, onPress, disabled }) {
+export default function NotificacionItem({ item, onPress, disabled, usuario }) {
   const isRead = !!item?.isRead;
+  const titulo = enmascararMarcaVisible(item?.titulo || 'Notificación', usuario);
+  const mensaje = enmascararMarcaVisible(item?.mensaje || 'Sin mensaje.', usuario);
 
   return (
     <TouchableOpacity
@@ -33,8 +36,8 @@ export default function NotificacionItem({ item, onPress, disabled }) {
           </View>
         </View>
 
-        <Text style={styles.titulo}>{item?.titulo || 'Notificación'}</Text>
-        <Text style={styles.mensaje} numberOfLines={3}>{item?.mensaje || 'Sin mensaje.'}</Text>
+        <Text style={styles.titulo}>{titulo}</Text>
+        <Text style={styles.mensaje} numberOfLines={3}>{mensaje}</Text>
 
         {!isRead ? <View style={styles.dotUnread} /> : null}
       </View>

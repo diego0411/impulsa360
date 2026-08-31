@@ -3,15 +3,35 @@ import {
   View, Text, FlatList, ActivityIndicator, StyleSheet, RefreshControl, Alert,
   Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
 } from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../lib/supabase';
-import { resolverUrlDeFoto } from '../lib/upload';
-import { obtenerFormulariosLocales } from '../lib/storage';
+import { prepararImagenPersistente, resolverUrlDeFoto } from '../lib/upload';
+import { actualizarFormularioLocal, obtenerFormulariosLocales } from '../lib/storage';
 import { mismoNombreActivador, normalizarNombreVisible } from '../lib/identity';
+import { etiquetaPlaza } from '../lib/plazas';
+import { fechaEnRango, fechaLocalIso, obtenerQuincenaActual } from '../lib/quincena';
+import { withTimeout } from '../lib/asyncTimeout';
+import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 
 const PAGE_SIZE = 20;
+const QUERY_TIMEOUT_MS = 10000;
+const esFotoLocal = (value) => /^(file|content):\/\//i.test(String(value || ''));
+const esPendienteSync = (item) => item?._origen === 'local' || item?.estado_sync === 'offline_pending' || item?._sync?.status === 'pending';
+const fechaRealActivacion = (item) => item?.fecha_activacion || item?._created_at || item?.created_at || item?.creado_en;
 
-export default function FormulariosPorImpulsador({ usuario }) {
+const resolverFotoDetalle = async (value) => {
+  if (!value) return { uri: '', perdida: false };
+  if (!esFotoLocal(value)) {
+    return { uri: await resolverUrlDeFoto(value), perdida: false };
+  }
+
+  const info = await FileSystem.getInfoAsync(value, { size: true }).catch(() => null);
+  return { uri: info?.exists ? value : '', perdida: !info?.exists };
+};
+
+export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
   const [formulariosRemotos, setFormulariosRemotos] = useState([]);
   const [formulariosLocales, setFormulariosLocales] = useState([]);
   const [cargando, setCargando] = useState(true);
@@ -27,9 +47,12 @@ export default function FormulariosPorImpulsador({ usuario }) {
   const [detalleFotoUrl, setDetalleFotoUrl] = useState('');
   const [detalleFotoCashInUrl, setDetalleFotoCashInUrl] = useState('');
   const [fotoDetalleActiva, setFotoDetalleActiva] = useState('activacion');
+  const [fotosPerdidas, setFotosPerdidas] = useState({});
 
   const pageRef = useRef(0);
   const channelRef = useRef(null);
+  const hoyLocal = fechaLocalIso(new Date());
+  const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
 
   const usuarioId = usuario?.id;
   const usuarioNombre = normalizarNombreVisible(usuario?.nombre || '');
@@ -59,6 +82,7 @@ export default function FormulariosPorImpulsador({ usuario }) {
 
     const localesPendientes = (formulariosLocales || [])
       .filter((f) => {
+        if (!esPendienteSync(f) && !fechaEnRango(fechaRealActivacion(f), rangoQuincena)) return false;
         const id = String(f?.id || '');
         if (!id) return true;
         return !remotosById.has(id);
@@ -67,11 +91,11 @@ export default function FormulariosPorImpulsador({ usuario }) {
 
     const merged = [...localesPendientes, ...remotos];
     return merged.sort((a, b) => {
-      const av = String(a?.fecha_activacion || a?._created_at || a?.created_at || a?.creado_en || '');
-      const bv = String(b?.fecha_activacion || b?._created_at || b?.created_at || b?.creado_en || '');
+      const av = String(fechaRealActivacion(a) || '');
+      const bv = String(fechaRealActivacion(b) || '');
       return bv.localeCompare(av);
     });
-  }, [formulariosLocales, formulariosRemotos]);
+  }, [formulariosLocales, formulariosRemotos, rangoQuincena]);
 
   const fetchPage = useCallback(async ({ reset = false } = {}) => {
     if (!usuarioId) return;
@@ -89,17 +113,23 @@ export default function FormulariosPorImpulsador({ usuario }) {
       const from = pageRef.current * PAGE_SIZE;
       const to = from + PAGE_SIZE - 1;
 
-      const { data, error } = await supabase
-        .from('activaciones')
-        .select('*')
-        .eq('usuario_id', usuarioId)
-        .order('fecha_activacion', { ascending: false })
-        .range(from, Math.max(from, to));
+      const { data, error } = await withTimeout(
+        supabase
+          .from('activaciones')
+          .select('*')
+          .eq('usuario_id', usuarioId)
+          .gte('fecha_activacion', rangoQuincena.desde)
+          .lt('fecha_activacion', rangoQuincena.hastaExclusivo)
+          .order('fecha_activacion', { ascending: false })
+          .range(from, Math.max(from, to)),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil para cargar activaciones.'
+      );
 
       if (error) {
         console.error('❌ Supabase select error:', error);
         setLastError(error.message || String(error));
-        if (reset) Alert.alert('Error', `No se pudieron cargar los formularios.\n${error.message || ''}`);
+        if (reset) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron cargar los formularios.\n${error.message || ''}`, usuario));
         if (reset) setFormulariosRemotos([]);
         setHasMore(false);
         return;
@@ -108,12 +138,18 @@ export default function FormulariosPorImpulsador({ usuario }) {
       let rows = data || [];
       // Compatibilidad con registros antiguos sin usuario_id enlazado.
       if (reset && rows.length === 0 && usuarioNombre) {
-        const { data: legacyRows, error: legacyError } = await supabase
-          .from('activaciones')
-          .select('*')
-          .ilike('impulsador', usuarioNombre)
-          .order('fecha_activacion', { ascending: false })
-          .range(0, PAGE_SIZE - 1);
+        const { data: legacyRows, error: legacyError } = await withTimeout(
+          supabase
+            .from('activaciones')
+            .select('*')
+            .ilike('impulsador', usuarioNombre)
+            .gte('fecha_activacion', rangoQuincena.desde)
+            .lt('fecha_activacion', rangoQuincena.hastaExclusivo)
+            .order('fecha_activacion', { ascending: false })
+            .range(0, PAGE_SIZE - 1),
+          QUERY_TIMEOUT_MS,
+          'La señal está muy débil para cargar activaciones.'
+        );
         if (!legacyError && Array.isArray(legacyRows) && legacyRows.length > 0) {
           rows = legacyRows.filter((item) => mismoNombreActivador(item?.impulsador, usuarioNombre));
         }
@@ -129,13 +165,13 @@ export default function FormulariosPorImpulsador({ usuario }) {
       setLastError(err?.message || String(err));
       if (reset) setFormulariosRemotos([]);
       setHasMore(false);
-      if (reset) Alert.alert('Error', `No se pudieron cargar los formularios.\n${err?.message || ''}`);
+      if (reset) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron cargar los formularios.\n${err?.message || ''}`, usuario));
     } finally {
       setCargando(false);
       setRefreshing(false);
       setLoadingMore(false);
     }
-  }, [usuarioId, usuarioNombre]);
+  }, [rangoQuincena, usuario, usuarioId, usuarioNombre]);
 
   useEffect(() => {
     if (usuarioId) {
@@ -195,30 +231,38 @@ export default function FormulariosPorImpulsador({ usuario }) {
       setDetalleFotoUrl('');
       setDetalleFotoCashInUrl('');
       setFotoDetalleActiva('activacion');
+      setFotosPerdidas({});
       setDetalleVisible(true);
 
       const fotoRaw = item?.foto_url || '';
-      const fotoEsLocal = /^(file|content):\/\//i.test(String(fotoRaw));
+      const fotoEsLocal = esFotoLocal(fotoRaw);
       const esLocal = item?._origen === 'local' || item?.estado_sync === 'offline_pending' || fotoEsLocal;
       if (esLocal) {
         const cashInRaw = item?.foto_cash_in || '';
-        const cashInEsLocal = /^(file|content):\/\//i.test(String(cashInRaw));
-        const [fotoUrl, cashInUrl] = await Promise.all([
-          fotoEsLocal ? fotoRaw : resolverUrlDeFoto(fotoRaw),
-          cashInEsLocal ? cashInRaw : resolverUrlDeFoto(cashInRaw),
+        const [fotoResult, cashInResult] = await Promise.all([
+          resolverFotoDetalle(fotoRaw),
+          resolverFotoDetalle(cashInRaw),
         ]);
         setDetalle(item);
-        setDetalleFotoUrl(fotoUrl);
-        setDetalleFotoCashInUrl(cashInUrl);
-        setFotoDetalleActiva(fotoUrl ? 'activacion' : 'cash_in');
+        setDetalleFotoUrl(fotoResult.uri);
+        setDetalleFotoCashInUrl(cashInResult.uri);
+        setFotosPerdidas({
+          foto_url: fotoResult.perdida,
+          foto_cash_in: cashInResult.perdida,
+        });
+        setFotoDetalleActiva(fotoResult.uri ? 'activacion' : 'cash_in');
         return;
       }
 
-      const { data, error } = await supabase
-        .from('activaciones')
-        .select('*')
-        .eq('id', item?.id)
-        .single();
+      const { data, error } = await withTimeout(
+        supabase
+          .from('activaciones')
+          .select('*')
+          .eq('id', item?.id)
+          .single(),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil para cargar el detalle.'
+      );
 
       if (error) {
         console.error('❌ Detalle error:', error);
@@ -247,14 +291,91 @@ export default function FormulariosPorImpulsador({ usuario }) {
     setDetalleFotoUrl('');
     setDetalleFotoCashInUrl('');
     setFotoDetalleActiva('activacion');
+    setFotosPerdidas({});
+  };
+
+  const guardarFotoReparada = async (fieldName, uri) => {
+    if (!detalle?._id_local && !detalle?.id) return;
+    const destino = await prepararImagenPersistente(uri, fieldName);
+    const idLocal = detalle._id_local || detalle.id;
+    const localPhotos = {
+      ...(detalle._sync?.localPhotos || {}),
+      [fieldName]: destino,
+    };
+    const anterior = detalle[fieldName];
+    if (/^file:\/\//i.test(String(anterior || '')) && anterior !== destino) {
+      await FileSystem.deleteAsync(anterior, { idempotent: true }).catch(() => {});
+    }
+    const patch = {
+      [fieldName]: destino,
+      estado_sync: 'offline_pending',
+      _sync: {
+        ...(detalle._sync || {}),
+        status: 'pending',
+        error: null,
+        localPhotos,
+      },
+    };
+    await actualizarFormularioLocal(idLocal, patch);
+    const actualizado = { ...detalle, ...patch };
+    setDetalle(actualizado);
+    if (fieldName === 'foto_cash_in') {
+      setDetalleFotoCashInUrl(destino);
+      setFotoDetalleActiva('cash_in');
+    } else {
+      setDetalleFotoUrl(destino);
+      setFotoDetalleActiva('activacion');
+    }
+    setFotosPerdidas((prev) => ({ ...prev, [fieldName]: false }));
+    await cargarLocales();
+    const result = await onSincronizar?.({ showAlerts: false, force: true, targetLocalId: idLocal });
+    const sincronizada = Array.isArray(result?.syncedLocalIds)
+      ? result.syncedLocalIds.includes(idLocal)
+      : result?.status === 'synced' && result?.synced > 0;
+    if (sincronizada) {
+      Alert.alert('Activación sincronizada', 'La activación pendiente se sincronizó correctamente.');
+      cerrarDetalle();
+      await cargarLocales();
+      await fetchPage({ reset: true });
+    } else {
+      const detalleError = result?.errors?.[0] ? `\n\n${result.errors[0]}` : '';
+      Alert.alert('Guardado local', enmascararMarcaVisible(`La foto se actualizó, pero la activación sigue pendiente de sincronización.${detalleError}`, usuario));
+    }
+  };
+
+  const repararFotoPendiente = async (fieldName) => {
+    try {
+      const permiso = await ImagePicker.requestCameraPermissionsAsync();
+      if (permiso.status !== 'granted') {
+        Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la cámara.');
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.5,
+        allowsEditing: true,
+      });
+      if (result.canceled) return;
+      const uri = result.assets?.[0]?.uri;
+      if (!uri) {
+        Alert.alert('Error', 'La ruta de imagen no es válida.');
+        return;
+      }
+      await guardarFotoReparada(fieldName, uri);
+    } catch (error) {
+      console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
+      Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo actualizar la foto pendiente.', usuario));
+    }
   };
 
   const renderItem = ({ item }) => {
     const fecha = item.fecha_activacion || item.creado_en || item.created_at || '—';
-    const tipo = item.tipo_activacion || '—';
+    const tipo = enmascararMarcaVisible(item.tipo_activacion || '—', usuario);
     const esReactiv = !!item.es_reactivacion || !!item.reactivacion_comercio || /reactivaci[óo]n/i.test(tipo);
     const pendiente = item?._origen === 'local' || item?.estado_sync === 'offline_pending' || item?._sync?.status === 'pending';
-    const cliente = [item.nombres_cliente, item.apellidos_cliente].filter(Boolean).join(' ').trim();
+    const cliente = enmascararMarcaVisible([item.nombres_cliente, item.apellidos_cliente].filter(Boolean).join(' ').trim(), usuario);
+    const plazaVisible = enmascararMarcaVisible(etiquetaPlaza(item?.es_plaza_temporal ? item?.plaza_temporal : item?.plaza), usuario);
+    const syncErrorText = pendiente ? enmascararMarcaVisible(item?._sync?.error, usuario) : '';
 
     return (
       <TouchableOpacity onPress={() => abrirDetalle(item)} activeOpacity={0.75}>
@@ -274,7 +395,8 @@ export default function FormulariosPorImpulsador({ usuario }) {
           </View>
           {!!cliente && <Text style={styles.itemTitle}>{cliente}</Text>}
           <Text style={styles.itemMeta}>Tipo: {tipo}</Text>
-          {!!item.plaza && <Text style={styles.itemMeta}>Plaza: {item.plaza}</Text>}
+          {!!plazaVisible && <Text style={styles.itemMeta}>Plaza: {plazaVisible}</Text>}
+          {!!syncErrorText && <Text style={styles.syncErrorText}>Error sync: {syncErrorText}</Text>}
           <Text style={styles.itemLink}>Ver detalle</Text>
         </View>
       </TouchableOpacity>
@@ -302,7 +424,7 @@ export default function FormulariosPorImpulsador({ usuario }) {
       ) : formularios.length === 0 ? (
         <View>
           <Text style={styles.emptyText}>No hay formularios registrados.</Text>
-          {lastError ? <Text style={[styles.emptyText, { marginTop: 6 }]}>⚠️ {lastError}</Text> : null}
+          {lastError ? <Text style={[styles.emptyText, { marginTop: 6 }]}>⚠️ {enmascararMarcaVisible(lastError, usuario)}</Text> : null}
         </View>
       ) : (
         <FlatList
@@ -380,23 +502,51 @@ export default function FormulariosPorImpulsador({ usuario }) {
                   <Text style={styles.photoUnavailable}>Este registro no tiene fotografías disponibles.</Text>
                 )}
 
+                {(detalle?._origen === 'local' || detalle?.estado_sync === 'offline_pending' || detalle?._sync?.status === 'pending') ? (
+                  <View style={styles.repairBox}>
+                    <Text style={styles.repairText}>
+                      {fotosPerdidas.foto_cash_in
+                        ? 'La foto Cash-In ya no está en el dispositivo. Tómala nuevamente para sincronizar.'
+                        : fotosPerdidas.foto_url
+                          ? 'La foto de activación ya no está en el dispositivo. Tómala nuevamente para sincronizar.'
+                          : 'Si una evidencia local se perdió, vuelve a tomarla para reintentar la sincronización.'}
+                    </Text>
+                    <TouchableOpacity
+                      onPress={() => repararFotoPendiente('foto_cash_in')}
+                      style={[styles.repairButton, fotosPerdidas.foto_cash_in && styles.repairButtonWarning]}
+                      activeOpacity={0.85}
+                    >
+                      <Text style={styles.repairButtonText}>
+                        {fotosPerdidas.foto_cash_in ? 'Tomar nuevamente foto Cash-In' : 'Reemplazar foto Cash-In'}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => repararFotoPendiente('foto_url')}
+                      style={[styles.repairButton, styles.repairButtonSecondary]}
+                      activeOpacity={0.85}
+                    >
+                      <Text style={[styles.repairButtonText, styles.repairButtonTextSecondary]}>Reemplazar foto activación</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : null}
+
                 {/* Campos principales */}
                 {renderCampo('Fecha', (detalle.fecha_activacion || detalle.creado_en || detalle.created_at || '').toString().slice(0,10))}
-                {renderCampo('Tipo de activación', detalle.tipo_activacion)}
+                {renderCampo('Tipo de activación', detalle.tipo_activacion, usuario)}
                 {renderCampo('Reactivación comercio', booleanPretty(!!detalle.es_reactivacion || !!detalle.reactivacion_comercio))}
-                {renderCampo('Tipo de comercio', detalle.tipo_comercio)}
-                {renderCampo('Tamaño de tienda', detalle.tamano_tienda)}
-                {renderCampo('Tipo de tienda', detalle.tipo_tienda)}
-                {renderCampo('Rubro de comercio', detalle.rubro_comercio)}
-                {renderCampo('Otro rubro', detalle.rubro_comercio_otro)}
+                {renderCampo('Tipo de comercio', detalle.tipo_comercio, usuario)}
+                {renderCampo('Tamaño de tienda', detalle.tamano_tienda, usuario)}
+                {renderCampo('Tipo de tienda', detalle.tipo_tienda, usuario)}
+                {renderCampo('Rubro de comercio', detalle.rubro_comercio, usuario)}
+                {renderCampo('Otro rubro', detalle.rubro_comercio_otro, usuario)}
                 {renderCampo('Comercio fuera del mercado', detalle.comercio_fuera_mercado == null ? null : booleanPretty(detalle.comercio_fuera_mercado))}
-                {renderCampo('Cliente', [detalle.nombres_cliente, detalle.apellidos_cliente].filter(Boolean).join(' ').trim())}
-                {renderCampo('CI', detalle.ci_cliente)}
-                {renderCampo('Teléfono', detalle.telefono_cliente)}
-                {renderCampo('Email', detalle.email_cliente)}
-                {renderCampo('Plaza', detalle.plaza)}
-                {renderCampo('Plaza temporal', detalle.es_plaza_temporal ? detalle.plaza_temporal : null)}
-                {renderCampo('Impulsador', detalle.impulsador)}
+                {renderCampo('Cliente', [detalle.nombres_cliente, detalle.apellidos_cliente].filter(Boolean).join(' ').trim(), usuario)}
+                {renderCampo('CI', detalle.ci_cliente, usuario)}
+                {renderCampo('Teléfono', detalle.telefono_cliente, usuario)}
+                {renderCampo('Email', detalle.email_cliente, usuario)}
+                {renderCampo('Plaza', etiquetaPlaza(detalle.plaza), usuario)}
+                {renderCampo('Plaza temporal', detalle.es_plaza_temporal ? etiquetaPlaza(detalle.plaza_temporal) : null, usuario)}
+                {renderCampo('Impulsador', detalle.impulsador, usuario)}
 
                 {/* Flags */}
                 {renderCampo('Descargo app', booleanPretty(detalle.descargo_app))}
@@ -407,8 +557,8 @@ export default function FormulariosPorImpulsador({ usuario }) {
                 {renderCampo('QR físico', booleanPretty(detalle.qr_fisico))}
                 {renderCampo('Respaldo', booleanPretty(detalle.respaldo))}
                 {renderCampo('¿Hubo error?', booleanPretty(detalle.hubo_error))}
-                {!!detalle.hubo_error && renderCampo('Tipo de error', detalle.tipo_error)}
-                {!!detalle.hubo_error && renderCampo('Descripción de error', detalle.descripcion_error)}
+                {!!detalle.hubo_error && renderCampo('Tipo de error', detalle.tipo_error, usuario)}
+                {!!detalle.hubo_error && renderCampo('Descripción de error', detalle.descripcion_error, usuario)}
 
                 {/* Ubicación */}
                 {(detalle.latitud || detalle.longitud) && renderCampo('Ubicación', `${detalle.latitud ?? '—'}, ${detalle.longitud ?? '—'}`)}
@@ -428,12 +578,12 @@ export default function FormulariosPorImpulsador({ usuario }) {
 }
 
 /** Helpers de UI */
-function renderCampo(label, value) {
+function renderCampo(label, value, usuario) {
   if (value === null || value === undefined || value === '') return null;
   return (
     <View style={{ marginBottom: 10 }}>
       <Text style={{ fontSize: fontSizes.small, color: colors.textMuted, fontWeight: '600' }}>{label}</Text>
-      <Text style={{ fontSize: fontSizes.medium, color: colors.text, fontWeight: '600' }}>{String(value)}</Text>
+      <Text style={{ fontSize: fontSizes.medium, color: colors.text, fontWeight: '600' }}>{enmascararMarcaVisible(value, usuario)}</Text>
     </View>
   );
 }
@@ -521,6 +671,12 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: fontSizes.small,
     marginBottom: 2,
+  },
+  syncErrorText: {
+    color: colors.danger || '#B42318',
+    fontSize: fontSizes.small,
+    fontWeight: '600',
+    marginTop: spacing.xs,
   },
   itemLink: {
     color: colors.primary,
@@ -610,6 +766,45 @@ const styles = StyleSheet.create({
     fontSize: fontSizes.small,
     textAlign: 'center',
     marginBottom: spacing.md,
+  },
+  repairBox: {
+    borderWidth: 1,
+    borderColor: colors.cardBorder,
+    borderRadius: radius.md,
+    padding: spacing.sm,
+    marginBottom: spacing.md,
+    backgroundColor: colors.background,
+  },
+  repairText: {
+    color: colors.textMuted,
+    fontSize: fontSizes.small,
+    marginBottom: spacing.sm,
+  },
+  repairButton: {
+    minHeight: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radius.md,
+    backgroundColor: colors.primary,
+    marginTop: spacing.xs,
+    paddingHorizontal: spacing.sm,
+  },
+  repairButtonSecondary: {
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  repairButtonWarning: {
+    backgroundColor: colors.danger || '#B42318',
+  },
+  repairButtonText: {
+    color: '#FFFFFF',
+    fontSize: fontSizes.small,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  repairButtonTextSecondary: {
+    color: colors.primary,
   },
   btnCerrar: {
     marginTop: spacing.md,

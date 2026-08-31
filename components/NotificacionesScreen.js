@@ -10,13 +10,14 @@ import {
 } from 'react-native';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 import NotificacionItem from './NotificacionItem';
+import { enmascararMarcaVisible } from '../lib/brandMask';
 import {
   obtenerNotificacionesUsuario,
   marcarNotificacionLeida,
   obtenerConteoDestinatariosSinId,
 } from '../lib/notificaciones';
 
-export default function NotificacionesScreen({ usuarioId, onUnreadCountChange }) {
+export default function NotificacionesScreen({ usuarioId, usuario, onUnreadCountChange }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -89,11 +90,11 @@ export default function NotificacionesScreen({ usuarioId, onUnreadCountChange })
         return updated;
       });
     } catch (e) {
-      Alert.alert('Error', e?.message || 'No se pudo marcar la notificación como leída.');
+      Alert.alert('Error', enmascararMarcaVisible(e?.message || 'No se pudo marcar la notificación como leída.', usuario));
     } finally {
       setMarkingId(null);
     }
-  }, [onUnreadCountChange]);
+  }, [onUnreadCountChange, usuario]);
 
   if (loading) {
     return (
@@ -116,7 +117,7 @@ export default function NotificacionesScreen({ usuarioId, onUnreadCountChange })
       {error ? (
         <View style={styles.centered}>
           <Text style={styles.errorText}>No se pudieron cargar las notificaciones.</Text>
-          <Text style={styles.errorDetail}>{error}</Text>
+          <Text style={styles.errorDetail}>{enmascararMarcaVisible(error, usuario)}</Text>
           <Text style={styles.retryText} onPress={() => cargar()}>
             Reintentar
           </Text>
@@ -134,6 +135,7 @@ export default function NotificacionesScreen({ usuarioId, onUnreadCountChange })
               item={item}
               onPress={onPressItem}
               disabled={markingId === item.destinatarioId}
+              usuario={usuario}
             />
           )}
           contentContainerStyle={styles.listContent}

@@ -9,11 +9,16 @@ import {
   Image,
   Animated,
   ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
+import { withTimeout, isTimeoutError } from '../lib/asyncTimeout';
+import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 import {
   getOfflinePinStatus,
@@ -28,6 +33,9 @@ const formatSecondsToMinSec = (seconds = 0) => {
   const secs = safeSeconds % 60;
   return `${mins}:${String(secs).padStart(2, '0')}`;
 };
+const AUTH_TIMEOUT_MS = 12000;
+const QUERY_TIMEOUT_MS = 10000;
+const isDev = typeof __DEV__ !== 'undefined' && __DEV__;
 
 const normalizePinInput = (value) =>
   String(value || '').replace(/\D/g, '').slice(0, pinPolicy.maxLength);
@@ -51,8 +59,10 @@ export default function AuthScreen({ onLogin }) {
 
   const heroAnim = useRef(new Animated.Value(0)).current;
   const cardAnim = useRef(new Animated.Value(0)).current;
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     Animated.stagger(120, [
       Animated.timing(heroAnim, {
         toValue: 1,
@@ -65,6 +75,10 @@ export default function AuthScreen({ onLogin }) {
         useNativeDriver: false,
       }),
     ]).start();
+
+    return () => {
+      mountedRef.current = false;
+    };
   }, [cardAnim, heroAnim]);
 
   const hydrateOfflineState = useCallback(async ({ knownIsConnected } = {}) => {
@@ -72,6 +86,7 @@ export default function AuthScreen({ onLogin }) {
       typeof knownIsConnected === 'boolean'
         ? knownIsConnected
         : !!(await NetInfo.fetch())?.isConnected;
+    if (!mountedRef.current) return;
     setIsConnected(netOnline);
 
     let usuarioLocal = null;
@@ -84,19 +99,23 @@ export default function AuthScreen({ onLogin }) {
     } catch {
       // ignorar cache inválido
     }
+    if (!mountedRef.current) return;
     setCachedUser(usuarioLocal);
 
     if (usuarioLocal?.id) {
       const pinStatus = await getOfflinePinStatus(usuarioLocal.id);
+      if (!mountedRef.current) return;
       setOfflinePinConfigured(pinStatus.configured);
       setOfflinePinLockSeconds(pinStatus.remainingSeconds || 0);
       setOfflinePinAttemptsLeft(pinStatus.attemptsLeft ?? pinPolicy.maxFailedAttempts);
     } else {
+      if (!mountedRef.current) return;
       setOfflinePinConfigured(false);
       setOfflinePinLockSeconds(0);
       setOfflinePinAttemptsLeft(pinPolicy.maxFailedAttempts);
     }
 
+    if (!mountedRef.current) return;
     setOfflineReady(true);
   }, []);
 
@@ -246,23 +265,31 @@ export default function AuthScreen({ onLogin }) {
 
     setSubmitting(true);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: emailNormalizado,
-        password: passwordNormalizado,
-      });
+      const { data, error } = await withTimeout(
+        supabase.auth.signInWithPassword({
+          email: emailNormalizado,
+          password: passwordNormalizado,
+        }),
+        AUTH_TIMEOUT_MS,
+        'La señal está muy débil. Intenta de nuevo o usa modo offline si ya tienes PIN.'
+      );
 
       if (error) {
-        Alert.alert('Error', error.message);
+        Alert.alert('Error', enmascararMarcaVisible(error.message, pinSetupUser || cachedUser));
         return;
       }
 
       const {
         data: { session },
         error: sessionError,
-      } = await supabase.auth.getSession();
+      } = await withTimeout(
+        supabase.auth.getSession(),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil al recuperar la sesión.'
+      );
 
       if (sessionError) {
-        Alert.alert('Error', sessionError.message);
+        Alert.alert('Error', enmascararMarcaVisible(sessionError.message, pinSetupUser || cachedUser));
         return;
       }
 
@@ -272,14 +299,20 @@ export default function AuthScreen({ onLogin }) {
         return;
       }
 
-      const { data: perfil, error: errorPerfil } = await supabase
-        .from('activadores')
-        .select('*')
-        .eq('usuario_id', usuario.id)
-        .single();
+      const { data: perfil, error: errorPerfil } = await withTimeout(
+        supabase
+          .from('activadores')
+          .select('*')
+          .eq('usuario_id', usuario.id)
+          .single(),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil al cargar el perfil.'
+      );
 
       if (errorPerfil) {
-        console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
+        if (isDev) {
+          console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
+        }
       }
 
       let usuarioCache = null;
@@ -322,10 +355,14 @@ export default function AuthScreen({ onLogin }) {
 
       continuarConUsuario(usuarioFinal);
     } catch (err) {
-      Alert.alert('Error crítico', err?.message || 'Ocurrió un error inesperado.');
-      console.error('Error en autenticación:', err);
+      Alert.alert(isTimeoutError(err) ? 'Conexión lenta' : 'Error crítico', enmascararMarcaVisible(err?.message || 'Ocurrió un error inesperado.', pinSetupUser || cachedUser));
+      if (isDev) {
+        console.error('Error en autenticación:', err);
+      }
     } finally {
-      setSubmitting(false);
+      if (mountedRef.current) {
+        setSubmitting(false);
+      }
     }
   };
 
@@ -336,79 +373,90 @@ export default function AuthScreen({ onLogin }) {
   const mostrarOfflineSinSesion = !mostrarSetupPin && offlineReady && !isConnected && !cachedUser?.id;
 
   const chipLabel = isConnected ? 'En línea' : 'Sin internet';
+  const usuarioSetupVisible = enmascararMarcaVisible(pinSetupUser?.nombre || pinSetupUser?.email || '', pinSetupUser);
+  const usuarioCacheVisible = enmascararMarcaVisible(cachedUser?.nombre || cachedUser?.email || '', cachedUser);
 
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={0}
+    >
       <View style={styles.backdrop} />
       <View style={[styles.mesh, styles.meshA]} />
       <View style={[styles.mesh, styles.meshB]} />
       <View style={[styles.mesh, styles.meshC]} />
       <View style={styles.gridVeil} />
 
-      <Animated.View
-        style={[
-          styles.hero,
-          {
-            opacity: heroAnim,
-            transform: [
-              {
-                translateY: heroAnim.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [16, 0],
-                }),
-              },
-            ],
-          },
-        ]}
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
       >
-        <View style={styles.kickerRow}>
-          <View style={styles.kickerDot} />
-          <Text style={styles.kicker}>PLATAFORMA OPERATIVA</Text>
-        </View>
-        <Text style={styles.titulo}>Impulsa 360</Text>
-        <Text style={styles.tituloAccent}>Field Command</Text>
-        <Text style={styles.subtitulo}>
-          Control de activaciones con sincronización segura y respaldo inteligente.
-        </Text>
+        <Animated.View
+          style={[
+            styles.hero,
+            {
+              opacity: heroAnim,
+              transform: [
+                {
+                  translateY: heroAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [16, 0],
+                  }),
+                },
+              ],
+            },
+          ]}
+        >
+          <View style={styles.kickerRow}>
+            <View style={styles.kickerDot} />
+            <Text style={styles.kicker}>PLATAFORMA OPERATIVA</Text>
+          </View>
+          <Text style={styles.titulo}>Impulsa 360</Text>
+          <Text style={styles.tituloAccent}>Field Command</Text>
+          <Text style={styles.subtitulo}>
+            Control de activaciones con sincronización segura y respaldo inteligente.
+          </Text>
 
-        <View style={styles.brandRow}>
-          <View style={styles.logoWrap}>
-            <Image source={require('../assets/icon.png')} style={styles.logo} resizeMode="cover" />
+          <View style={styles.brandRow}>
+            <View style={styles.logoWrap}>
+              <Image source={require('../assets/icon.png')} style={styles.logo} resizeMode="cover" />
+            </View>
+            <View style={styles.brandTextWrap}>
+              <Text style={styles.brandTitle}>Cuenta corporativa</Text>
+              <Text style={styles.brandHint}>Acceso para equipos de campo</Text>
+            </View>
           </View>
-          <View style={styles.brandTextWrap}>
-            <Text style={styles.brandTitle}>Cuenta corporativa</Text>
-            <Text style={styles.brandHint}>Acceso para equipos de campo</Text>
-          </View>
-        </View>
 
-        <View style={styles.statsRow}>
-          <View style={styles.statPill}>
-            <Text style={styles.statValue}>24/7</Text>
-            <Text style={styles.statLabel}>Sync</Text>
+          <View style={styles.statsRow}>
+            <View style={styles.statPill}>
+              <Text style={styles.statValue}>24/7</Text>
+              <Text style={styles.statLabel}>Sync</Text>
+            </View>
+            <View style={styles.statPill}>
+              <Text style={styles.statValue}>PIN</Text>
+              <Text style={styles.statLabel}>Offline</Text>
+            </View>
           </View>
-          <View style={styles.statPill}>
-            <Text style={styles.statValue}>PIN</Text>
-            <Text style={styles.statLabel}>Offline</Text>
-          </View>
-        </View>
-      </Animated.View>
+        </Animated.View>
 
-      <Animated.View
-        style={[
-          styles.card,
-          {
-            opacity: cardAnim,
-            transform: [
-              {
-                translateY: cardAnim.interpolate({
-                  inputRange: [0, 1],
-                  outputRange: [24, 0],
-                }),
-              },
-            ],
-          },
-        ]}
-      >
+        <Animated.View
+          style={[
+            styles.card,
+            {
+              opacity: cardAnim,
+              transform: [
+                {
+                  translateY: cardAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [24, 0],
+                  }),
+                },
+              ],
+            },
+          ]}
+        >
         <View style={styles.cardTopAccent} />
         <View style={styles.cardHeaderRow}>
           <View style={[styles.connectionChip, isConnected ? styles.connectionChipOnline : styles.connectionChipOffline]}>
@@ -423,7 +471,7 @@ export default function AuthScreen({ onLogin }) {
               Define un PIN de {pinPolicy.minLength} a {pinPolicy.maxLength} dígitos para desbloquear la app sin internet.
             </Text>
 
-            <Text style={styles.userPreview}>Usuario: {pinSetupUser?.nombre || pinSetupUser?.email}</Text>
+            <Text style={styles.userPreview}>Usuario: {usuarioSetupVisible}</Text>
 
             <Text style={styles.fieldLabel}>Nuevo PIN</Text>
             <TextInput
@@ -478,7 +526,7 @@ export default function AuthScreen({ onLogin }) {
               Ingresa tu PIN local para desbloquear la sesión guardada en este dispositivo.
             </Text>
 
-            <Text style={styles.userPreview}>Usuario: {cachedUser?.nombre || cachedUser?.email}</Text>
+            <Text style={styles.userPreview}>Usuario: {usuarioCacheVisible}</Text>
 
             <Text style={styles.fieldLabel}>PIN local</Text>
             <TextInput
@@ -522,7 +570,7 @@ export default function AuthScreen({ onLogin }) {
             <Text style={styles.cardSub}>
               Tienes sesión local guardada, pero aún no configuraste un PIN para desbloqueo offline seguro.
             </Text>
-            <Text style={styles.userPreview}>Usuario: {cachedUser?.nombre || cachedUser?.email}</Text>
+            <Text style={styles.userPreview}>Usuario: {usuarioCacheVisible}</Text>
             <Text style={styles.helperMuted}>
               Conéctate una vez a internet, inicia sesión y crea tu PIN local.
             </Text>
@@ -574,8 +622,9 @@ export default function AuthScreen({ onLogin }) {
             </TouchableOpacity>
           </>
         )}
-      </Animated.View>
-    </View>
+        </Animated.View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -583,9 +632,13 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#050D16',
+    overflow: 'hidden',
+  },
+  scrollContent: {
+    flexGrow: 1,
     justifyContent: 'center',
     paddingHorizontal: spacing.lg - 2,
-    overflow: 'hidden',
+    paddingVertical: spacing.xl,
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,

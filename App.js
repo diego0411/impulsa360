@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as SplashScreen from 'expo-splash-screen';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -18,7 +18,11 @@ import { supabase } from './lib/supabase';
 import { HAS_SUPABASE_CONFIG, SUPABASE_CONFIG_ERROR } from './lib/config';
 import { colors, spacing, fontSizes } from './styles/theme';
 import { normalizarNombreVisible } from './lib/identity';
+import { enmascararMarcaVisible } from './lib/brandMask';
+import { tienePlazaValida } from './lib/plazas';
 import { obtenerPlazasTemporales } from './lib/plazasTemporales';
+import { withTimeout } from './lib/asyncTimeout';
+import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from './lib/elegibilidadReactivacion';
 import AuthScreen from './components/AuthScreen';
 import LaunchIntroScreen from './components/LaunchIntroScreen';
 import FormularioActivacion from './components/FormularioActivacion';
@@ -29,12 +33,17 @@ import {
   obtenerFormulariosLocales,
   eliminarFormularioLocal,
   actualizarFormularioLocal,
+  marcarErrorSync,
 } from './lib/storage';
-import { subirImagenASupabase } from './lib/upload';
+import { ACTIVACIONES_BUCKET, subirImagenASupabase } from './lib/upload';
 import { hasOfflinePin } from './lib/offlinePin';
 import { obtenerConteoNoLeidas } from './lib/notificaciones';
 
 const MIN_BRANDED_INTRO_MS = 3200;
+const SESSION_TIMEOUT_MS = 8000;
+const QUERY_TIMEOUT_MS = 10000;
+const SYNC_UPSERT_TIMEOUT_MS = 12000;
+const PHOTO_UPLOAD_TIMEOUT_MS = 45000;
 const syncDebug = (...args) => {
   if (typeof __DEV__ !== 'undefined' && __DEV__) console.log('[sync]', ...args);
 };
@@ -43,6 +52,137 @@ const syncWarn = (...args) => {
 };
 const syncError = (...args) => {
   if (typeof __DEV__ !== 'undefined' && __DEV__) console.error('[sync]', ...args);
+};
+const syncErrorInfo = (error) => ({
+  message: error?.message || String(error || 'Error desconocido'),
+  code: error?.code ?? null,
+  details: error?.details ?? null,
+  hint: error?.hint ?? null,
+  status: error?.status ?? error?.statusCode ?? null,
+});
+const syncErrorMessage = (error) => {
+  const info = syncErrorInfo(error);
+  return [
+    info.message,
+    info.code ? `code=${info.code}` : '',
+    info.status ? `status=${info.status}` : '',
+    info.details ? `details=${info.details}` : '',
+    info.hint ? `hint=${info.hint}` : '',
+  ].filter(Boolean).join(' | ');
+};
+const isLocalPhotoUri = (value) => typeof value === 'string' && /^(file|content):\/\//i.test(value);
+const isRemotePhotoRef = (value) => (
+  typeof value === 'string'
+  && value.trim()
+  && !isLocalPhotoUri(value)
+);
+const normalizeOptionalDbValue = (value) => {
+  if (typeof value === 'string' && value.trim() === '') return null;
+  return value;
+};
+const sanitizeActivationPayload = (payload = {}) => {
+  const clean = { ...payload };
+  const tipo = clean.tipo_activacion;
+  const base = clean.base_activacion;
+  const isTiendaBarrio = base === 'tienda_barrio';
+  const isComercio = base === 'comercio';
+
+  if (!isTiendaBarrio) {
+    clean.tipo_tienda = null;
+    clean.tamano_tienda = null;
+  }
+  if (!isComercio) {
+    clean.tipo_comercio = null;
+    clean.rubro_comercio = null;
+    clean.rubro_comercio_otro = null;
+    clean.comercio_fuera_mercado = null;
+  }
+  if (tipo !== 'reactivacion_comercio' && tipo !== 'reactivacion_transeunte' && tipo !== 'reactivacion') {
+    clean.reactivacion_comercio = false;
+  }
+
+  return clean;
+};
+const buildPhotoStoragePath = (usuarioId, recordId, key) => {
+  const fileName = key === 'foto_cash_in' ? 'cash-in.jpg' : 'principal.jpg';
+  return `activaciones/${usuarioId}/${recordId}/${fileName}`;
+};
+const existeFotoRemota = async (path) => {
+  if (!path) return false;
+  const { data, error } = await withTimeout(
+    supabase.storage.from(ACTIVACIONES_BUCKET).download(path),
+    QUERY_TIMEOUT_MS,
+    'La red está tardando demasiado al verificar la foto remota.'
+  );
+  if (error) {
+    syncWarn('foto remota no encontrada', { path, error: syncErrorInfo(error) });
+    return false;
+  }
+  return !!data;
+};
+const listFolderPhotoCandidates = async (folder) => {
+  if (!folder) return [];
+  const { data, error } = await withTimeout(
+    supabase.storage.from(ACTIVACIONES_BUCKET).list(folder, { limit: 20 }),
+    QUERY_TIMEOUT_MS,
+    'La red está tardando demasiado al listar fotos remotas.'
+  );
+  if (error || !Array.isArray(data)) {
+    syncWarn('no se pudo listar carpeta de fotos', { folder, error: error ? syncErrorInfo(error) : null });
+    return [];
+  }
+  return data
+    .filter((item) => item?.name && !item.name.endsWith('/'))
+    .map((item) => `${folder}/${item.name}`);
+};
+const uniqueStrings = (values) => Array.from(new Set(values.filter(Boolean)));
+const findHistoricalRemotePhoto = async ({ usuario, formulario, localId, recordId, key }) => {
+  const currentRef = formulario[key];
+  if (isRemotePhotoRef(currentRef)) return currentRef;
+
+  const usuarioIds = uniqueStrings([usuario?.id, usuario?.usuario_id, formulario?.usuario_id]);
+  const recordIds = uniqueStrings([recordId, formulario?.id, localId, formulario?._id_local]);
+  const fileNames = key === 'foto_cash_in'
+    ? ['cash-in.jpg', 'cash_in.jpg', 'foto_cash_in.jpg']
+    : ['principal.jpg', 'foto.jpg', 'foto_url.jpg'];
+  const directCandidates = [];
+  for (const userId of usuarioIds) {
+    for (const id of recordIds) {
+      for (const fileName of fileNames) {
+        directCandidates.push(`activaciones/${userId}/${id}/${fileName}`);
+      }
+    }
+  }
+  if (key === 'foto_url') {
+    for (const id of recordIds) {
+      directCandidates.push(`activaciones/${id}.jpg`);
+      directCandidates.push(`activaciones/${id}_respaldo.jpg`);
+    }
+  }
+
+  const listCandidates = [];
+  for (const userId of usuarioIds) {
+    for (const id of recordIds) {
+      listCandidates.push(...await listFolderPhotoCandidates(`activaciones/${userId}/${id}`));
+    }
+  }
+
+  const candidates = uniqueStrings([...directCandidates, ...listCandidates]);
+  const preferred = candidates.sort((a, b) => {
+    const nameA = a.toLowerCase();
+    const nameB = b.toLowerCase();
+    const score = (name) => {
+      if (key === 'foto_cash_in' && /cash[-_]?in|foto_cash_in/.test(name)) return 0;
+      if (key === 'foto_url' && /principal|foto_url|\/[^/]+\.jpg$/.test(name)) return 0;
+      return 1;
+    };
+    return score(nameA) - score(nameB);
+  });
+
+  for (const candidate of preferred) {
+    if (await existeFotoRemota(candidate)) return candidate;
+  }
+  return '';
 };
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -57,7 +197,9 @@ class AppErrorBoundary extends React.Component {
   }
 
   componentDidCatch(error, errorInfo) {
-    console.error('❌ Error en el arranque de la app:', error?.message || error, errorInfo);
+    if (typeof __DEV__ !== 'undefined' && __DEV__) {
+      console.error('❌ Error en el arranque de la app:', error?.message || error, errorInfo);
+    }
   }
 
   render() {
@@ -91,7 +233,7 @@ function AppShell() {
     setCantidadOffline(datos.length);
   }, []);
 
-  const sincronizarFormularios = useCallback(async ({ showAlerts = true, force = false } = {}) => {
+  const sincronizarFormularios = useCallback(async ({ showAlerts = true, force = false, targetLocalId = null } = {}) => {
     if (syncingRef.current) {
       if (force) {
         for (let attempt = 0; attempt < 20 && syncingRef.current; attempt += 1) {
@@ -120,8 +262,21 @@ function AppShell() {
     syncingRef.current = true;
     syncDebug('inicio', { force, showAlerts });
     try {
-      const formularios = await obtenerFormulariosLocales();
+      const todosFormularios = await obtenerFormulariosLocales();
+      const formularios = targetLocalId
+        ? todosFormularios.filter((f) => f?._id_local === targetLocalId || f?.id === targetLocalId)
+        : todosFormularios;
+      syncDebug('formularios pendientes', { count: formularios.length });
       if (!formularios.length) {
+        if (targetLocalId) {
+          return {
+            status: 'synced',
+            synced: 1,
+            errors: [],
+            syncedLocalIds: [targetLocalId],
+            syncedRecordIds: [],
+          };
+        }
         if (showAlerts) {
           Alert.alert('Sin formularios', 'No hay formularios pendientes.');
         }
@@ -130,6 +285,8 @@ function AppShell() {
 
       let ok = 0;
       const errores = [];
+      const syncedLocalIds = [];
+      const syncedRecordIds = [];
       const allowedFields = [
         'id',
         'nombres_cliente',
@@ -166,6 +323,8 @@ function AppShell() {
         'respaldo',
         'ciudad_activacion',
         'zona_activacion',
+        'distrito_gps',
+        'region_gps',
         'plaza',
         'estado_sync',
         'dispositivo',
@@ -186,6 +345,7 @@ function AppShell() {
           formulario.id = recordId;
           await actualizarFormularioLocal(localId, { id: recordId });
         }
+        syncDebug('registro local', { localId, recordId });
 
         // Asegura fecha
         formulario.fecha_activacion ??= new Date().toISOString().split('T')[0];
@@ -193,48 +353,134 @@ function AppShell() {
         // Limpia campos que no existan en la tabla
         delete formulario.fecha_hora;
 
-        if (!formulario.foto_url || !formulario.foto_cash_in) {
+        if (requiereValidacionReactivacion(formulario.tipo_activacion)) {
+          try {
+            const elegibilidad = await validarElegibilidadReactivacion({
+              ci: formulario.ci_cliente,
+              telefono: formulario.telefono_cliente,
+              tipoActivacion: formulario.tipo_activacion,
+              registroId: recordId,
+              fechaReferencia: formulario.fecha_activacion,
+            });
+            if (!elegibilidad.ok) {
+              await marcarErrorSync(localId, elegibilidad.mensaje);
+              errores.push(`ID local ${localId}: ${elegibilidad.mensaje}`);
+              continue;
+            }
+          } catch (e) {
+            const errorMsg = `No se pudo validar elegibilidad de reactivación: ${syncErrorMessage(e)}`;
+            syncError('fallo validacion reactivacion', { localId, recordId, error: syncErrorInfo(e) });
+            await marcarErrorSync(localId, errorMsg);
+            errores.push(`ID local ${localId}: ${errorMsg}`);
+            continue;
+          }
+        }
+
+        const localPhotosForCleanup = { ...(_sync?.localPhotos || {}) };
+        const effectiveFotoUrl = formulario.foto_url || localPhotosForCleanup.foto_url;
+        const effectiveFotoCashIn = formulario.foto_cash_in || localPhotosForCleanup.foto_cash_in;
+
+        if (!effectiveFotoUrl || !effectiveFotoCashIn) {
           syncWarn('fotos obligatorias faltantes', { localId, recordId });
-          errores.push(`ID local ${localId}: Faltan las dos fotos obligatorias.`);
+          const errorMsg = 'Faltan las dos fotos obligatorias.';
+          await marcarErrorSync(localId, errorMsg);
+          errores.push(`ID local ${localId}: ${errorMsg}`);
           continue;
         }
 
         // Sube imágenes pendientes
         const fotoKeys = ['foto_url', 'foto_cash_in'];
         let fotoUploadFailed = false;
+        syncDebug('rehydratedUri', { localId, recordId, localPhotos: localPhotosForCleanup });
         for (const key of fotoKeys) {
-          const fotoLocalUri = formulario[key];
-          const isLocalPhotoUri = typeof fotoLocalUri === 'string' && /^(file|content):\/\//i.test(fotoLocalUri);
-          if (isLocalPhotoUri) {
-            const fileInfo = await FileSystem.getInfoAsync(fotoLocalUri, { size: true }).catch(() => null);
+          const fieldUri = formulario[key] || localPhotosForCleanup[key];
+          const preferredLocalUri = localPhotosForCleanup[key];
+          const uploadSourceUri = isLocalPhotoUri(preferredLocalUri) ? preferredLocalUri : fieldUri;
+          const fieldAlreadyRemote = typeof fieldUri === 'string' && fieldUri && !isLocalPhotoUri(fieldUri);
+          const shouldUploadLocal = isLocalPhotoUri(uploadSourceUri) && !fieldAlreadyRemote;
+
+          if (shouldUploadLocal) {
+            const fileInfo = await FileSystem.getInfoAsync(uploadSourceUri, { size: true }).catch(() => null);
+            syncDebug('existsBeforeUpload', {
+              localId,
+              recordId,
+              key,
+              fieldUri,
+              rehydratedUri: preferredLocalUri,
+              uploadSourceUri,
+              exists: !!fileInfo?.exists,
+              size: fileInfo?.size,
+            });
             if (!fileInfo?.exists) {
-              syncWarn('foto local no encontrada', { localId, recordId, key, fotoLocalUri });
-              errores.push(`ID local ${localId}: La foto (${key}) ya no está en el dispositivo. Debes tomarla nuevamente.`);
+              const remotePath = await findHistoricalRemotePhoto({ usuario, formulario, localId, recordId, key });
+              syncWarn('foto local no encontrada', {
+                localId,
+                recordId,
+                key,
+                uploadSourceUri,
+                remotePath,
+                remoteRecovered: !!remotePath,
+              });
+              if (remotePath) {
+                formulario[key] = remotePath;
+                delete localPhotosForCleanup[key];
+                await actualizarFormularioLocal(localId, {
+                  [key]: remotePath,
+                  _sync: {
+                    ...(_sync || {}),
+                    status: 'pending',
+                    error: null,
+                    localPhotos: localPhotosForCleanup,
+                  },
+                });
+                continue;
+              }
+              const errorMsg = key === 'foto_cash_in'
+                ? 'Foto Cash-In original no recuperable. Reemplázala para sincronizar.'
+                : 'Foto de activación original no recuperable. Reemplázala para sincronizar.';
+              await marcarErrorSync(localId, errorMsg);
+              errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
             }
             try {
-              const fileName = key === 'foto_cash_in' ? 'cash-in.jpg' : 'principal.jpg';
-              const path = `activaciones/${usuario.id}/${recordId}/${fileName}`;
+              const path = buildPhotoStoragePath(usuario.id, recordId, key);
               syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', { localId, recordId, path });
-              const storagePath = await subirImagenASupabase(fotoLocalUri, path);
+              const storagePath = await withTimeout(
+                subirImagenASupabase(uploadSourceUri, path),
+                PHOTO_UPLOAD_TIMEOUT_MS,
+                'La señal está muy débil para subir la foto. Se reintentará luego.'
+              );
               if (storagePath) {
                 formulario[key] = storagePath;
-                await actualizarFormularioLocal(localId, { [key]: storagePath });
-                // Si el upload fue exitoso, limpiamos la copia local persistida.
-                await FileSystem.deleteAsync(fotoLocalUri, { idempotent: true }).catch(() => {});
+                localPhotosForCleanup[key] = uploadSourceUri;
+                await actualizarFormularioLocal(localId, {
+                  [key]: storagePath,
+                  _sync: {
+                    ...(_sync || {}),
+                    status: 'pending',
+                    error: null,
+                    localPhotos: localPhotosForCleanup,
+                  },
+                });
               } else {
                 syncWarn('upload sin storagePath', { localId, recordId, key, path });
-                errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
+                const errorMsg = `No se pudo subir la foto (${key})`;
+                await marcarErrorSync(localId, errorMsg);
+                errores.push(`ID local ${localId}: ${errorMsg}`);
                 fotoUploadFailed = true;
                 continue;
               }
             } catch (e) {
-              syncWarn('fallo upload foto', { localId, recordId, key, error: e?.message || e });
-              errores.push(`ID local ${localId}: No se pudo subir la foto (${key})`);
+              syncError('fallo upload foto', { localId, recordId, key, error: syncErrorInfo(e) });
+              const errorMsg = `No se pudo subir la foto (${key}): ${syncErrorMessage(e)}`;
+              await marcarErrorSync(localId, errorMsg);
+              errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
             }
+          } else {
+            syncDebug('foto remota existente', { localId, recordId, key, fieldUri, rehydratedUri: preferredLocalUri });
           }
         }
         if (fotoUploadFailed) {
@@ -242,33 +488,45 @@ function AppShell() {
         }
 
         // Solo enviamos columnas permitidas para evitar errores de esquema
-        const payload = allowedFields.reduce((acc, key) => {
-          if (formulario[key] !== undefined) acc[key] = formulario[key];
+        let payload = allowedFields.reduce((acc, key) => {
+          if (formulario[key] !== undefined) acc[key] = normalizeOptionalDbValue(formulario[key]);
           return acc;
         }, {});
+        payload = sanitizeActivationPayload(payload);
 
         // Añade datos del usuario actual
         const nombreImpulsador = normalizarNombreVisible(usuario?.nombre || '');
+        const plazaFallback = tienePlazaValida(usuario?.plaza) ? usuario.plaza : null;
         const datosConUsuario = {
           ...payload,
           id: recordId,
           usuario_id: usuario?.id,
           impulsador: nombreImpulsador || payload.impulsador || usuario?.email || '',
-          plaza: payload.plaza || usuario?.plaza,
+          plaza: payload.plaza || plazaFallback,
           estado_sync: 'online',
         };
 
-        const { error } = await supabase
-          .from('activaciones')
-          .upsert(datosConUsuario, { onConflict: 'id' });
+        const { error } = await withTimeout(
+          supabase.from('activaciones').upsert(datosConUsuario, { onConflict: 'id' }),
+          SYNC_UPSERT_TIMEOUT_MS,
+          'La señal está muy débil para sincronizar. Se reintentará luego.'
+        );
         syncDebug('upsert', { localId, recordId, ok: !error });
 
         if (!error) {
+          const cleanupUris = Object.values(localPhotosForCleanup)
+            .filter((uri) => typeof uri === 'string' && /^file:\/\//i.test(uri));
+          await Promise.all(cleanupUris.map((uri) => FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {})));
+          syncDebug('cleanup final fotos locales', { localId, recordId, count: cleanupUris.length });
           await eliminarFormularioLocal(localId);
           ok += 1;
+          syncedLocalIds.push(localId);
+          syncedRecordIds.push(recordId);
         } else {
-          syncError('fallo upsert activacion', { localId, recordId, error: error.message });
-          errores.push(`ID local ${localId}: ${error.message}`);
+          syncError('fallo upsert activacion', { localId, recordId, error: syncErrorInfo(error) });
+          const errorMsg = `Upsert activacion: ${syncErrorMessage(error)}`;
+          await marcarErrorSync(localId, errorMsg);
+          errores.push(`ID local ${localId}: ${errorMsg}`);
         }
       }
 
@@ -282,11 +540,17 @@ function AppShell() {
           Alert.alert('Sincronización fallida', errores.slice(0, 5).join('\n'));
         }
       }
-      const result = { status: errores.length ? 'error' : 'synced', synced: ok, errors: errores };
+      const result = {
+        status: errores.length ? 'error' : 'synced',
+        synced: ok,
+        errors: errores,
+        syncedLocalIds,
+        syncedRecordIds,
+      };
       syncDebug('finalizacion', result);
       return result;
     } catch (err) {
-      syncError('error general', err?.message || err);
+      syncError('error general', syncErrorInfo(err));
       if (showAlerts) {
         Alert.alert('Error', 'No se pudieron sincronizar los formularios.');
       }
@@ -296,7 +560,7 @@ function AppShell() {
       syncingRef.current = false;
       syncDebug('lock liberado');
     }
-  }, [contarFormulariosLocales, isConnected, usuario?.email, usuario?.id, usuario?.nombre, usuario?.plaza]);
+  }, [contarFormulariosLocales, isConnected, usuario]);
 
   const refrescarConteoNoLeidas = useCallback(async ({ silent = true } = {}) => {
     if (!usuario?.id) {
@@ -309,7 +573,9 @@ function AppShell() {
       const total = await obtenerConteoNoLeidas(usuario.id);
       setNotificacionesNoLeidas(total);
     } catch (e) {
-      console.warn('⚠️ No se pudo consultar conteo de notificaciones:', e?.message || e);
+      if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        console.warn('⚠️ No se pudo consultar conteo de notificaciones:', e?.message || e);
+      }
       if (!silent) {
         Alert.alert('Error', 'No se pudo actualizar el conteo de notificaciones.');
       }
@@ -318,10 +584,11 @@ function AppShell() {
 
   const verificarSesion = useCallback(async () => {
     setLoading(true);
+    let storedUser = null;
+    let usuarioCache = null;
     try {
       // Siempre intenta cargar usuario local primero (útil si tarda la red)
-      const storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
-      let usuarioCache = null;
+      storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
       if (storedUser) {
         try {
           const parsed = JSON.parse(storedUser);
@@ -336,7 +603,9 @@ function AppShell() {
       if (!isConnected) {
         if (usuario?.id) return;
         if (!storedUser) {
-          console.warn('⚠️ No se encontró usuario local (offline).');
+          if (typeof __DEV__ !== 'undefined' && __DEV__) {
+            console.warn('⚠️ No se encontró usuario local (offline).');
+          }
           setUsuario(null);
           return;
         }
@@ -352,16 +621,24 @@ function AppShell() {
           setUsuario(null);
         }
       } else {
-        const { data: { user }, error } = await supabase.auth.getUser();
+        const { data: { user }, error } = await withTimeout(
+          supabase.auth.getUser(),
+          SESSION_TIMEOUT_MS,
+          'La red tardó demasiado al verificar la sesión.'
+        );
         if (error || !user) throw new Error(error?.message || 'No user');
 
-        const { data: perfil, error: errorPerfil } = await supabase
-          .from('activadores')
-          .select('*')
-          .eq('usuario_id', user.id)
-          .single();
+        const { data: perfil, error: errorPerfil } = await withTimeout(
+          supabase
+            .from('activadores')
+            .select('*')
+            .eq('usuario_id', user.id)
+            .single(),
+          QUERY_TIMEOUT_MS,
+          'La red tardó demasiado al cargar el perfil.'
+        );
 
-        if (errorPerfil) console.warn('⚠️ Perfil no encontrado:', errorPerfil.message);
+        if (errorPerfil && typeof __DEV__ !== 'undefined' && __DEV__) console.warn('⚠️ Perfil no encontrado:', errorPerfil.message);
 
         const cacheMismoUsuario = usuarioCache?.id === user.id ? usuarioCache : null;
         const nombrePerfil = normalizarNombreVisible(perfil?.nombre || '');
@@ -388,8 +665,15 @@ function AppShell() {
         await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
       }
     } catch (e) {
-      console.error('❌ Error verificando sesión:', e?.message || e);
-      setUsuario(null);
+      if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        console.error('❌ Error verificando sesión:', e?.message || e);
+      }
+      if (usuarioCache?.id && !usuario?.id) {
+        const pinConfigurado = await hasOfflinePin(usuarioCache.id);
+        setUsuario(pinConfigurado ? null : usuarioCache);
+      } else if (!usuario?.id) {
+        setUsuario(null);
+      }
     } finally {
       contarFormulariosLocales();
       setLoading(false);
@@ -503,7 +787,9 @@ function AppShell() {
     try {
       await supabase.auth.signOut();
     } catch (e) {
-      console.warn('⚠️ Error cerrando sesión:', e.message);
+      if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        console.warn('⚠️ Error cerrando sesión:', e.message);
+      }
     }
     await AsyncStorage.removeItem('usuario_autenticado_local');
     setVistaActiva('formulario');
@@ -517,7 +803,7 @@ function AppShell() {
     contarFormulariosLocales();
   };
 
-  const firstName = usuario?.nombre?.split(' ')[0] || 'Usuario';
+  const firstName = enmascararMarcaVisible(usuario?.nombre?.split(' ')[0] || 'Usuario', usuario);
   const rolNormalizado = String(usuario?.rol || usuario?.role || 'activador')
     .toLowerCase()
     .normalize('NFD')
@@ -638,12 +924,13 @@ function AppShell() {
 
       <View style={styles.body}>
         {vistaSegura === 'activaciones' ? (
-          <FormulariosPorImpulsador usuario={usuario} />
+          <FormulariosPorImpulsador usuario={usuario} onSincronizar={sincronizarFormularios} />
         ) : vistaSegura === 'control' ? (
           <ControlActivadores usuario={usuario} isConnected={isConnected} />
         ) : vistaSegura === 'notificaciones' ? (
           <NotificacionesScreen
             usuarioId={usuario?.id}
+            usuario={usuario}
             onUnreadCountChange={setNotificacionesNoLeidas}
           />
         ) : (

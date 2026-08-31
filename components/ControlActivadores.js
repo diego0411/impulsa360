@@ -18,7 +18,13 @@ import { Picker } from '@react-native-picker/picker';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
 import { resolverUrlDeFoto } from '../lib/upload';
+import { etiquetaPlaza } from '../lib/plazas';
+import { fechaLocalIso, obtenerQuincenaActual } from '../lib/quincena';
+import { withTimeout } from '../lib/asyncTimeout';
+import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, fontSizes, radius, spacing } from '../styles/theme';
+
+const QUERY_TIMEOUT_MS = 12000;
 
 const normalizarRol = (value) => String(value || '')
   .toLowerCase()
@@ -142,6 +148,13 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const [fotoError, setFotoError] = useState('');
   const { height } = useWindowDimensions();
   const administrador = esRolAdministrador(usuario?.rol || usuario?.role);
+  const hoyLocal = fechaLocalIso(new Date());
+  const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
+  const filtrosConsulta = useMemo(() => (
+    administrador
+      ? filtrosAplicados
+      : rangoQuincena
+  ), [administrador, filtrosAplicados, rangoQuincena]);
 
   const cargar = useCallback(async ({ manual = false } = {}) => {
     if (!isConnected) {
@@ -156,10 +169,14 @@ export default function ControlActivadores({ usuario, isConnected }) {
     setError('');
 
     try {
-      const { data, error: queryError } = await supabase.rpc('control_activadores_jerarquia', {
-        p_desde: filtrosAplicados.desde || null,
-        p_hasta: filtrosAplicados.hasta || null,
-      });
+      const { data, error: queryError } = await withTimeout(
+        supabase.rpc('control_activadores_jerarquia', {
+          p_desde: filtrosConsulta.desde || null,
+          p_hasta: filtrosConsulta.hasta || null,
+        }),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil para cargar métricas.'
+      );
       if (queryError) throw queryError;
       setRows(Array.isArray(data) ? data : []);
       if (manual) {
@@ -173,7 +190,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [filtrosAplicados.desde, filtrosAplicados.hasta, isConnected]);
+  }, [filtrosConsulta.desde, filtrosConsulta.hasta, isConnected]);
 
   useEffect(() => {
     cargar();
@@ -202,18 +219,22 @@ export default function ControlActivadores({ usuario, isConnected }) {
   }, [filtros.activador, integrantes]);
 
   const cargarActivaciones = useCallback(async (equipoId, activadorId) => {
-    const key = claveDetalleFiltrada(equipoId, activadorId, filtrosAplicados.desde, filtrosAplicados.hasta);
+    const key = claveDetalleFiltrada(equipoId, activadorId, filtrosConsulta.desde, filtrosConsulta.hasta);
     if (Object.prototype.hasOwnProperty.call(detalles, key) || detalleLoading[key]) return;
 
     setDetalleLoading((actual) => ({ ...actual, [key]: true }));
     setDetalleErrores((actual) => ({ ...actual, [key]: '' }));
     try {
-      const { data, error: queryError } = await supabase.rpc('control_activaciones_detalle', {
-        p_activador_id: activadorId,
-        p_equipo_id: equipoId,
-        p_desde: filtrosAplicados.desde || null,
-        p_hasta: filtrosAplicados.hasta || null,
-      });
+      const { data, error: queryError } = await withTimeout(
+        supabase.rpc('control_activaciones_detalle', {
+          p_activador_id: activadorId,
+          p_equipo_id: equipoId,
+          p_desde: filtrosConsulta.desde || null,
+          p_hasta: filtrosConsulta.hasta || null,
+        }),
+        QUERY_TIMEOUT_MS,
+        'La señal está muy débil para cargar el detalle.'
+      );
       if (queryError) throw queryError;
       setDetalles((actual) => ({ ...actual, [key]: Array.isArray(data) ? data : [] }));
     } catch (e) {
@@ -224,7 +245,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
     } finally {
       setDetalleLoading((actual) => ({ ...actual, [key]: false }));
     }
-  }, [detalleLoading, detalles, filtrosAplicados.desde, filtrosAplicados.hasta]);
+  }, [detalleLoading, detalles, filtrosConsulta.desde, filtrosConsulta.hasta]);
 
   const seleccionarActivador = useCallback((activador) => {
     setActivadorSeleccionado(activador);
@@ -322,15 +343,16 @@ export default function ControlActivadores({ usuario, isConnected }) {
   }, []);
 
   const renderActivacion = (item) => {
-    const cliente = clienteVisible(item);
+    const cliente = enmascararMarcaVisible(clienteVisible(item), usuario);
+    const plazaVisible = enmascararMarcaVisible(etiquetaPlaza(item?.plaza), usuario);
     return (
       <TouchableOpacity key={item.id} style={styles.activationCard} onPress={() => setActivacionSeleccionada(item)} activeOpacity={0.8}>
         <View style={styles.rowBetween}>
           <Text style={styles.activationDate}>{fechaVisible(item)}</Text>
-          <Text style={styles.activationType}>{item?.tipo_activacion || 'Activación'}</Text>
+          <Text style={styles.activationType}>{enmascararMarcaVisible(item?.tipo_activacion || 'Activación', usuario)}</Text>
         </View>
         {!!cliente && <Text style={styles.activationClient}>{cliente}</Text>}
-        {!!item?.plaza && <Text style={styles.meta}>Plaza: {item.plaza}</Text>}
+        {!!plazaVisible && <Text style={styles.meta}>Plaza: {plazaVisible}</Text>}
       </TouchableOpacity>
     );
   };
@@ -357,8 +379,8 @@ export default function ControlActivadores({ usuario, isConnected }) {
     const key = claveDetalleFiltrada(
       activadorSeleccionado.equipoId,
       activadorSeleccionado.id,
-      filtrosAplicados.desde,
-      filtrosAplicados.hasta,
+      filtrosConsulta.desde,
+      filtrosConsulta.hasta,
     );
     const tipoFiltro = filtros.tipo;
     const activaciones = (detalles[key] || []).filter(
@@ -379,10 +401,9 @@ export default function ControlActivadores({ usuario, isConnected }) {
     };
     return (
       <View style={styles.selectedCard}>
-        <Text style={styles.selectedName}>{activadorSeleccionado.nombre}</Text>
+        <Text style={styles.selectedName}>{enmascararMarcaVisible(activadorSeleccionado.nombre, usuario)}</Text>
         <Text style={styles.meta}>
-          {activadorSeleccionado.equipoNumero ? `Equipo ${activadorSeleccionado.equipoNumero} · ` : ''}
-          {activadorSeleccionado.equipoNombre}
+          {enmascararMarcaVisible(`${activadorSeleccionado.equipoNumero ? `Equipo ${activadorSeleccionado.equipoNumero} · ` : ''}${activadorSeleccionado.equipoNombre}`, usuario)}
         </Text>
         <View style={styles.metricsRow}>
           {[['Hoy', resumenFiltrado.hoy], ['Semana', resumenFiltrado.semana], ['Mes', resumenFiltrado.mes], ['Total', resumenFiltrado.total]].map(([label, value]) => (
@@ -396,7 +417,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
           {detalleLoading[key] ? (
             <ActivityIndicator color={colors.primary} />
           ) : detalleErrores[key] ? (
-            <Text style={styles.inlineError}>{detalleErrores[key]}</Text>
+                  <Text style={styles.inlineError}>{enmascararMarcaVisible(detalleErrores[key], usuario)}</Text>
           ) : activaciones.length === 0 ? (
             <Text style={styles.emptyInline}>No hay activaciones atribuibles a este equipo.</Text>
           ) : activaciones.map(renderActivacion)}
@@ -427,7 +448,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
           <Text style={styles.refreshText}>{refreshing ? 'Actualizando…' : 'Actualizar'}</Text>
         </TouchableOpacity>
       </View>
-      {!!error && <View style={styles.errorCard}><Text style={styles.errorText}>{error}</Text></View>}
+      {!!error && <View style={styles.errorCard}><Text style={styles.errorText}>{enmascararMarcaVisible(error, usuario)}</Text></View>}
       <ScrollView
         contentContainerStyle={styles.list}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => cargar({ manual: true })} tintColor={colors.primary} />}
@@ -468,7 +489,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
                 >
                   <Picker.Item label="Todos" value="" />
                   {integrantes.map((item) => (
-                    <Picker.Item key={`${item.equipoId}:${item.id}`} label={item.nombre} value={item.id} />
+                    <Picker.Item key={`${item.equipoId}:${item.id}`} label={enmascararMarcaVisible(item.nombre, usuario)} value={item.id} />
                   ))}
                 </Picker>
               </View>
@@ -503,10 +524,9 @@ export default function ControlActivadores({ usuario, isConnected }) {
                     onPress={() => seleccionarActivador(item)}
                   >
                     <View style={styles.flexOne}>
-                      <Text style={styles.memberName}>{item.nombre}</Text>
+                      <Text style={styles.memberName}>{enmascararMarcaVisible(item.nombre, usuario)}</Text>
                       <Text style={styles.meta}>
-                        {item.equipoNumero ? `Equipo ${item.equipoNumero} · ` : ''}{item.equipoNombre}
-                        {administrador ? ` · ${item.liderNombre}` : ''}
+                        {enmascararMarcaVisible(`${item.equipoNumero ? `Equipo ${item.equipoNumero} · ` : ''}${item.equipoNombre}${administrador ? ` · ${item.liderNombre}` : ''}`, usuario)}
                       </Text>
                     </View>
                     <Text style={styles.memberTotal}>{item.total}</Text>
@@ -536,7 +556,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
             {fotoLoading ? (
               <ActivityIndicator size="large" color={colors.primary} style={styles.photoLoader} />
             ) : fotoError ? (
-              <Text style={styles.inlineError}>{fotoError}</Text>
+              <Text style={styles.inlineError}>{enmascararMarcaVisible(fotoError, usuario)}</Text>
             ) : foto?.uri ? (
               <Image source={{ uri: foto.uri }} style={[styles.photo, { height: height * 0.62 }]} resizeMode="contain" />
             ) : null}
@@ -553,17 +573,17 @@ export default function ControlActivadores({ usuario, isConnected }) {
             </View>
             <ScrollView style={styles.detailScroll} showsVerticalScrollIndicator={false}>
               <Text style={styles.detailLabel}>Cliente</Text>
-              <Text style={styles.detailValue}>{clienteVisible(activacionSeleccionada) || 'Sin cliente'}</Text>
+              <Text style={styles.detailValue}>{enmascararMarcaVisible(clienteVisible(activacionSeleccionada) || 'Sin cliente', usuario)}</Text>
               <Text style={styles.detailLabel}>Tipo</Text>
-              <Text style={styles.detailValue}>{activacionSeleccionada?.tipo_activacion || 'Sin tipo'}</Text>
+              <Text style={styles.detailValue}>{enmascararMarcaVisible(activacionSeleccionada?.tipo_activacion || 'Sin tipo', usuario)}</Text>
               <Text style={styles.detailLabel}>Fecha</Text>
               <Text style={styles.detailValue}>{fechaVisible(activacionSeleccionada)}</Text>
               <Text style={styles.detailLabel}>Plaza</Text>
-              <Text style={styles.detailValue}>{activacionSeleccionada?.plaza || 'Sin plaza'}</Text>
+              <Text style={styles.detailValue}>{enmascararMarcaVisible(etiquetaPlaza(activacionSeleccionada?.plaza, 'Sin plaza'), usuario)}</Text>
               <Text style={styles.detailLabel}>Equipo histórico</Text>
-              <Text style={styles.detailValue}>{activacionSeleccionada?.equipo_id_registro || activadorSeleccionado?.equipoNombre || 'Sin equipo'}</Text>
+              <Text style={styles.detailValue}>{enmascararMarcaVisible(activacionSeleccionada?.equipo_id_registro || activadorSeleccionado?.equipoNombre || 'Sin equipo', usuario)}</Text>
               <Text style={styles.detailLabel}>Líder histórico</Text>
-              <Text style={styles.detailValue}>{activacionSeleccionada?.lider_id_registro || activadorSeleccionado?.liderNombre || 'Sin líder'}</Text>
+              <Text style={styles.detailValue}>{enmascararMarcaVisible(activacionSeleccionada?.lider_id_registro || activadorSeleccionado?.liderNombre || 'Sin líder', usuario)}</Text>
               <Text style={styles.detailLabel}>Evidencias</Text>
               {(activacionSeleccionada?.foto_url || activacionSeleccionada?.foto_cash_in) ? (
                 <View style={styles.evidenceRow}>
