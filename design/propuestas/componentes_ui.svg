@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1100" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F3F8FE"/>
+      <stop offset="1" stop-color="#EAF2FB"/>
+    </linearGradient>
+    <linearGradient id="hero" x1="120" y1="170" x2="1480" y2="410" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#112640"/>
+      <stop offset="1" stop-color="#17385B"/>
+    </linearGradient>
+    <filter id="shadow" x="76" y="146" width="1470" height="870" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="14"/>
+      <feGaussianBlur stdDeviation="22"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.047 0 0 0 0 0.129 0 0 0 0 0.211 0 0 0 0.17 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1100" fill="url(#bg)"/>
+
+  <text x="120" y="88" fill="#112941" font-size="44" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    UI Kit sugerido para la app
+  </text>
+  <text x="120" y="126" fill="#4E6781" font-size="22" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Tokens y componentes base para mantener consistencia visual
+  </text>
+
+  <g filter="url(#shadow)">
+    <rect x="120" y="170" width="1360" height="800" rx="28" fill="#FFFFFF"/>
+  </g>
+
+  <rect x="120" y="170" width="1360" height="240" rx="28" fill="url(#hero)"/>
+  <text x="170" y="236" fill="#FFFFFF" font-size="32" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Bloque superior (app bar + estado)</text>
+  <text x="170" y="276" fill="#D4E6FB" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Contraste alto para uso en exteriores y lectura rapida</text>
+
+  <rect x="170" y="306" width="168" height="40" rx="20" fill="#0FA968"/>
+  <text x="213" y="332" fill="#FFFFFF" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Conectado</text>
+
+  <rect x="360" y="306" width="178" height="40" rx="20" fill="#FFB703"/>
+  <text x="394" y="332" fill="#1F2328" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">3 pendientes</text>
+
+  <rect x="560" y="306" width="148" height="40" rx="20" fill="#D63A45"/>
+  <text x="598" y="332" fill="#FFFFFF" font-size="16" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">1 error</text>
+
+  <text x="170" y="468" fill="#173049" font-size="24" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Botones</text>
+
+  <rect x="170" y="498" width="250" height="58" rx="18" fill="#1769FF"/>
+  <text x="241" y="534" fill="#FFFFFF" font-size="20" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Primario</text>
+
+  <rect x="440" y="498" width="250" height="58" rx="18" fill="#FFB703"/>
+  <text x="510" y="534" fill="#1F2328" font-size="20" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Acento</text>
+
+  <rect x="710" y="498" width="250" height="58" rx="18" fill="#EAF2FA" stroke="#BFD3E8"/>
+  <text x="781" y="534" fill="#27415C" font-size="20" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Secundario</text>
+
+  <text x="170" y="628" fill="#173049" font-size="24" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Campos de formulario</text>
+
+  <text x="170" y="668" fill="#34516D" font-size="16" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Nombre del cliente</text>
+  <rect x="170" y="680" width="430" height="64" rx="16" fill="#FFFFFF" stroke="#C7D9EC" stroke-width="2"/>
+  <text x="192" y="719" fill="#233D58" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Ej. Juan Perez</text>
+
+  <text x="630" y="668" fill="#34516D" font-size="16" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Telefono</text>
+  <rect x="630" y="680" width="330" height="64" rx="16" fill="#FFFFFF" stroke="#C7D9EC" stroke-width="2"/>
+  <text x="652" y="719" fill="#233D58" font-size="18" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">70000000</text>
+
+  <text x="170" y="790" fill="#173049" font-size="24" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Tarjetas de estado</text>
+
+  <rect x="170" y="824" width="250" height="118" rx="20" fill="#FFFFFF" stroke="#D4E3F2"/>
+  <text x="190" y="858" fill="#5A748E" font-size="15" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Subidos hoy</text>
+  <text x="190" y="905" fill="#112B45" font-size="38" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">12</text>
+
+  <rect x="440" y="824" width="250" height="118" rx="20" fill="#FFFFFF" stroke="#D4E3F2"/>
+  <text x="460" y="858" fill="#5A748E" font-size="15" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Pendientes</text>
+  <text x="460" y="905" fill="#112B45" font-size="38" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">3</text>
+
+  <rect x="710" y="824" width="250" height="118" rx="20" fill="#FFFFFF" stroke="#D4E3F2"/>
+  <text x="730" y="858" fill="#5A748E" font-size="15" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Errores</text>
+  <text x="730" y="905" fill="#112B45" font-size="38" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">1</text>
+
+  <text x="1020" y="468" fill="#173049" font-size="24" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Escala tipografica</text>
+  <text x="1020" y="520" fill="#122A43" font-size="36" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Titulo 36</text>
+  <text x="1020" y="560" fill="#1D3854" font-size="26" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Subtitulo 26</text>
+  <text x="1020" y="596" fill="#35516D" font-size="20" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Seccion 20</text>
+  <text x="1020" y="628" fill="#4E6781" font-size="16" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Body 16</text>
+
+  <text x="1020" y="698" fill="#173049" font-size="24" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Estados UI</text>
+
+  <rect x="1020" y="726" width="420" height="54" rx="14" fill="#E8F5EE"/>
+  <text x="1044" y="760" fill="#137C4B" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Exito: Sincronizacion completa</text>
+
+  <rect x="1020" y="794" width="420" height="54" rx="14" fill="#FFF2E1"/>
+  <text x="1044" y="828" fill="#A86A08" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Advertencia: Sin red</text>
+
+  <rect x="1020" y="862" width="420" height="54" rx="14" fill="#FDE8EA"/>
+  <text x="1044" y="896" fill="#A9313C" font-size="18" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Error: Foto no subida</text>
+</svg>

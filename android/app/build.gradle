@@ -129,7 +129,7 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode Integer.parseInt((findProperty("android.versionCode") ?: "1").toString())
-        versionName (findProperty("android.versionName") ?: "1.0.2").toString()
+        versionName (findProperty("android.versionName") ?: "1.0.12").toString()
     }
     signingConfigs {
         debug {
@@ -152,7 +152,11 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            signingConfig hasReleaseSigning ? signingConfigs.release : signingConfigs.debug
+            // Production always requires real release credentials. Debug signing is an
+            // explicit opt-in reserved for internal release APKs (the EAS preview profile).
+            signingConfig hasReleaseSigning
+                    ? signingConfigs.release
+                    : (allowDebugSigningInRelease ? signingConfigs.debug : null)
             shrinkResources (findProperty('android.enableShrinkResourcesInReleaseBuilds')?.toBoolean() ?: false)
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"

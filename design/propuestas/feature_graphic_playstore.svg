@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="500" viewBox="0 0 1024 500" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071327"/>
+      <stop offset="1" stop-color="#0E2745"/>
+    </linearGradient>
+    <linearGradient id="card" x1="94" y1="58" x2="930" y2="442" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F3F7FC"/>
+      <stop offset="1" stop-color="#E8EFF7"/>
+    </linearGradient>
+    <linearGradient id="logoA" x1="0" y1="0" x2="170" y2="170" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2E77FF"/>
+      <stop offset="1" stop-color="#1B4FD0"/>
+    </linearGradient>
+    <linearGradient id="logoB" x1="0" y1="80" x2="170" y2="170" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B365D"/>
+      <stop offset="1" stop-color="#0D1D31"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="500" fill="url(#bg)"/>
+
+  <circle cx="42" cy="54" r="112" fill="#2E77FF" fill-opacity="0.18"/>
+  <circle cx="988" cy="470" r="170" fill="#FF8A00" fill-opacity="0.12"/>
+
+  <rect x="94" y="58" width="836" height="384" rx="48" fill="url(#card)"/>
+
+  <g transform="translate(150 129)">
+    <rect width="170" height="170" rx="40" fill="url(#logoA)"/>
+    <rect y="74" width="170" height="96" rx="34" fill="url(#logoB)"/>
+    <rect x="56" width="114" height="64" rx="32" fill="#2F73F6"/>
+    <rect x="56" y="71" width="114" height="99" rx="30" fill="#111F3A"/>
+    <path d="M80 0L5 75L80 150" stroke="#F5F9FF" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M86 0L30 56C24 62 24 71 30 77L48 95" stroke="#DEEAF9" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <text x="360" y="206" fill="#163D66" font-family="Poppins, Montserrat, Avenir Next, sans-serif" font-size="70" font-weight="700" letter-spacing="1">IMPULSA360</text>
+  <circle cx="842" cy="169" r="9" fill="#FF8A00"/>
+
+  <text x="360" y="264" fill="#2B5C90" font-family="Poppins, Montserrat, Avenir Next, sans-serif" font-size="24" font-weight="500">Activaciones de campo con control y sincronizacion</text>
+
+  <g>
+    <rect x="360" y="300" width="176" height="44" rx="22" fill="#1158DE"/>
+    <text x="394" y="329" fill="#FFFFFF" font-family="Poppins, Montserrat, Avenir Next, sans-serif" font-size="20" font-weight="600">Tiempo real</text>
+
+    <rect x="552" y="300" width="150" height="44" rx="22" fill="#0F3360"/>
+    <text x="586" y="329" fill="#FFFFFF" font-family="Poppins, Montserrat, Avenir Next, sans-serif" font-size="20" font-weight="600">Offline</text>
+
+    <rect x="716" y="300" width="164" height="44" rx="22" fill="#0A1E36"/>
+    <text x="751" y="329" fill="#FFFFFF" font-family="Poppins, Montserrat, Avenir Next, sans-serif" font-size="20" font-weight="600">GPS</text>
+  </g>
+</svg>

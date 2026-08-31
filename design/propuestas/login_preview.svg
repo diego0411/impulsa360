@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="1000" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#050D16"/>
+      <stop offset="1" stop-color="#0B1A2B"/>
+    </linearGradient>
+    <linearGradient id="meshA" x1="0" y1="0" x2="420" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2A78FF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#2A78FF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="meshB" x1="0" y1="0" x2="500" y2="500" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FF8A00" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#FF8A00" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="btn" x1="835" y1="738" x2="1310" y2="738" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1769FF"/>
+      <stop offset="1" stop-color="#0F4ECC"/>
+    </linearGradient>
+    <filter id="panelShadow" x="766" y="226" width="620" height="562" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="8"/>
+      <feGaussianBlur stdDeviation="18"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.02 0 0 0 0 0.06 0 0 0 0 0.12 0 0 0 0.42 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#bg)"/>
+  <circle cx="70" cy="70" r="260" fill="url(#meshA)"/>
+  <circle cx="1500" cy="930" r="300" fill="url(#meshB)"/>
+  <circle cx="1470" cy="130" r="160" fill="rgba(255,255,255,0.06)"/>
+  <rect width="1600" height="1000" fill="rgba(6,13,22,0.34)"/>
+
+  <text x="190" y="280" fill="#9BB8D7" font-size="18" letter-spacing="2.2" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    PLATAFORMA OPERATIVA
+  </text>
+
+  <text x="190" y="364" fill="#F7FBFF" font-size="96" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Impulsa 360
+  </text>
+  <text x="190" y="436" fill="#BFD4EA" font-size="58" font-weight="600" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Field Command
+  </text>
+  <text x="190" y="494" fill="#A6BED6" font-size="30" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Control de activaciones con sincronizacion segura
+  </text>
+  <text x="190" y="534" fill="#A6BED6" font-size="30" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    y respaldo inteligente.
+  </text>
+
+  <rect x="190" y="574" width="560" height="112" rx="24" fill="rgba(255,255,255,0.09)" stroke="rgba(215,231,247,0.2)" stroke-width="2"/>
+  <rect x="210" y="594" width="72" height="72" rx="20" fill="rgba(255,255,255,0.92)"/>
+  <rect x="220" y="604" width="52" height="52" rx="14" fill="#1769FF"/>
+  <text x="305" y="630" fill="#FFFFFF" font-size="30" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Cuenta corporativa</text>
+  <text x="305" y="664" fill="#BDD2E8" font-size="22" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Acceso para equipos de campo autorizados</text>
+
+  <rect x="190" y="718" width="150" height="68" rx="14" fill="rgba(255,255,255,0.1)" stroke="rgba(202,220,238,0.22)" stroke-width="2"/>
+  <text x="220" y="754" fill="#FFFFFF" font-size="28" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">24/7</text>
+  <text x="220" y="778" fill="#B5CCE3" font-size="16" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Sync</text>
+
+  <rect x="354" y="718" width="150" height="68" rx="14" fill="rgba(255,255,255,0.1)" stroke="rgba(202,220,238,0.22)" stroke-width="2"/>
+  <text x="388" y="754" fill="#FFFFFF" font-size="28" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">AES</text>
+  <text x="388" y="778" fill="#B5CCE3" font-size="16" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">Seguridad</text>
+
+  <g filter="url(#panelShadow)">
+    <rect x="802" y="254" width="548" height="490" rx="28" fill="#FDFEFF" stroke="#D6E3F0" stroke-width="2"/>
+  </g>
+  <rect x="802" y="254" width="548" height="6" rx="3" fill="#1769FF"/>
+
+  <text x="835" y="320" fill="#12263A" font-size="46" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Iniciar sesion
+  </text>
+  <text x="835" y="354" fill="#5B7590" font-size="22" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Tu sesion se vinculara a tu perfil de activador
+  </text>
+
+  <text x="835" y="414" fill="#1C344D" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Correo
+  </text>
+  <rect x="835" y="430" width="475" height="72" rx="16" fill="#F5F9FD" stroke="#CBDCEC" stroke-width="2"/>
+  <text x="858" y="474" fill="#6B839B" font-size="24" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Correo electronico
+  </text>
+
+  <text x="835" y="552" fill="#1C344D" font-size="22" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Contrasena
+  </text>
+  <rect x="835" y="568" width="475" height="72" rx="16" fill="#F5F9FD" stroke="#CBDCEC" stroke-width="2"/>
+  <text x="858" y="612" fill="#6B839B" font-size="24" font-weight="500" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    ************
+  </text>
+
+  <rect x="835" y="690" width="475" height="76" rx="16" fill="url(#btn)"/>
+  <text x="1072" y="739" text-anchor="middle" fill="#FFFFFF" font-size="27" font-weight="700" font-family="Poppins, Montserrat, Avenir Next, sans-serif">
+    Entrar al panel
+  </text>
+
+</svg>
