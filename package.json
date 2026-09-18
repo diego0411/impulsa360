@@ -11,10 +11,12 @@
     "web": "expo start --web",
     "lint": "eslint .",
     "preflight:android": "bash ./scripts/preflight-android-release.sh",
-    "build:android:aab": "npm run preflight:android && cd android && NODE_ENV=production ./gradlew :app:bundleRelease"
+    "build:android:aab": "set -a; [ ! -f .env ] || . ./.env; set +a; npm run preflight:android && cd android && NODE_ENV=production ./gradlew :app:bundleRelease"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/datetimepicker": "8.4.4",
     "@react-native-community/netinfo": "11.4.1",
@@ -30,6 +32,7 @@
     "expo-image-manipulator": "~14.0.8",
     "expo-image-picker": "~17.0.11",
     "expo-location": "~19.0.8",
+    "expo-secure-store": "~15.0.8",
     "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",

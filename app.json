@@ -2,7 +2,7 @@
   "expo": {
     "name": "Impulsa360",
     "slug": "impulsa360",
-    "version": "1.0.26",
+    "version": "1.0.28",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
@@ -14,11 +14,18 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.integrat360.impulsa360"
+      "bundleIdentifier": "com.integrat360.impulsa360",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Impulsa360 usa la cámara para capturar evidencias de activaciones.",
+        "NSLocationWhenInUseUsageDescription": "Impulsa360 usa tu ubicación mientras utilizas la app para registrar el punto de activación.",
+        "NSPhotoLibraryUsageDescription": "Impulsa360 permite seleccionar fotos de la biblioteca como evidencia de activaciones."
+      }
     },
     "android": {
       "permissions": [
         "CAMERA",
+        "READ_EXTERNAL_STORAGE",
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION"
       ],
@@ -27,7 +34,7 @@
         "backgroundColor": "#FFFFFF"
       },
       "package": "com.integrat360.impulsa360",
-      "versionCode": 43
+      "versionCode": 51
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -39,7 +46,9 @@
       }
     },
     "plugins": [
-      "expo-asset"
+      "expo-asset",
+      "./plugins/withAndroidNoBackup",
+      "expo-secure-store"
     ]
   }
 }

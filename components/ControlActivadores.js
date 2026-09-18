@@ -32,13 +32,26 @@ const normalizarRol = (value) => String(value || '')
   .replace(/[\u0300-\u036f]/g, '')
   .replace(/[^a-z0-9]+/g, '_')
   .replace(/^_|_$/g, '');
+const rolesNormalizados = (value) => {
+  if (Array.isArray(value)) return value.map(normalizarRol).filter(Boolean);
+  const rol = normalizarRol(value);
+  if (!rol) return [];
+  return rol.split('_').filter(Boolean);
+};
 
 const esRolAdministrador = (value) => {
-  const rol = normalizarRol(value);
+  const roles = rolesNormalizados(value);
   return ['admin', 'administrador', 'administrator'].some(
-    (item) => rol === item || rol.startsWith(`${item}_`),
+    (item) => roles.includes(item),
   );
 };
+const esRolLider = (value) => {
+  const roles = rolesNormalizados(value);
+  return ['lider', 'leader', 'supervisor'].some(
+    (item) => roles.includes(item),
+  );
+};
+const esRolActivador = (value) => rolesNormalizados(value).includes('activador');
 
 const TIPOS_ACTIVACION = [
   { key: 'comercio', label: 'Comercio' },
@@ -68,6 +81,32 @@ const fechaLegible = (value) => {
   const [year, month, day] = String(value).split('-');
   if (!year || !month || !day) return value;
   return `${day}/${month}/${year}`;
+};
+const esReactivacionTipo = (tipo) => /reactivacion/i.test(String(tipo || ''));
+const esReimpresionTipo = (tipo) => String(tipo || '').toLowerCase() === 'reimpresion_qr';
+const porcentaje = (cantidad, total) => (total > 0 ? `${Math.round((cantidad / total) * 100)}%` : '0%');
+const resumenTiposVacio = { total: 0, reactivaciones: 0, reimpresiones: 0, tipos: [] };
+const labelTipoActivacion = (tipo) => {
+  const tipoTexto = String(tipo || '').trim();
+  return TIPOS_ACTIVACION.find((item) => item.key === tipoTexto)?.label || tipoTexto || 'Sin tipo';
+};
+const calcularResumenTipos = (activaciones = []) => {
+  const lista = Array.isArray(activaciones) ? activaciones : [];
+  const conteo = new Map();
+  lista.forEach((item) => {
+    const tipo = String(item?.tipo_activacion || '').trim() || 'sin_tipo';
+    conteo.set(tipo, (conteo.get(tipo) || 0) + 1);
+  });
+  const tipos = [...conteo.entries()]
+    .map(([tipo, cantidad]) => ({ tipo, label: labelTipoActivacion(tipo), cantidad }))
+    .sort((a, b) => b.cantidad - a.cantidad || a.label.localeCompare(b.label));
+
+  return {
+    total: lista.length,
+    reactivaciones: lista.filter((item) => esReactivacionTipo(item?.tipo_activacion)).length,
+    reimpresiones: lista.filter((item) => esReimpresionTipo(item?.tipo_activacion)).length,
+    tipos,
+  };
 };
 const resumirActivadores = (activadores) => (activadores || []).reduce((resumen, activador) => ({
   activadores: resumen.activadores + 1,
@@ -146,8 +185,12 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const [foto, setFoto] = useState(null);
   const [fotoLoading, setFotoLoading] = useState(false);
   const [fotoError, setFotoError] = useState('');
+  const [resumenTiposGlobal, setResumenTiposGlobal] = useState(resumenTiposVacio);
   const { height } = useWindowDimensions();
   const administrador = esRolAdministrador(usuario?.rol || usuario?.role);
+  const lider = esRolLider(usuario?.rol || usuario?.role);
+  const activadorSolo = !administrador && esRolActivador(usuario?.rol || usuario?.role);
+  const usuarioId = usuario?.id;
   const hoyLocal = fechaLocalIso(new Date());
   const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
   const filtrosConsulta = useMemo(() => (
@@ -155,6 +198,44 @@ export default function ControlActivadores({ usuario, isConnected }) {
       ? filtrosAplicados
       : rangoQuincena
   ), [administrador, filtrosAplicados, rangoQuincena]);
+
+  const cargarResumenTiposGlobal = useCallback(async (rowsData = []) => {
+    const pares = new Map();
+    (Array.isArray(rowsData) ? rowsData : []).forEach((row) => {
+      if (!row?.equipo_id || !row?.activador_id) return;
+      pares.set(`${row.equipo_id}:${row.activador_id}`, {
+        equipoId: row.equipo_id,
+        activadorId: row.activador_id,
+      });
+    });
+
+    if (pares.size === 0) {
+      setResumenTiposGlobal(resumenTiposVacio);
+      return;
+    }
+
+    try {
+      const resultados = await Promise.all([...pares.values()].map(({ equipoId, activadorId }) =>
+        withTimeout(
+          supabase.rpc('control_activaciones_detalle', {
+            p_activador_id: activadorId,
+            p_equipo_id: equipoId,
+            p_desde: filtrosConsulta.desde || null,
+            p_hasta: filtrosConsulta.hasta || null,
+          }),
+          QUERY_TIMEOUT_MS,
+          'La señal está muy débil para cargar métricas.'
+        )
+      ));
+      const activaciones = resultados.flatMap(({ data, error: queryError }) => {
+        if (queryError || !Array.isArray(data)) return [];
+        return data;
+      });
+      setResumenTiposGlobal(calcularResumenTipos(activaciones));
+    } catch {
+      setResumenTiposGlobal(resumenTiposVacio);
+    }
+  }, [filtrosConsulta.desde, filtrosConsulta.hasta]);
 
   const cargar = useCallback(async ({ manual = false } = {}) => {
     if (!isConnected) {
@@ -169,6 +250,54 @@ export default function ControlActivadores({ usuario, isConnected }) {
     setError('');
 
     try {
+      if (activadorSolo) {
+        let query = supabase
+          .from('activaciones')
+          .select('*')
+          .eq('usuario_id', usuarioId)
+          .order('fecha_activacion', { ascending: false });
+
+        if (filtrosConsulta.desde) query = query.gte('fecha_activacion', filtrosConsulta.desde);
+        if (filtrosConsulta.hasta) query = query.lte('fecha_activacion', filtrosConsulta.hasta);
+
+        const { data, error: queryError } = await withTimeout(
+          query,
+          QUERY_TIMEOUT_MS,
+          'La señal está muy débil para cargar métricas.'
+        );
+        if (queryError) throw queryError;
+
+        const activaciones = Array.isArray(data) ? data : [];
+        const activadorNombre = nombreVisible(usuario?.nombre || usuario?.email, 'Mis métricas');
+        const hoy = new Date().toISOString().slice(0, 10);
+        const inicioSemana = new Date();
+        inicioSemana.setDate(inicioSemana.getDate() - inicioSemana.getDay() + 1);
+        inicioSemana.setHours(0, 0, 0, 0);
+        const mes = hoy.slice(0, 7);
+        const rowPropia = {
+          lider_id: usuarioId,
+          lider_nombre: activadorNombre,
+          equipo_id: 'propio',
+          equipo_numero: null,
+          equipo_nombre: 'Mis activaciones',
+          activador_id: usuarioId,
+          activador_nombre: activadorNombre,
+          hoy: activaciones.filter((item) => fechaVisible(item) === hoy).length,
+          semana: activaciones.filter((item) => {
+            const fecha = new Date(`${fechaVisible(item)}T00:00:00`);
+            return fecha >= inicioSemana;
+          }).length,
+          mes: activaciones.filter((item) => fechaVisible(item).slice(0, 7) === mes).length,
+          total: activaciones.length,
+        };
+        const detailKey = claveDetalleFiltrada('propio', usuarioId, filtrosConsulta.desde, filtrosConsulta.hasta);
+        setRows([rowPropia]);
+        setDetalles({ [detailKey]: activaciones });
+        setResumenTiposGlobal(calcularResumenTipos(activaciones));
+        if (manual) setDetalleErrores({});
+        return;
+      }
+
       const { data, error: queryError } = await withTimeout(
         supabase.rpc('control_activadores_jerarquia', {
           p_desde: filtrosConsulta.desde || null,
@@ -178,7 +307,9 @@ export default function ControlActivadores({ usuario, isConnected }) {
         'La señal está muy débil para cargar métricas.'
       );
       if (queryError) throw queryError;
-      setRows(Array.isArray(data) ? data : []);
+      const rowsData = Array.isArray(data) ? data : [];
+      setRows(rowsData);
+      cargarResumenTiposGlobal(rowsData);
       if (manual) {
         setDetalles({});
         setDetalleErrores({});
@@ -190,7 +321,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [filtrosConsulta.desde, filtrosConsulta.hasta, isConnected]);
+  }, [activadorSolo, cargarResumenTiposGlobal, filtrosConsulta.desde, filtrosConsulta.hasta, isConnected, usuario?.email, usuario?.nombre, usuarioId]);
 
   useEffect(() => {
     cargar();
@@ -214,9 +345,10 @@ export default function ControlActivadores({ usuario, isConnected }) {
     [jerarquia],
   );
   const integrantesFiltrados = useMemo(() => {
+    if (activadorSolo) return integrantes.filter((item) => item.id === usuarioId);
     if (!filtros.activador) return integrantes;
     return integrantes.filter((item) => item.id === filtros.activador);
-  }, [filtros.activador, integrantes]);
+  }, [activadorSolo, filtros.activador, integrantes, usuarioId]);
 
   const cargarActivaciones = useCallback(async (equipoId, activadorId) => {
     const key = claveDetalleFiltrada(equipoId, activadorId, filtrosConsulta.desde, filtrosConsulta.hasta);
@@ -248,11 +380,13 @@ export default function ControlActivadores({ usuario, isConnected }) {
   }, [detalleLoading, detalles, filtrosConsulta.desde, filtrosConsulta.hasta]);
 
   const seleccionarActivador = useCallback((activador) => {
+    if (activadorSolo && activador?.id !== usuarioId) return;
     setActivadorSeleccionado(activador);
     cargarActivaciones(activador.equipoId, activador.id);
-  }, [cargarActivaciones]);
+  }, [activadorSolo, cargarActivaciones, usuarioId]);
 
   const seleccionarFiltroActivador = useCallback((activadorId) => {
+    if (activadorSolo) return;
     setFiltros((actual) => ({ ...actual, activador: activadorId }));
     setActivacionSeleccionada(null);
     if (!activadorId) {
@@ -261,7 +395,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
     }
     const activador = integrantes.find((item) => item.id === activadorId);
     if (activador) seleccionarActivador(activador);
-  }, [integrantes, seleccionarActivador]);
+  }, [activadorSolo, integrantes, seleccionarActivador]);
 
   const cambiarFecha = useCallback((campo, event, date) => {
     if (Platform.OS !== 'ios') setSelectorFecha(null);
@@ -358,20 +492,35 @@ export default function ControlActivadores({ usuario, isConnected }) {
   };
 
   const renderResumenGlobal = () => (
-    <View style={styles.globalGrid}>
-      {[
-        ['Activadores', resumenGlobal.activadores],
-        ['Hoy', resumenGlobal.hoy],
-        ['Semana', resumenGlobal.semana],
-        ['Mes', resumenGlobal.mes],
-        ['Total', resumenGlobal.total],
-      ].map(([label, value]) => (
-        <View key={label} style={styles.globalMetric}>
-          <Text style={styles.globalValue}>{value}</Text>
-          <Text style={styles.globalLabel}>{label}</Text>
+    <>
+      <View style={styles.globalGrid}>
+        {[
+          ['Activadores', resumenGlobal.activadores],
+          ['Hoy', resumenGlobal.hoy],
+          ['Semana', resumenGlobal.semana],
+          ['Mes', resumenGlobal.mes],
+          ['Total', resumenGlobal.total],
+          ['Reactivación', `${resumenTiposGlobal.reactivaciones} · ${porcentaje(resumenTiposGlobal.reactivaciones, resumenTiposGlobal.total)}`],
+          ['Reimpresión', `${resumenTiposGlobal.reimpresiones} · ${porcentaje(resumenTiposGlobal.reimpresiones, resumenTiposGlobal.total)}`],
+        ].map(([label, value]) => (
+          <View key={label} style={styles.globalMetric}>
+            <Text style={[styles.globalValue, typeof value === 'string' && styles.globalValueCompact]}>{value}</Text>
+            <Text style={styles.globalLabel}>{label}</Text>
+          </View>
+        ))}
+      </View>
+      {activadorSolo && resumenTiposGlobal.tipos.length > 0 && (
+        <View style={styles.typeSummary}>
+          <Text style={styles.membersTitle}>Tipos de activación</Text>
+          {resumenTiposGlobal.tipos.map((item) => (
+            <View key={item.tipo} style={styles.typeSummaryRow}>
+              <Text style={styles.typeSummaryLabel}>{enmascararMarcaVisible(item.label, usuario)}</Text>
+              <Text style={styles.typeSummaryValue}>{item.cantidad}</Text>
+            </View>
+          ))}
         </View>
-      ))}
-    </View>
+      )}
+    </>
   );
 
   const renderDetalleActivador = () => {
@@ -441,7 +590,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
         <View style={styles.flexOne}>
           <Text style={styles.title}>{vistaDetalle ? 'Ver Detalle' : 'Métricas Generales'}</Text>
           <Text style={styles.subtitle}>
-            {administrador ? 'Todos los equipos autorizados' : 'Tus equipos autorizados'}
+            {activadorSolo ? 'Solo tus activaciones' : administrador ? 'Todos los equipos autorizados' : 'Tus equipos autorizados'}
           </Text>
         </View>
         <TouchableOpacity style={styles.refreshButton} onPress={() => cargar({ manual: true })} disabled={refreshing}>
@@ -480,19 +629,23 @@ export default function ControlActivadores({ usuario, isConnected }) {
                   onChange={(event, date) => cambiarFecha(selectorFecha, event, date)}
                 />
               )}
-              <Text style={styles.filterLabel}>Activador</Text>
-              <View style={styles.pickerShell}>
-                <Picker
-                  selectedValue={filtros.activador}
-                  onValueChange={seleccionarFiltroActivador}
-                  style={styles.picker}
-                >
-                  <Picker.Item label="Todos" value="" />
-                  {integrantes.map((item) => (
-                    <Picker.Item key={`${item.equipoId}:${item.id}`} label={enmascararMarcaVisible(item.nombre, usuario)} value={item.id} />
-                  ))}
-                </Picker>
-              </View>
+              {!activadorSolo && (
+                <>
+                  <Text style={styles.filterLabel}>Activador</Text>
+                  <View style={styles.pickerShell}>
+                    <Picker
+                      selectedValue={filtros.activador}
+                      onValueChange={seleccionarFiltroActivador}
+                      style={styles.picker}
+                    >
+                      <Picker.Item label="Todos" value="" />
+                      {integrantes.map((item) => (
+                        <Picker.Item key={`${item.equipoId}:${item.id}`} label={enmascararMarcaVisible(item.nombre, usuario)} value={item.id} />
+                      ))}
+                    </Picker>
+                  </View>
+                </>
+              )}
               <Text style={styles.filterLabel}>Tipo de activación</Text>
               <View style={styles.pickerShell}>
                 <Picker
@@ -625,7 +778,12 @@ const styles = StyleSheet.create({
   globalGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   globalMetric: { flexGrow: 1, flexBasis: '30%', alignItems: 'center', backgroundColor: colors.surfaceAlt, borderRadius: radius.md, padding: spacing.md },
   globalValue: { color: colors.primaryDark, fontWeight: '900', fontSize: fontSizes.xlarge },
+  globalValueCompact: { fontSize: fontSizes.large },
   globalLabel: { color: colors.textMuted, fontSize: fontSizes.small, marginTop: 3, textAlign: 'center' },
+  typeSummary: { marginTop: spacing.md, borderTopWidth: 1, borderTopColor: colors.cardBorder, paddingTop: spacing.md },
+  typeSummaryRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: spacing.xs },
+  typeSummaryLabel: { color: colors.text, fontWeight: '700', flex: 1, paddingRight: spacing.sm },
+  typeSummaryValue: { color: colors.primaryDark, fontWeight: '900' },
   detailButton: { backgroundColor: colors.primary, borderRadius: radius.md, paddingVertical: spacing.md, alignItems: 'center', marginTop: spacing.md },
   detailButtonText: { color: '#fff', fontWeight: '900', fontSize: fontSizes.small },
   backButton: { alignSelf: 'flex-start', paddingVertical: spacing.sm, marginBottom: spacing.sm },

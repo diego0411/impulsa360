@@ -20,7 +20,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { v4 as uuidv4 } from 'uuid';
 import { guardarFormularioLocal } from '../lib/storage';
-import { prepararImagenPersistente } from '../lib/upload';
+import { esFotoPendientePersistente, prepararImagenPersistente } from '../lib/upload';
 import { normalizarNombreVisible } from '../lib/identity';
 import { deduplicarPlazasPorEtiqueta, etiquetaPlaza, tienePlazaValida } from '../lib/plazas';
 import { withTimeout } from '../lib/asyncTimeout';
@@ -29,7 +29,7 @@ import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
 
 const DEVICE_INFO = `react-native-${Platform.OS}`;
-const GPS_TIMEOUT_MS = 8000;
+const GPS_TIMEOUT_MS = 15000;
 const MENSAJE_GPS_OBLIGATORIO = 'No se pudo obtener la ubicación actual. Activa el GPS, revisa el permiso de ubicación e intenta guardar nuevamente.';
 const formDebug = (...args) => {
   if (typeof __DEV__ !== 'undefined' && __DEV__) {
@@ -40,6 +40,7 @@ const esFotoLocal = (value) => typeof value === 'string' && /^file:\/\//i.test(v
 
 const validarFotoLocalDisponible = async (uri, label) => {
   if (!esFotoLocal(uri)) return null;
+  if (!esFotoPendientePersistente(uri)) return `La foto de ${label} no está en almacenamiento persistente. Tómala nuevamente.`;
   const info = await FileSystem.getInfoAsync(uri, { size: true }).catch(() => null);
   if (!info?.exists) return `La foto de ${label} ya no está disponible. Tómala nuevamente.`;
   if (typeof info.size === 'number' && info.size <= 0) return `La foto de ${label} está vacía. Tómala nuevamente.`;
@@ -49,6 +50,11 @@ const optionalTextOrNull = (value) => {
   if (typeof value === 'string' && value.trim() === '') return null;
   return value ?? null;
 };
+const tieneCoordenadasValidas = (data = {}) => (
+  Number.isFinite(data.latitud) && Number.isFinite(data.longitud)
+);
+const esActivacionTranseunte = (tipoActivacion) =>
+  String(tipoActivacion || '').toLowerCase() === 'transeunte';
 
 const GRUPOS_ACTIVACION = [
   { key: 'tienda_barrio', label: 'Tiendas de Barrio' },
@@ -402,6 +408,7 @@ export default function FormularioActivacion({
   const [activacionGuardada, setActivacionGuardada] = useState(false);
   const [guardando, setGuardando] = useState(false);
   const guardandoRef = useRef(false);
+  const gpsSolicitudRef = useRef(null);
   const fotosPersistentesRef = useRef({});
   const [detectandoCiudad, setDetectandoCiudad] = useState(isConnected !== false);
   const { width, height } = useWindowDimensions();
@@ -462,8 +469,11 @@ export default function FormularioActivacion({
   const requiereComercio = formulario.tipo_grupo === 'comercio';
   const requiereComercioGeneral =
     requiereComercio && baseActivacionPreview === 'comercio';
+  const esTranseunteSimple = esActivacionTranseunte(formulario.tipo_activacion);
 
   const requiereFotos = true;
+  const requiereCashIn = !requiereValidacionReactivacion(formulario.tipo_activacion) && !esTranseunteSimple;
+  const totalFotosRequeridas = esTranseunteSimple ? 1 : requiereCashIn ? 2 : 1;
   const plazasTemporales = useMemo(
     () => Array.isArray(usuario?.plazas_temporales) ? usuario.plazas_temporales : [],
     [usuario?.plazas_temporales],
@@ -542,83 +552,88 @@ export default function FormularioActivacion({
     region_gps: typeof dir.region === 'string' && dir.region.trim() ? dir.region.trim() : '',
   });
 
-  const detectarCiudadPorGps = useCallback(async ({ silent = false } = {}) => {
-    if (Platform.OS === 'web') return;
-    setDetectandoCiudad(true);
-    try {
-      const permiso = await Location.requestForegroundPermissionsAsync();
-      if (permiso.status !== 'granted') {
-        if (!silent) {
-          Alert.alert('Ubicación desactivada', 'Activa el permiso de ubicación para detectar la ciudad automáticamente.');
+  const detectarCiudadPorGps = useCallback(({ silent = false } = {}) => {
+    if (Platform.OS === 'web') return Promise.resolve(null);
+    if (gpsSolicitudRef.current) return gpsSolicitudRef.current;
+
+    let solicitud;
+    solicitud = (async () => {
+      setDetectandoCiudad(true);
+      try {
+        const permiso = await Location.requestForegroundPermissionsAsync();
+        if (permiso.status !== 'granted') {
+          if (!silent) {
+            Alert.alert('Ubicación desactivada', 'Activa el permiso de ubicación para detectar la ciudad automáticamente.');
+          }
+          return null;
         }
-        return;
-      }
 
-      const ubicacion = await withTimeout(
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        GPS_TIMEOUT_MS,
-        'La ubicación está tardando demasiado.'
-      );
-      const geocoded = await withTimeout(
-        Location.reverseGeocodeAsync({
-          latitude: ubicacion.coords.latitude,
-          longitude: ubicacion.coords.longitude,
-        }),
-        GPS_TIMEOUT_MS,
-        'La ubicación está tardando demasiado.'
-      );
-
-      const direccionGps = geocoded?.[0] || {};
-      let ciudadGps = resolverCiudadDesdeDireccion(direccionGps);
-      if (!ciudadGps) {
-        ciudadGps = resolverCiudadKey(usuario?.plaza);
-      }
-      const ubicacionDerivada = extraerUbicacionDerivada(direccionGps);
-      if (!ciudadGps) {
-        if (!silent) {
-          Alert.alert(
-            'Ciudad no detectada',
-            'No pudimos identificar la ciudad con GPS. Revisa la ubicación del dispositivo e intenta nuevamente.'
+        const ubicacion = await withTimeout(
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          GPS_TIMEOUT_MS,
+          'La ubicación está tardando demasiado.'
+        );
+        const latitud = ubicacion?.coords?.latitude;
+        const longitud = ubicacion?.coords?.longitude;
+        if (!Number.isFinite(latitud) || !Number.isFinite(longitud)) {
+          throw new Error('La ubicación no devolvió coordenadas válidas.');
+        }
+        let direccionGps = {};
+        try {
+          const geocoded = await withTimeout(
+            Location.reverseGeocodeAsync({
+              latitude: latitud,
+              longitude: longitud,
+            }),
+            GPS_TIMEOUT_MS,
+            'La ubicación está tardando demasiado.'
           );
+          direccionGps = geocoded?.[0] || {};
+        } catch (geocodeError) {
+          console.warn('No se pudo resolver la ciudad por GPS:', geocodeError?.message || geocodeError);
         }
-        return;
-      }
 
-      setFormulario((prev) => ({
-        ...prev,
-        ciudad_activacion: ciudadGps,
-        zona_activacion: prev.ciudad_activacion === ciudadGps ? prev.zona_activacion : '',
-        ...ubicacionDerivada,
-      }));
-    } catch (error) {
-      console.warn('No se pudo detectar ciudad por GPS:', error?.message || error);
-      if (!silent) {
-        Alert.alert('Error de ubicación', 'No se pudo obtener la ubicación actual.');
+        let ciudadGps = resolverCiudadDesdeDireccion(direccionGps);
+        if (!ciudadGps) {
+          ciudadGps = resolverCiudadKey(usuario?.plaza);
+        }
+        const ubicacionDerivada = extraerUbicacionDerivada(direccionGps);
+        if (!ciudadGps) {
+          if (!silent) {
+            Alert.alert(
+              'Ciudad no detectada',
+              'Se obtuvo tu ubicación, pero no pudimos identificar la ciudad automáticamente. Selecciónala manualmente.'
+            );
+          }
+          const resultado = { latitud, longitud, ...ubicacionDerivada };
+          setFormulario((prev) => ({ ...prev, ...resultado }));
+          return resultado;
+        }
+
+        const resultado = { ciudad_activacion: ciudadGps, latitud, longitud, ...ubicacionDerivada };
+        setFormulario((prev) => ({
+          ...prev,
+          ciudad_activacion: ciudadGps,
+          zona_activacion: prev.ciudad_activacion === ciudadGps ? prev.zona_activacion : '',
+          latitud,
+          longitud,
+          ...ubicacionDerivada,
+        }));
+        return resultado;
+      } catch (error) {
+        console.warn('No se pudo detectar ciudad por GPS:', error?.message || error);
+        if (!silent) {
+          Alert.alert('Error de ubicación', 'No se pudo obtener la ubicación actual.');
+        }
+        return null;
+      } finally {
+        if (gpsSolicitudRef.current === solicitud) gpsSolicitudRef.current = null;
+        setDetectandoCiudad(false);
       }
-    } finally {
-      setDetectandoCiudad(false);
-    }
+    })();
+    gpsSolicitudRef.current = solicitud;
+    return solicitud;
   }, [usuario?.plaza]);
-
-  const obtenerCoordenadasObligatorias = async () => {
-    const permiso = await Location.requestForegroundPermissionsAsync();
-    if (permiso.status !== 'granted') {
-      throw new Error('Permiso de ubicación denegado.');
-    }
-
-    const ubicacion = await withTimeout(
-      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-      GPS_TIMEOUT_MS,
-      'La ubicación está tardando demasiado.'
-    );
-    const latitud = ubicacion?.coords?.latitude;
-    const longitud = ubicacion?.coords?.longitude;
-    if (!Number.isFinite(latitud) || !Number.isFinite(longitud)) {
-      throw new Error('La ubicación no devolvió coordenadas válidas.');
-    }
-
-    return { latitud, longitud };
-  };
 
   // Auto-set de datos provenientes del usuario y fecha actual
   useEffect(() => {
@@ -634,10 +649,19 @@ export default function FormularioActivacion({
   }, [isConnected, usuario]);
 
   useEffect(() => {
-    if (isConnected === false) return;
-    if (formulario.ciudad_activacion) return;
-    detectarCiudadPorGps({ silent: true });
-  }, [detectarCiudadPorGps, formulario.ciudad_activacion, isConnected]);
+    if (activacionGuardada || tieneCoordenadasValidas(formulario)) return;
+    let cancelado = false;
+    const detectarAutomaticamente = async () => {
+      const primerIntento = await detectarCiudadPorGps({ silent: true });
+      if (!cancelado && !tieneCoordenadasValidas(primerIntento || {})) {
+        await detectarCiudadPorGps({ silent: true });
+      }
+    };
+    detectarAutomaticamente();
+    return () => {
+      cancelado = true;
+    };
+  }, [activacionGuardada, detectarCiudadPorGps, formulario.latitud, formulario.longitud]);
 
   const tomarFoto = async (setter, fieldName) => {
     try {
@@ -710,10 +734,19 @@ export default function FormularioActivacion({
       if (result.canceled) return;
       const asset = result.assets?.[0];
       if (!asset?.uri) return Alert.alert('Error', 'La ruta de imagen no es válida.');
-      const size = typeof asset.fileSize === 'number'
-        ? asset.fileSize
-        : (await FileSystem.getInfoAsync(asset.uri, { size: true }).catch(() => null))?.size;
-      if (size && size / 1024 / 1024 > 6) {
+      const extension = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(asset.uri)?.[1]?.toLowerCase();
+      if (extension && !['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'].includes(extension)) {
+        return Alert.alert('Error', 'Selecciona una foto válida (JPG o PNG).');
+      }
+      const infoArchivo = await FileSystem.getInfoAsync(asset.uri, { size: true }).catch(() => null);
+      if (infoArchivo && infoArchivo.exists === false) {
+        return Alert.alert('Error', 'No se pudo leer la imagen seleccionada.');
+      }
+      const size = typeof asset.fileSize === 'number' ? asset.fileSize : infoArchivo?.size;
+      if (typeof size === 'number' && size <= 0) {
+        return Alert.alert('Error', 'La imagen seleccionada está vacía.');
+      }
+      if (typeof size === 'number' && size / 1024 / 1024 > 6) {
         return Alert.alert('❌ Imagen demasiado grande', 'Selecciona una imagen más liviana (≤ 6 MB).');
       }
       const destino = await prepararImagenPersistente(asset.uri, fieldName);
@@ -759,6 +792,14 @@ export default function FormularioActivacion({
     const actual = evidenciaPreview;
     if (!actual) return;
     setEvidenciaPreview(null);
+    if (actual.fieldName === 'foto_cash_in') {
+      Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Galería', onPress: () => seleccionarImagen(actual.setter, actual.fieldName) },
+        { text: 'Cámara', onPress: () => tomarFoto(actual.setter, actual.fieldName) },
+      ]);
+      return;
+    }
     tomarFoto(actual.setter, actual.fieldName);
   };
 
@@ -775,22 +816,25 @@ export default function FormularioActivacion({
     const carnetNormalizado = String(data.ci_cliente || '').replace(/\D/g, '');
     if (!data.tipo_grupo) return 'Selecciona el tipo de activación (Tiendas de Barrio, Comercio o Transeúnte).';
     if (!data.tipo_activacion) return 'Selecciona el tipo de activación específico.';
-    if (!data.ciudad_activacion) {
+    const esTranseunte = esActivacionTranseunte(data.tipo_activacion);
+    if (!esTranseunte && !data.ciudad_activacion) {
       return isConnected === false
         ? 'Selecciona la ciudad de activación.'
         : 'No se pudo detectar la ciudad por GPS. Pulsa "Actualizar ubicación".';
     }
-    if (!data.zona_activacion) return 'Selecciona la zona de activación.';
+    if (!esTranseunte && !data.zona_activacion) return 'Selecciona la zona de activación.';
     if (!impulsadorActual) return 'No se pudo obtener el nombre del activador.';
 
-    if (!data.nombres_cliente.trim()) return 'Ingresa los nombres del cliente.';
-    if (!data.apellidos_cliente.trim()) return 'Ingresa los apellidos del cliente.';
-    if (!/^\d{7,9}$/.test(carnetNormalizado)) return 'La cédula debe tener 7 a 9 números.';
-    if (!/^\d{8}$/.test(telefonoNormalizado)) return 'El teléfono debe tener exactamente 8 números.';
-    if (telefonoNormalizado && telefonoNormalizado === carnetNormalizado) {
-      return 'El número de teléfono no puede ser igual al carnet';
+    if (!esTranseunte) {
+      if (!data.nombres_cliente.trim()) return 'Ingresa los nombres del cliente.';
+      if (!data.apellidos_cliente.trim()) return 'Ingresa los apellidos del cliente.';
+      if (!/^\d{7,9}$/.test(carnetNormalizado)) return 'La cédula debe tener 7 a 9 números.';
+      if (!/^\d{8}$/.test(telefonoNormalizado)) return 'El teléfono debe tener exactamente 8 números.';
+      if (telefonoNormalizado && telefonoNormalizado === carnetNormalizado) {
+        return 'El número de teléfono no puede ser igual al carnet';
+      }
+      if (data.email_cliente && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email_cliente)) return 'El correo no parece válido.';
     }
-    if (data.email_cliente && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email_cliente)) return 'El correo no parece válido.';
 
     if (requiereTiendaBarrio && !data.tamano_tienda) {
       return 'Selecciona el tamaño de la tienda.';
@@ -808,18 +852,21 @@ export default function FormularioActivacion({
       return 'No se pudo obtener la fecha de activación.';
     }
 
-    if (!data.foto_url && !fotoPrincipal) return 'Debes cargar la foto de comprobación.';
-    if (!data.foto_cash_in && !fotoCashIn) return 'Debes cargar la foto del Cash-In.';
+    if (!esTranseunte && !data.foto_url && !fotoPrincipal) return 'Debes cargar la foto de comprobación.';
+    if (!requiereValidacionReactivacion(data.tipo_activacion) && !esActivacionTranseunte(data.tipo_activacion) && !data.foto_cash_in && !fotoCashIn) return 'Debes cargar la foto del Cash-In.';
 
     return null;
   };
 
   const fotoPrincipalUri = fotoPrincipal || formulario.foto_url;
   const fotoCashInUri = fotoCashIn || formulario.foto_cash_in;
-  const fotosCapturadas = Number(Boolean(fotoPrincipalUri)) + Number(Boolean(fotoCashInUri));
+  const fotosCapturadas = esTranseunteSimple
+    ? Number(Boolean(fotoCashInUri))
+    : Number(Boolean(fotoPrincipalUri)) + Number(Boolean(fotoCashInUri));
+  const gpsListo = formulario.ciudad_activacion && tieneCoordenadasValidas(formulario);
   const gpsResumen = detectandoCiudad
     ? 'Detectando'
-    : formulario.ciudad_activacion
+    : gpsListo
       ? 'Listo'
       : 'Pendiente';
   const faltanteActual = validar(formulario);
@@ -833,7 +880,7 @@ export default function FormularioActivacion({
     // Asegura fecha e id si no están seteados (fallback a hoy)
     const fecha = formulario.fecha_activacion || new Date().toISOString().split('T')[0];
     const formId = formulario.id || uuidv4();
-    const formularioConBasicos = {
+    let formularioConBasicos = {
       ...formulario,
       fecha_activacion: fecha,
       id: formId,
@@ -843,7 +890,26 @@ export default function FormularioActivacion({
       setFormulario(prev => ({ ...prev, fecha_activacion: fecha, id: formId }));
     }
 
-    const errorMsg = validar(formularioConBasicos);
+    let errorMsg = validar(formularioConBasicos);
+    if (isConnected !== false && errorMsg === 'No se pudo detectar la ciudad por GPS. Pulsa "Actualizar ubicación".') {
+      const solicitudActiva = gpsSolicitudRef.current;
+      const resultadoActivo = solicitudActiva ? await solicitudActiva : null;
+      const ubicacionFinal = tieneCoordenadasValidas(resultadoActivo || {})
+        ? resultadoActivo
+        : await detectarCiudadPorGps({ silent: true });
+      if (ubicacionFinal) {
+        formularioConBasicos = { ...formularioConBasicos, ...ubicacionFinal };
+        errorMsg = validar(formularioConBasicos);
+        // GPS válido = coordenadas válidas: si reverseGeocode no resolvió ciudad
+        // pero hay coordenadas, no se bloquea el guardado por la ciudad.
+        if (
+          errorMsg === 'No se pudo detectar la ciudad por GPS. Pulsa "Actualizar ubicación".'
+          && tieneCoordenadasValidas(formularioConBasicos)
+        ) {
+          errorMsg = '';
+        }
+      }
+    }
     if (errorMsg) {
       guardandoRef.current = false;
       setGuardando(false);
@@ -872,11 +938,21 @@ export default function FormularioActivacion({
         }
       }
 
-      let latitud = null; let longitud = null;
+      let latitud = formularioConBasicos.latitud;
+      let longitud = formularioConBasicos.longitud;
       try {
-        const coordenadas = await obtenerCoordenadasObligatorias();
-        latitud = coordenadas.latitud;
-        longitud = coordenadas.longitud;
+        if (!tieneCoordenadasValidas({ latitud, longitud })) {
+          const solicitudActiva = gpsSolicitudRef.current;
+          const resultadoActivo = solicitudActiva ? await solicitudActiva : null;
+          const coordenadas = tieneCoordenadasValidas(resultadoActivo || {})
+            ? resultadoActivo
+            : await detectarCiudadPorGps({ silent: true });
+          if (!tieneCoordenadasValidas(coordenadas || {})) {
+            throw new Error('La ubicación no devolvió coordenadas válidas.');
+          }
+          latitud = coordenadas.latitud;
+          longitud = coordenadas.longitud;
+        }
       } catch (gpsError) {
         formDebug('gps no disponible al guardar', gpsError?.message || gpsError);
         setEstadoGuardado('Error: ubicación requerida');
@@ -910,8 +986,10 @@ export default function FormularioActivacion({
       const esBaseComercio = baseActivacion === 'comercio';
       const fotoPrincipalPersistente = fotosPersistentesRef.current.foto_url || fotoPrincipal || formulario.foto_url;
       const fotoCashInPersistente = fotosPersistentesRef.current.foto_cash_in || fotoCashIn || formulario.foto_cash_in;
-      const fotoLocalError = await validarFotoLocalDisponible(fotoPrincipalPersistente, 'activación')
-        || await validarFotoLocalDisponible(fotoCashInPersistente, 'Cash-In');
+      const fotoLocalError = (!esActivacionTranseunte(formularioConBasicos.tipo_activacion)
+        ? await validarFotoLocalDisponible(fotoPrincipalPersistente, 'activación')
+        : null)
+        || (fotoCashInPersistente ? await validarFotoLocalDisponible(fotoCashInPersistente, 'Cash-In') : null);
       if (fotoLocalError) {
         setEstadoGuardado(`Error: ${fotoLocalError}`);
         Alert.alert('Foto no disponible', fotoLocalError);
@@ -932,7 +1010,7 @@ export default function FormularioActivacion({
         plaza: formularioConBasicos.es_plaza_temporal
           ? formularioConBasicos.plaza_temporal
           : plazaBaseValor,
-        foto_url: fotoPrincipalPersistente || null,
+        foto_url: esActivacionTranseunte(formularioConBasicos.tipo_activacion) ? null : fotoPrincipalPersistente || null,
         foto_cash_in: fotoCashInPersistente || null,
         tipo_tienda: null,
         tamano_tienda: esBaseTienda ? optionalTextOrNull(formularioConBasicos.tamano_tienda) : null,
@@ -948,7 +1026,7 @@ export default function FormularioActivacion({
           error: null,
           requiresEligibilityCheck: !isConnected && requiereElegibilidad,
           localPhotos: {
-            ...(typeof fotoPrincipalPersistente === 'string' && /^file:\/\//i.test(fotoPrincipalPersistente)
+            ...(!esActivacionTranseunte(formularioConBasicos.tipo_activacion) && typeof fotoPrincipalPersistente === 'string' && /^file:\/\//i.test(fotoPrincipalPersistente)
               ? { foto_url: fotoPrincipalPersistente }
               : {}),
             ...(typeof fotoCashInPersistente === 'string' && /^file:\/\//i.test(fotoCashInPersistente)
@@ -965,25 +1043,10 @@ export default function FormularioActivacion({
       });
 
       const idLocalGuardado = await guardarFormularioLocal(datosFormulario);
-      setEstadoGuardado('Guardada localmente');
+      const mensajePendiente = 'Activación guardada. Sincronización pendiente.';
+      setEstadoGuardado(mensajePendiente);
+      setMensajeGuardado(mensajePendiente);
       contarFormulariosLocales?.();
-      let syncResult = { status: 'offline' };
-      if (isConnected) {
-        try {
-          syncResult = await onSincronizar?.({ showAlerts: false, force: true, targetLocalId: idLocalGuardado });
-        } catch (syncError) {
-          console.error('[sync] error al sincronizar formulario guardado:', syncError?.message || syncError);
-          syncResult = { status: 'error' };
-        }
-      }
-      const sincronizada = Array.isArray(syncResult?.syncedLocalIds)
-        ? syncResult.syncedLocalIds.includes(idLocalGuardado)
-        : syncResult?.status === 'synced' && syncResult?.synced > 0;
-      const mensajeFinal = sincronizada
-        ? 'Activación sincronizada'
-        : 'Activación guardada. Pendiente de sincronización.';
-      setEstadoGuardado(mensajeFinal);
-      setMensajeGuardado(mensajeFinal);
       setFormulario({
         ...formularioInicial,
         id: '',
@@ -996,6 +1059,23 @@ export default function FormularioActivacion({
       setFotoPrincipal(null);
       setFotoCashIn(null);
       setActivacionGuardada(true);
+      setGuardando(false);
+      guardandoRef.current = false;
+      if (isConnected && typeof onSincronizar === 'function') {
+        onSincronizar({ showAlerts: false, force: true, targetLocalId: idLocalGuardado })
+          .then((syncResult) => {
+            const sincronizada = Array.isArray(syncResult?.syncedLocalIds)
+              ? syncResult.syncedLocalIds.includes(idLocalGuardado)
+              : syncResult?.status === 'synced' && syncResult?.synced > 0;
+            if (sincronizada) {
+              setEstadoGuardado('Activación sincronizada');
+              setMensajeGuardado('Activación sincronizada');
+            }
+          })
+          .catch((syncError) => {
+            formDebug('[sync] error al sincronizar formulario guardado:', syncError?.message || syncError);
+          });
+      }
     } catch (err) {
       console.error('Error al guardar formulario:', err);
       Alert.alert('Error', enmascararMarcaVisible(err?.message ? err.message : 'No se pudo guardar el formulario.', usuario));
@@ -1057,7 +1137,7 @@ export default function FormularioActivacion({
             <Text style={styles.badgeText}>Pendientes: {cantidadOffline}</Text>
           </View>
           <View style={[styles.badge, styles.badgeAccent]}>
-            <Text style={styles.badgeText}>2 fotos obligatorias</Text>
+            <Text style={styles.badgeText}>{totalFotosRequeridas} foto{totalFotosRequeridas === 1 ? '' : 's'} obligatoria{totalFotosRequeridas === 1 ? '' : 's'}</Text>
           </View>
           {!!formulario.fecha_activacion && (
             <View style={[styles.badge, styles.badgeNeutral]}>
@@ -1067,62 +1147,85 @@ export default function FormularioActivacion({
         </View>
       </View>
 
-      <View style={[styles.card, styles.compactCard]}>
-        <Text style={styles.sectionTitle}>Ubicación</Text>
-        {isConnected === false ? (
-          <>
-            <Text style={styles.locationStatus}>Ubicación guardada para modo offline</Text>
-            <Text style={styles.label}>Ciudad de Activación</Text>
-            <Picker
-              selectedValue={formulario.ciudad_activacion}
-              onValueChange={(v) => setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' }))}
-              style={styles.picker}
-            >
-              <Picker.Item label="Seleccionar..." value="" />
-              {CIUDADES.map((item) => <Picker.Item key={item.key} label={item.label} value={item.key} />)}
-            </Picker>
-          </>
-        ) : (
-          <>
-            <Text style={styles.locationStatus}>
-              {detectandoCiudad
-                ? 'Detectando ubicación...'
-                : ciudadLabel
-                  ? 'Ubicación obtenida'
-                  : 'No se pudo obtener ubicación'}
-            </Text>
-            {!!ciudadLabel && (
-              <View style={styles.locationSummary}>
-                <Text style={styles.helperLabel}>Ciudad detectada</Text>
-                <Text style={styles.helperValue}>{ciudadLabel}</Text>
-              </View>
-            )}
-            {zonasDisponibles.length === 1 && !!formulario.zona_activacion && (
-              <View style={styles.locationSummary}>
-                <Text style={styles.helperLabel}>Zona detectada</Text>
-                <Text style={styles.helperValue}>{formulario.zona_activacion}</Text>
-              </View>
-            )}
-            <TouchableOpacity
-              style={[styles.gpsButton, detectandoCiudad && styles.botonDisabled]}
-              onPress={() => detectarCiudadPorGps()}
-              disabled={detectandoCiudad}
-              activeOpacity={0.85}
-            >
-              {detectandoCiudad ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.gpsButtonText}>Actualizar ubicación</Text>}
-            </TouchableOpacity>
-          </>
-        )}
-      </View>
+      {esTranseunteSimple ? (
+        <View style={[styles.card, styles.compactCard]}>
+          <Text style={styles.sectionTitle}>Ubicación GPS</Text>
+          <Text style={styles.locationStatus}>
+            {detectandoCiudad
+              ? 'Detectando ubicación...'
+              : tieneCoordenadasValidas(formulario)
+                ? 'GPS listo'
+                : 'GPS pendiente'}
+          </Text>
+          <TouchableOpacity
+            style={[styles.gpsButton, detectandoCiudad && styles.botonDisabled]}
+            onPress={() => detectarCiudadPorGps()}
+            disabled={detectandoCiudad}
+            activeOpacity={0.85}
+          >
+            {detectandoCiudad ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.gpsButtonText}>Actualizar ubicación</Text>}
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={[styles.card, styles.compactCard]}>
+          <Text style={styles.sectionTitle}>Ubicación</Text>
+          {isConnected === false ? (
+            <>
+              <Text style={styles.locationStatus}>Ubicación guardada para modo offline</Text>
+              <Text style={styles.label}>Ciudad de Activación</Text>
+              <Picker
+                selectedValue={formulario.ciudad_activacion}
+                onValueChange={(v) => setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' }))}
+                style={styles.picker}
+              >
+                <Picker.Item label="Seleccionar..." value="" />
+                {CIUDADES.map((item) => <Picker.Item key={item.key} label={item.label} value={item.key} />)}
+              </Picker>
+            </>
+          ) : (
+            <>
+              <Text style={styles.locationStatus}>
+                {detectandoCiudad
+                  ? 'Detectando ubicación...'
+                  : ciudadLabel
+                    ? 'Ubicación obtenida'
+                    : 'No se pudo obtener ubicación'}
+              </Text>
+              {!!ciudadLabel && (
+                <View style={styles.locationSummary}>
+                  <Text style={styles.helperLabel}>Ciudad detectada</Text>
+                  <Text style={styles.helperValue}>{ciudadLabel}</Text>
+                </View>
+              )}
+              {zonasDisponibles.length === 1 && !!formulario.zona_activacion && (
+                <View style={styles.locationSummary}>
+                  <Text style={styles.helperLabel}>Zona detectada</Text>
+                  <Text style={styles.helperValue}>{formulario.zona_activacion}</Text>
+                </View>
+              )}
+              <TouchableOpacity
+                style={[styles.gpsButton, detectandoCiudad && styles.botonDisabled]}
+                onPress={() => detectarCiudadPorGps()}
+                disabled={detectandoCiudad}
+                activeOpacity={0.85}
+              >
+                {detectandoCiudad ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.gpsButtonText}>Actualizar ubicación</Text>}
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      )}
 
       <View style={styles.statusSummary}>
+        {!esTranseunteSimple && (
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>GPS</Text>
           <Text style={styles.statusSummaryValue}>{gpsResumen}</Text>
         </View>
+        )}
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>Fotos</Text>
-          <Text style={styles.statusSummaryValue}>{fotosCapturadas}/2</Text>
+          <Text style={styles.statusSummaryValue}>{fotosCapturadas}/{totalFotosRequeridas}</Text>
         </View>
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>Formulario</Text>
@@ -1232,7 +1335,7 @@ export default function FormularioActivacion({
           </>
         )}
 
-        {zonasDisponibles.length > 1 && (
+        {!esTranseunteSimple && zonasDisponibles.length > 1 && (
           <>
             <Text style={styles.label}>Zona de Activación</Text>
             <Picker
@@ -1246,27 +1349,42 @@ export default function FormularioActivacion({
             </Picker>
           </>
         )}
-        <Text style={styles.label}>Plaza asignada</Text>
-        {plazasTemporalesVisibles.length === 0 ? (
-          <View style={styles.fixedPlaza}>
-            <Text style={styles.plazaTag}>Base</Text>
-            <Text style={styles.fixedPlazaText}>{plazaBaseLabel}</Text>
-          </View>
-        ) : (
-          <Picker selectedValue={plazaSeleccionada} onValueChange={onPlazaChange} style={styles.picker}>
-            <Picker.Item label={`Base · ${plazaBaseLabel}`} value="base" />
-            {plazasTemporalesVisibles.map((plaza) => (
-              <Picker.Item
-                key={plaza.id}
-                label={`Temporal · ${enmascararMarcaVisible(plaza.nombre_legible || etiquetaPlaza(plaza.nombre, plaza.nombre), usuario)}`}
-                value={`temporal:${plaza.id}`}
-                color={colors.warning}
-              />
-            ))}
-          </Picker>
+        {!esTranseunteSimple && (
+          <>
+            <Text style={styles.label}>Ubicación de Interés (Eventos)</Text>
+            {plazasTemporalesVisibles.length === 0 ? (
+              <View style={styles.fixedPlaza}>
+                <Text style={styles.plazaTag}>Base</Text>
+                <Text style={styles.fixedPlazaText}>{plazaBaseLabel}</Text>
+              </View>
+            ) : (
+              <Picker selectedValue={plazaSeleccionada} onValueChange={onPlazaChange} style={styles.picker}>
+                <Picker.Item label={`Base · ${plazaBaseLabel}`} value="base" />
+                {plazasTemporalesVisibles.map((plaza) => (
+                  <Picker.Item
+                    key={plaza.id}
+                    label={`Temporal · ${enmascararMarcaVisible(plaza.nombre_legible || etiquetaPlaza(plaza.nombre, plaza.nombre), usuario)}`}
+                    value={`temporal:${plaza.id}`}
+                    color={colors.warning}
+                  />
+                ))}
+              </Picker>
+            )}
+          </>
         )}
       </View>
 
+       {esTranseunteSimple ? (
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Nombre</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="Nombre del transeúnte"
+          value={formulario.nombres_cliente}
+          onChangeText={(v) => actualizarCampo('nombres_cliente', v)}
+        />
+      </View>
+    ) : (
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Datos del cliente</Text>
         <Text style={styles.label}>Nombres</Text>
@@ -1309,7 +1427,9 @@ export default function FormularioActivacion({
           onChangeText={(v) => actualizarCampo('email_cliente', v)}
         />
       </View>
+      )}
 
+      {!esTranseunteSimple && (
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Checklist de activación</Text>
         {['descargo_app', 'registro', 'cash_in', 'cash_out', 'p2p', 'qr_fisico', 'respaldo'].map(key => (
@@ -1348,19 +1468,22 @@ export default function FormularioActivacion({
           </>
         )}
       </View>
+      )}
 
       {requiereFotos ? (
         <View style={styles.card}>
-          <Text style={styles.evidenceSectionTitle}>📸 Evidencias ({fotosCapturadas}/2)</Text>
+          <Text style={styles.evidenceSectionTitle}>📸 Evidencias ({fotosCapturadas}/{totalFotosRequeridas})</Text>
           <View style={styles.evidenceButtonsRow}>
-            <TouchableOpacity
-              onPress={() => abrirEvidencia(fotoPrincipalUri, setFotoPrincipal, 'foto_url', 'Activación')}
-              style={[styles.evidenceButton, fotoPrincipalUri && styles.evidenceButtonCaptured]}
-              activeOpacity={0.8}
-            >
-              <Text style={[styles.evidenceButtonIcon, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>{fotoPrincipalUri ? '✓' : '📷'}</Text>
-              <Text style={[styles.evidenceButtonText, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>Activación</Text>
-            </TouchableOpacity>
+            {!esTranseunteSimple && (
+              <TouchableOpacity
+                onPress={() => abrirEvidencia(fotoPrincipalUri, setFotoPrincipal, 'foto_url', 'Activación')}
+                style={[styles.evidenceButton, fotoPrincipalUri && styles.evidenceButtonCaptured]}
+                activeOpacity={0.8}
+              >
+                <Text style={[styles.evidenceButtonIcon, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>{fotoPrincipalUri ? '✓' : '📷'}</Text>
+                <Text style={[styles.evidenceButtonText, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>Activación</Text>
+              </TouchableOpacity>
+            )}
             <TouchableOpacity
               onPress={() => abrirEvidencia(fotoCashInUri, setFotoCashIn, 'foto_cash_in', 'Cash-In')}
               style={[styles.evidenceButton, fotoCashInUri && styles.evidenceButtonCaptured]}

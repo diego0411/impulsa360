@@ -8,7 +8,6 @@ import {
   StyleSheet,
   AppState,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SplashScreen from 'expo-splash-screen';
@@ -16,6 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { supabase } from './lib/supabase';
 import { HAS_SUPABASE_CONFIG, SUPABASE_CONFIG_ERROR } from './lib/config';
+import { secureLocalStorage } from './lib/secureLocalStorage';
 import { colors, spacing, fontSizes } from './styles/theme';
 import { normalizarNombreVisible } from './lib/identity';
 import { enmascararMarcaVisible } from './lib/brandMask';
@@ -35,7 +35,12 @@ import {
   actualizarFormularioLocal,
   marcarErrorSync,
 } from './lib/storage';
-import { ACTIVACIONES_BUCKET, subirImagenASupabase } from './lib/upload';
+import {
+  ACTIVACIONES_BUCKET,
+  asegurarFotoPendientePersistente,
+  limpiarFotosPendientesHuerfanas,
+  subirImagenASupabase,
+} from './lib/upload';
 import { hasOfflinePin } from './lib/offlinePin';
 import { obtenerConteoNoLeidas } from './lib/notificaciones';
 
@@ -71,6 +76,8 @@ const syncErrorMessage = (error) => {
   ].filter(Boolean).join(' | ');
 };
 const isLocalPhotoUri = (value) => typeof value === 'string' && /^(file|content):\/\//i.test(value);
+const esActivacionTranseunte = (tipoActivacion) =>
+  String(tipoActivacion || '').toLowerCase() === 'transeunte';
 const isRemotePhotoRef = (value) => (
   typeof value === 'string'
   && value.trim()
@@ -109,16 +116,20 @@ const buildPhotoStoragePath = (usuarioId, recordId, key) => {
 };
 const existeFotoRemota = async (path) => {
   if (!path) return false;
+  const partes = String(path).split('/').filter(Boolean);
+  const nombre = partes.pop();
+  const carpeta = partes.join('/');
+  if (!nombre || !carpeta) return false;
   const { data, error } = await withTimeout(
-    supabase.storage.from(ACTIVACIONES_BUCKET).download(path),
+    supabase.storage.from(ACTIVACIONES_BUCKET).list(carpeta, { limit: 100 }),
     QUERY_TIMEOUT_MS,
     'La red está tardando demasiado al verificar la foto remota.'
   );
-  if (error) {
-    syncWarn('foto remota no encontrada', { path, error: syncErrorInfo(error) });
+  if (error || !Array.isArray(data)) {
+    syncWarn('foto remota no encontrada', { path, error: error ? syncErrorInfo(error) : null });
     return false;
   }
-  return !!data;
+  return data.some((item) => item?.name === nombre);
 };
 const listFolderPhotoCandidates = async (folder) => {
   if (!folder) return [];
@@ -227,6 +238,7 @@ function AppShell() {
   const syncingRef = useRef(false);
   const lastSyncRef = useRef(0);
   const splashHiddenRef = useRef(false);
+  const sesionRecienAutenticadaRef = useRef(false);
 
   const contarFormulariosLocales = useCallback(async () => {
     const datos = await obtenerFormulariosLocales();
@@ -379,28 +391,33 @@ function AppShell() {
         const localPhotosForCleanup = { ...(_sync?.localPhotos || {}) };
         const effectiveFotoUrl = formulario.foto_url || localPhotosForCleanup.foto_url;
         const effectiveFotoCashIn = formulario.foto_cash_in || localPhotosForCleanup.foto_cash_in;
+        const esTranseunte = esActivacionTranseunte(formulario.tipo_activacion);
+        const requiereFotoPrincipal = !esTranseunte;
+        const requiereCashIn = !requiereValidacionReactivacion(formulario.tipo_activacion) && !esActivacionTranseunte(formulario.tipo_activacion);
 
-        if (!effectiveFotoUrl || !effectiveFotoCashIn) {
+        if ((requiereFotoPrincipal && !effectiveFotoUrl) || (requiereCashIn && !effectiveFotoCashIn)) {
           syncWarn('fotos obligatorias faltantes', { localId, recordId });
-          const errorMsg = 'Faltan las dos fotos obligatorias.';
+          const errorMsg = esTranseunte
+            ? 'Falta la foto Cash-In obligatoria.'
+            : requiereCashIn ? 'Faltan las dos fotos obligatorias.' : 'Falta la foto de activación.';
           await marcarErrorSync(localId, errorMsg);
           errores.push(`ID local ${localId}: ${errorMsg}`);
           continue;
         }
 
         // Sube imágenes pendientes
-        const fotoKeys = ['foto_url', 'foto_cash_in'];
+        const fotoKeys = [...(requiereFotoPrincipal ? ['foto_url'] : []), ...(effectiveFotoCashIn ? ['foto_cash_in'] : [])];
         let fotoUploadFailed = false;
         syncDebug('rehydratedUri', { localId, recordId, localPhotos: localPhotosForCleanup });
         for (const key of fotoKeys) {
           const fieldUri = formulario[key] || localPhotosForCleanup[key];
           const preferredLocalUri = localPhotosForCleanup[key];
-          const uploadSourceUri = isLocalPhotoUri(preferredLocalUri) ? preferredLocalUri : fieldUri;
+          let uploadSourceUri = isLocalPhotoUri(preferredLocalUri) ? preferredLocalUri : fieldUri;
           const fieldAlreadyRemote = typeof fieldUri === 'string' && fieldUri && !isLocalPhotoUri(fieldUri);
-          const shouldUploadLocal = isLocalPhotoUri(uploadSourceUri) && !fieldAlreadyRemote;
+          let shouldUploadLocal = isLocalPhotoUri(uploadSourceUri) && !fieldAlreadyRemote;
 
           if (shouldUploadLocal) {
-            const fileInfo = await FileSystem.getInfoAsync(uploadSourceUri, { size: true }).catch(() => null);
+            let fileInfo = await FileSystem.getInfoAsync(uploadSourceUri, { size: true }).catch(() => null);
             syncDebug('existsBeforeUpload', {
               localId,
               recordId,
@@ -442,6 +459,43 @@ function AppShell() {
               errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
+            }
+            const persistentUri = await asegurarFotoPendientePersistente(uploadSourceUri, key).catch((error) => {
+              syncWarn('no se pudo migrar foto local a almacenamiento persistente', { localId, recordId, key, error: syncErrorInfo(error) });
+              return null;
+            });
+            if (!persistentUri) {
+              const errorMsg = key === 'foto_cash_in'
+                ? 'Foto Cash-In no pudo guardarse en almacenamiento persistente. Reemplázala para sincronizar.'
+                : 'Foto de activación no pudo guardarse en almacenamiento persistente. Reemplázala para sincronizar.';
+              await marcarErrorSync(localId, errorMsg);
+              errores.push(`ID local ${localId}: ${errorMsg}`);
+              fotoUploadFailed = true;
+              continue;
+            }
+            if (persistentUri !== uploadSourceUri) {
+              uploadSourceUri = persistentUri;
+              formulario[key] = persistentUri;
+              localPhotosForCleanup[key] = persistentUri;
+              fileInfo = await FileSystem.getInfoAsync(uploadSourceUri, { size: true }).catch(() => null);
+              if (!fileInfo?.exists) {
+                const errorMsg = key === 'foto_cash_in'
+                  ? 'Foto Cash-In original no recuperable. Reemplázala para sincronizar.'
+                  : 'Foto de activación original no recuperable. Reemplázala para sincronizar.';
+                await marcarErrorSync(localId, errorMsg);
+                errores.push(`ID local ${localId}: ${errorMsg}`);
+                fotoUploadFailed = true;
+                continue;
+              }
+              await actualizarFormularioLocal(localId, {
+                [key]: persistentUri,
+                _sync: {
+                  ...(_sync || {}),
+                  status: 'pending',
+                  error: null,
+                  localPhotos: localPhotosForCleanup,
+                },
+              });
             }
             try {
               const path = buildPhotoStoragePath(usuario.id, recordId, key);
@@ -583,12 +637,22 @@ function AppShell() {
   }, [isConnected, usuario?.id]);
 
   const verificarSesion = useCallback(async () => {
+    // Ingreso fresco desde AuthScreen: usuarioFinal ya trae perfil, roles,
+    // plazas y puede_activar; se omite la recarga de red para mostrar la
+    // pantalla principal de inmediato (restauración en frío sigue intacta).
+    if (sesionRecienAutenticadaRef.current && usuario?.id) {
+      sesionRecienAutenticadaRef.current = false;
+      contarFormulariosLocales();
+      setLoading(false);
+      return;
+    }
+    sesionRecienAutenticadaRef.current = false;
     setLoading(true);
     let storedUser = null;
     let usuarioCache = null;
     try {
       // Siempre intenta cargar usuario local primero (útil si tarda la red)
-      storedUser = await AsyncStorage.getItem('usuario_autenticado_local');
+      storedUser = await secureLocalStorage.getItem('usuario_autenticado_local');
       if (storedUser) {
         try {
           const parsed = JSON.parse(storedUser);
@@ -651,6 +715,23 @@ function AppShell() {
           usuarioId: user.id,
         });
 
+        let filasRoles = [];
+        try {
+          const { data: rolesData } = await withTimeout(
+            supabase.from('activador_roles').select('rol').eq('usuario_id', user.id),
+            QUERY_TIMEOUT_MS,
+            'La red tardó demasiado al cargar los roles.'
+          );
+          if (Array.isArray(rolesData)) filasRoles = rolesData;
+        } catch {
+          // Sin multirrol (RLS/red): se conserva el rol legacy de activadores.
+        }
+        const rolesCrudos = [
+          perfil?.rol || perfil?.role,
+          ...filasRoles.map((fila) => fila?.rol),
+          ...(Array.isArray(cacheMismoUsuario?.roles) ? cacheMismoUsuario.roles : []),
+        ].filter((rol) => typeof rol === 'string' && rol.trim());
+
         const usuarioFinal = {
           id: user.id,
           email: user.email,
@@ -658,11 +739,12 @@ function AppShell() {
           plaza: plazaPerfil || plazaCache || 'No especificada',
           plazas_temporales: plazasTemporales,
           rol: perfil?.rol || perfil?.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || user.user_metadata?.rol || user.user_metadata?.role || 'activador',
+          roles: Array.from(new Set(rolesCrudos)),
           puede_activar: perfil?.puede_activar === true || cacheMismoUsuario?.puede_activar === true,
         };
 
         setUsuario(usuarioFinal);
-        await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+        await secureLocalStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
       }
     } catch (e) {
       if (typeof __DEV__ !== 'undefined' && __DEV__) {
@@ -791,40 +873,68 @@ function AppShell() {
         console.warn('⚠️ Error cerrando sesión:', e.message);
       }
     }
-    await AsyncStorage.removeItem('usuario_autenticado_local');
+    try {
+      const pendientes = await obtenerFormulariosLocales();
+      const fotosReferenciadas = pendientes.flatMap((item) => [
+        item?.foto_url,
+        item?.foto_cash_in,
+        ...Object.values(item?._sync?.localPhotos || {}),
+      ]);
+      await limpiarFotosPendientesHuerfanas(fotosReferenciadas);
+    } catch (e) {
+      if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        console.warn('⚠️ No se pudieron limpiar fotos huérfanas:', e?.message || e);
+      }
+    }
+    await secureLocalStorage.removeItem('usuario_autenticado_local');
     setVistaActiva('formulario');
     setNotificacionesNoLeidas(0);
     setUsuario(null);
   };
 
   const handleLogin = async (user) => {
+    sesionRecienAutenticadaRef.current = true;
     setUsuario(user);
     setVistaActiva('formulario');
     contarFormulariosLocales();
   };
 
   const firstName = enmascararMarcaVisible(usuario?.nombre?.split(' ')[0] || 'Usuario', usuario);
-  const rolNormalizado = String(usuario?.rol || usuario?.role || 'activador')
+  const normalizarRol = (value) => String(value || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_|_$/g, '');
-  const esAdministrador = ['admin', 'administrador', 'administrator'].some(
-    (rol) => rolNormalizado === rol || rolNormalizado.startsWith(`${rol}_`),
+  // Conjunto multirrol: activador_roles + rol legacy de activadores (+ cache offline).
+  const rolesNormalizados = [...new Set(
+    [usuario?.rol, usuario?.role, ...(Array.isArray(usuario?.roles) ? usuario.roles : [])]
+      .map(normalizarRol)
+      .filter(Boolean)
+  )];
+  const rolesBase = rolesNormalizados.length ? rolesNormalizados : ['activador'];
+  // Compatibilidad con strings legacy compuestos (p. ej. 'lider_activador'): se
+  // interpretan como ambas capacidades sin crear roles nuevos.
+  const esRolCompuestoLegacy = (rol) =>
+    ['lider_activador', 'activador_lider', 'leader_activator', 'activator_leader'].includes(rol)
+    || ((rol.includes('lider') || rol.includes('leader')) && rol.includes('activador'));
+  const esAdministrador = rolesBase.some(
+    (rol) => ['admin', 'administrador', 'administrator'].some(
+      (base) => rol === base || rol.startsWith(`${base}_`),
+    ),
   );
-  const esHibrido =
-    ['lider_activador', 'activador_lider', 'leader_activator', 'activator_leader'].includes(rolNormalizado)
-    || ((rolNormalizado.includes('lider') || rolNormalizado.includes('leader')) && rolNormalizado.includes('activador'));
-  const esLider =
-    ['lider', 'leader', 'supervisor'].some(
-      (rol) => rolNormalizado === rol || rolNormalizado.startsWith(`${rol}_`),
-    )
-    || esHibrido;
+  const esLider = rolesBase.some(
+    (rol) => ['lider', 'leader', 'supervisor'].some(
+      (base) => rol === base || rol.startsWith(`${base}_`),
+    ) || esRolCompuestoLegacy(rol),
+  );
+  const esActivadorOperativo = rolesBase.some(
+    (rol) => rol === 'activador' || rol.startsWith('activador_') || esRolCompuestoLegacy(rol),
+  );
   const liderPuedeActivar = esLider && usuario?.puede_activar === true;
-  const puedeFormulario = esAdministrador || !esLider || esHibrido || liderPuedeActivar;
-  const puedeActivaciones = esAdministrador || !esLider || esHibrido || liderPuedeActivar;
-  const puedeControl = esAdministrador || esLider;
+  const puedeFormulario = esAdministrador || esActivadorOperativo || !esLider || liderPuedeActivar;
+  const puedeActivaciones = esAdministrador || esActivadorOperativo || !esLider || liderPuedeActivar;
+  const puedeControl = esAdministrador || esLider || esActivadorOperativo;
   const vistasPermitidas = [
     ...(puedeFormulario ? ['formulario'] : []),
     ...(puedeControl ? ['control'] : []),

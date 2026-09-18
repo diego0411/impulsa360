@@ -39,3 +39,10 @@ yarn-error.*
 
 # Android local signing config
 android/keystore.properties
+
+# local release artifacts (no versionables)
+releases/
+
+# local emulator artifacts (no versionables)
+__azurite_db_blob*.json
+supabase/.temp/

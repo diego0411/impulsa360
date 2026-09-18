@@ -14,11 +14,12 @@ import {
   ScrollView,
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
+import { obtenerPlazasTemporales } from '../lib/plazasTemporales';
 import { withTimeout, isTimeoutError } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
+import { secureLocalStorage } from '../lib/secureLocalStorage';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 import {
   getOfflinePinStatus,
@@ -91,7 +92,7 @@ export default function AuthScreen({ onLogin }) {
 
     let usuarioLocal = null;
     try {
-      const storedRaw = await AsyncStorage.getItem('usuario_autenticado_local');
+      const storedRaw = await secureLocalStorage.getItem('usuario_autenticado_local');
       const stored = storedRaw ? JSON.parse(storedRaw) : null;
       if (stored?.id) {
         usuarioLocal = stored;
@@ -279,45 +280,15 @@ export default function AuthScreen({ onLogin }) {
         return;
       }
 
-      const {
-        data: { session },
-        error: sessionError,
-      } = await withTimeout(
-        supabase.auth.getSession(),
-        QUERY_TIMEOUT_MS,
-        'La señal está muy débil al recuperar la sesión.'
-      );
-
-      if (sessionError) {
-        Alert.alert('Error', enmascararMarcaVisible(sessionError.message, pinSetupUser || cachedUser));
-        return;
-      }
-
-      const usuario = session?.user || data.user;
+      const usuario = data.user;
       if (!usuario?.id) {
         Alert.alert('Error', 'No se pudo recuperar la sesión del usuario.');
         return;
       }
 
-      const { data: perfil, error: errorPerfil } = await withTimeout(
-        supabase
-          .from('activadores')
-          .select('*')
-          .eq('usuario_id', usuario.id)
-          .single(),
-        QUERY_TIMEOUT_MS,
-        'La señal está muy débil al cargar el perfil.'
-      );
-
-      if (errorPerfil) {
-        if (isDev) {
-          console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
-        }
-      }
-
       let usuarioCache = null;
       try {
-        const storedRaw = await AsyncStorage.getItem('usuario_autenticado_local');
+        const storedRaw = await secureLocalStorage.getItem('usuario_autenticado_local');
         const stored = storedRaw ? JSON.parse(storedRaw) : null;
         if (stored?.id === usuario.id) {
           usuarioCache = stored;
@@ -325,6 +296,38 @@ export default function AuthScreen({ onLogin }) {
       } catch {
         // ignorar cache inválido
       }
+
+      // Consultas independientes en paralelo: perfil (autorización), roles
+      // (multirrol) y plazas (formulario). Ninguna bloquea a otra.
+      const [perfilResult, filasRoles, plazasTemporales] = await Promise.all([
+        withTimeout(
+          supabase
+            .from('activadores')
+            .select('*')
+            .eq('usuario_id', usuario.id)
+            .single(),
+          QUERY_TIMEOUT_MS,
+          'La señal está muy débil al cargar el perfil.'
+        ),
+        withTimeout(
+          supabase.from('activador_roles').select('rol').eq('usuario_id', usuario.id),
+          QUERY_TIMEOUT_MS,
+          'La señal está muy débil al cargar los roles.'
+        ).then(({ data: rolesData }) => (Array.isArray(rolesData) ? rolesData : [])).catch(() => []),
+        obtenerPlazasTemporales({ activadorId: usuario.id, usuarioId: usuario.id }),
+      ]);
+      const perfil = perfilResult?.data;
+      const errorPerfil = perfilResult?.error;
+      if (errorPerfil) {
+        if (isDev) {
+          console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
+        }
+      }
+      const rolesCrudos = [
+        perfil?.rol || perfil?.role,
+        ...filasRoles.map((fila) => fila?.rol),
+        ...(Array.isArray(usuarioCache?.roles) ? usuarioCache.roles : []),
+      ].filter((rol) => typeof rol === 'string' && rol.trim());
 
       const nombrePerfil = normalizarNombreVisible(perfil?.nombre || '');
       const nombreCache = normalizarNombreVisible(usuarioCache?.nombre || '');
@@ -337,13 +340,14 @@ export default function AuthScreen({ onLogin }) {
         email: usuario.email,
         nombre: nombrePerfil || nombreCache || nombreMetadata || usuario.email,
         plaza: plazaPerfil || plazaCache || 'No especificada',
+        plazas_temporales: plazasTemporales,
         rol: perfil?.rol || perfil?.role || usuarioCache?.rol || usuarioCache?.role || usuario.user_metadata?.rol || usuario.user_metadata?.role || 'activador',
+        roles: Array.from(new Set(rolesCrudos)),
         puede_activar: perfil?.puede_activar === true || usuarioCache?.puede_activar === true,
       };
 
-      await AsyncStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+      await secureLocalStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
       const pinStatus = await getOfflinePinStatus(usuarioFinal.id);
-      await hydrateOfflineState({ knownIsConnected: true });
 
       if (!pinStatus.configured) {
         setPinSetupUser(usuarioFinal);

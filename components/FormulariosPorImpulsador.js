@@ -13,6 +13,7 @@ import { etiquetaPlaza } from '../lib/plazas';
 import { fechaEnRango, fechaLocalIso, obtenerQuincenaActual } from '../lib/quincena';
 import { withTimeout } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
+import { enmascararDatoCliente } from '../lib/customerMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 
 const PAGE_SIZE = 20;
@@ -20,6 +21,18 @@ const QUERY_TIMEOUT_MS = 10000;
 const esFotoLocal = (value) => /^(file|content):\/\//i.test(String(value || ''));
 const esPendienteSync = (item) => item?._origen === 'local' || item?.estado_sync === 'offline_pending' || item?._sync?.status === 'pending';
 const fechaRealActivacion = (item) => item?.fecha_activacion || item?._created_at || item?.created_at || item?.creado_en;
+const normalizarRol = (value) => String(value || '')
+  .toLowerCase()
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-z0-9]+/g, '_')
+  .replace(/^_|_$/g, '');
+const esRolAdministrador = (value) => {
+  const rol = normalizarRol(value);
+  return ['admin', 'administrador', 'administrator'].some(
+    (item) => rol === item || rol.startsWith(`${item}_`),
+  );
+};
 
 const resolverFotoDetalle = async (value) => {
   if (!value) return { uri: '', perdida: false };
@@ -56,6 +69,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
   const usuarioId = usuario?.id;
   const usuarioNombre = normalizarNombreVisible(usuario?.nombre || '');
+  const administrador = esRolAdministrador(usuario?.rol || usuario?.role);
   const { height } = useWindowDimensions();
   const modalMaxHeight = Math.min(height * 0.85, 640);
   const fotoHeight = Math.min(height * 0.35, 260);
@@ -82,7 +96,8 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
     const localesPendientes = (formulariosLocales || [])
       .filter((f) => {
-        if (!esPendienteSync(f) && !fechaEnRango(fechaRealActivacion(f), rangoQuincena)) return false;
+        if (!administrador && !fechaEnRango(fechaRealActivacion(f), rangoQuincena)) return false;
+        if (!esPendienteSync(f) && !administrador) return false;
         const id = String(f?.id || '');
         if (!id) return true;
         return !remotosById.has(id);
@@ -95,7 +110,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       const bv = String(fechaRealActivacion(b) || '');
       return bv.localeCompare(av);
     });
-  }, [formulariosLocales, formulariosRemotos, rangoQuincena]);
+  }, [administrador, formulariosLocales, formulariosRemotos, rangoQuincena]);
 
   const fetchPage = useCallback(async ({ reset = false } = {}) => {
     if (!usuarioId) return;
@@ -113,15 +128,20 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       const from = pageRef.current * PAGE_SIZE;
       const to = from + PAGE_SIZE - 1;
 
-      const { data, error } = await withTimeout(
-        supabase
+      let query = supabase
           .from('activaciones')
           .select('*')
           .eq('usuario_id', usuarioId)
-          .gte('fecha_activacion', rangoQuincena.desde)
-          .lt('fecha_activacion', rangoQuincena.hastaExclusivo)
           .order('fecha_activacion', { ascending: false })
-          .range(from, Math.max(from, to)),
+          .range(from, Math.max(from, to));
+      if (!administrador) {
+        query = query
+          .gte('fecha_activacion', rangoQuincena.desde)
+          .lt('fecha_activacion', rangoQuincena.hastaExclusivo);
+      }
+
+      const { data, error } = await withTimeout(
+        query,
         QUERY_TIMEOUT_MS,
         'La señal está muy débil para cargar activaciones.'
       );
@@ -138,15 +158,19 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       let rows = data || [];
       // Compatibilidad con registros antiguos sin usuario_id enlazado.
       if (reset && rows.length === 0 && usuarioNombre) {
-        const { data: legacyRows, error: legacyError } = await withTimeout(
-          supabase
+        let legacyQuery = supabase
             .from('activaciones')
             .select('*')
             .ilike('impulsador', usuarioNombre)
-            .gte('fecha_activacion', rangoQuincena.desde)
-            .lt('fecha_activacion', rangoQuincena.hastaExclusivo)
             .order('fecha_activacion', { ascending: false })
-            .range(0, PAGE_SIZE - 1),
+            .range(0, PAGE_SIZE - 1);
+        if (!administrador) {
+          legacyQuery = legacyQuery
+            .gte('fecha_activacion', rangoQuincena.desde)
+            .lt('fecha_activacion', rangoQuincena.hastaExclusivo);
+        }
+        const { data: legacyRows, error: legacyError } = await withTimeout(
+          legacyQuery,
           QUERY_TIMEOUT_MS,
           'La señal está muy débil para cargar activaciones.'
         );
@@ -171,7 +195,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       setRefreshing(false);
       setLoadingMore(false);
     }
-  }, [rangoQuincena, usuario, usuarioId, usuarioNombre]);
+  }, [administrador, rangoQuincena, usuario, usuarioId, usuarioNombre]);
 
   useEffect(() => {
     if (usuarioId) {
@@ -343,7 +367,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     }
   };
 
-  const repararFotoPendiente = async (fieldName) => {
+  const tomarFotoReparada = async (fieldName) => {
     try {
       const permiso = await ImagePicker.requestCameraPermissionsAsync();
       if (permiso.status !== 'granted') {
@@ -366,6 +390,64 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
       Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo actualizar la foto pendiente.', usuario));
     }
+  };
+
+  const seleccionarFotoReparada = async (fieldName) => {
+    try {
+      const permiso = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (permiso.status !== 'granted') {
+        Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la galería.');
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.5,
+        allowsEditing: true,
+      });
+      if (result.canceled) return;
+      const uri = result.assets?.[0]?.uri;
+      if (!uri) {
+        Alert.alert('Error', 'La ruta de imagen no es válida.');
+        return;
+      }
+      const extension = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(uri)?.[1]?.toLowerCase();
+      if (extension && !['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'].includes(extension)) {
+        Alert.alert('Error', 'Selecciona una foto válida (JPG o PNG).');
+        return;
+      }
+      const infoArchivo = await FileSystem.getInfoAsync(uri, { size: true }).catch(() => null);
+      if (infoArchivo && infoArchivo.exists === false) {
+        Alert.alert('Error', 'No se pudo leer la imagen seleccionada.');
+        return;
+      }
+      const size = typeof result.assets?.[0]?.fileSize === 'number'
+        ? result.assets[0].fileSize
+        : infoArchivo?.size;
+      if (typeof size === 'number' && size <= 0) {
+        Alert.alert('Error', 'La imagen seleccionada está vacía.');
+        return;
+      }
+      if (typeof size === 'number' && size / 1024 / 1024 > 6) {
+        Alert.alert('❌ Imagen demasiado grande', 'Selecciona una imagen más liviana (≤ 6 MB).');
+        return;
+      }
+      await guardarFotoReparada(fieldName, uri);
+    } catch (error) {
+      console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
+      Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo actualizar la foto pendiente.', usuario));
+    }
+  };
+
+  const repararFotoPendiente = (fieldName) => {
+    if (fieldName === 'foto_cash_in') {
+      Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Galería', onPress: () => seleccionarFotoReparada(fieldName) },
+        { text: 'Cámara', onPress: () => tomarFotoReparada(fieldName) },
+      ]);
+      return;
+    }
+    return tomarFotoReparada(fieldName);
   };
 
   const renderItem = ({ item }) => {
@@ -580,10 +662,11 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 /** Helpers de UI */
 function renderCampo(label, value, usuario) {
   if (value === null || value === undefined || value === '') return null;
+  const valorVisible = enmascararDatoCliente(label, value);
   return (
     <View style={{ marginBottom: 10 }}>
       <Text style={{ fontSize: fontSizes.small, color: colors.textMuted, fontWeight: '600' }}>{label}</Text>
-      <Text style={{ fontSize: fontSizes.medium, color: colors.text, fontWeight: '600' }}>{enmascararMarcaVisible(value, usuario)}</Text>
+      <Text style={{ fontSize: fontSizes.medium, color: colors.text, fontWeight: '600' }}>{enmascararMarcaVisible(valorVisible, usuario)}</Text>
     </View>
   );
 }
