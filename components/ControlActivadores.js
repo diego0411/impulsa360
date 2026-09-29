@@ -33,7 +33,7 @@ const normalizarRol = (value) => String(value || '')
   .replace(/[^a-z0-9]+/g, '_')
   .replace(/^_|_$/g, '');
 const rolesNormalizados = (value) => {
-  if (Array.isArray(value)) return value.map(normalizarRol).filter(Boolean);
+  if (Array.isArray(value)) return value.flatMap(rolesNormalizados);
   const rol = normalizarRol(value);
   if (!rol) return [];
   return rol.split('_').filter(Boolean);
@@ -187,9 +187,10 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const [fotoError, setFotoError] = useState('');
   const [resumenTiposGlobal, setResumenTiposGlobal] = useState(resumenTiposVacio);
   const { height } = useWindowDimensions();
-  const administrador = esRolAdministrador(usuario?.rol || usuario?.role);
-  const lider = esRolLider(usuario?.rol || usuario?.role);
-  const activadorSolo = !administrador && esRolActivador(usuario?.rol || usuario?.role);
+  const rolesUsuario = [usuario?.rol, usuario?.role, usuario?.roles];
+  const administrador = esRolAdministrador(rolesUsuario);
+  const lider = esRolLider(rolesUsuario);
+  const activadorSolo = !administrador && esRolActivador(rolesUsuario);
   const usuarioId = usuario?.id;
   const hoyLocal = fechaLocalIso(new Date());
   const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
@@ -711,7 +712,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
             ) : fotoError ? (
               <Text style={styles.inlineError}>{enmascararMarcaVisible(fotoError, usuario)}</Text>
             ) : foto?.uri ? (
-              <Image source={{ uri: foto.uri }} style={[styles.photo, { height: height * 0.62 }]} resizeMode="contain" />
+              <Image source={{ uri: foto.uri }} style={[styles.photo, { height: height * 0.62 }]} resizeMode="contain" resizeMethod="resize" />
             ) : null}
           </View>
         </View>

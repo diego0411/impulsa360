@@ -20,6 +20,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { v4 as uuidv4 } from 'uuid';
 import { guardarFormularioLocal } from '../lib/storage';
+import { secureLocalStorage } from '../lib/secureLocalStorage';
 import { esFotoPendientePersistente, prepararImagenPersistente } from '../lib/upload';
 import { normalizarNombreVisible } from '../lib/identity';
 import { deduplicarPlazasPorEtiqueta, etiquetaPlaza, tienePlazaValida } from '../lib/plazas';
@@ -27,9 +28,18 @@ import { withTimeout } from '../lib/asyncTimeout';
 import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from '../lib/elegibilidadReactivacion';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
+import CameraEvidencia from './CameraEvidencia';
+import { registrarErrorFoto } from '../lib/photoDiagnostics';
 
 const DEVICE_INFO = `react-native-${Platform.OS}`;
 const GPS_TIMEOUT_MS = 15000;
+const CONOCIDA_TIMEOUT_MS = 3000;
+const UBICACION_CONOCIDA_MAX_MS = 120000;
+const PRECISION_MAXIMA_METROS = 200;
+const BORRADOR_DEBOUNCE_MS = 700;
+const GALLERY_TIMEOUT_MS = 30000;
+const PHOTO_FILE_TIMEOUT_MS = 12000;
+const borradorKey = (usuarioId) => (usuarioId ? `borrador_formulario_${usuarioId}` : null);
 const MENSAJE_GPS_OBLIGATORIO = 'No se pudo obtener la ubicación actual. Activa el GPS, revisa el permiso de ubicación e intenta guardar nuevamente.';
 const formDebug = (...args) => {
   if (typeof __DEV__ !== 'undefined' && __DEV__) {
@@ -403,13 +413,36 @@ export default function FormularioActivacion({
   const [fotoPrincipal, setFotoPrincipal] = useState(null);
   const [fotoCashIn, setFotoCashIn] = useState(null);
   const [evidenciaPreview, setEvidenciaPreview] = useState(null);
+  const [camaraEvidencia, setCamaraEvidencia] = useState(null);
   const [estadoGuardado, setEstadoGuardado] = useState('');
   const [mensajeGuardado, setMensajeGuardado] = useState('');
   const [activacionGuardada, setActivacionGuardada] = useState(false);
   const [guardando, setGuardando] = useState(false);
+  const [borradorListoUsuario, setBorradorListoUsuario] = useState(null);
+  const [usuarioFormularioId, setUsuarioFormularioId] = useState(usuario?.id || null);
+  const [borradorResetToken, setBorradorResetToken] = useState(0);
   const guardandoRef = useRef(false);
   const gpsSolicitudRef = useRef(null);
   const fotosPersistentesRef = useRef({});
+  const galeriaOperacionRef = useRef(null);
+  const mountedRef = useRef(true);
+  const ciudadManualRef = useRef(false);
+  const borradorTimerRef = useRef(null);
+  const borradorRestauradoRef = useRef(null);
+  const restaurandoBorradorRef = useRef(false);
+  const borradorColaRef = useRef(Promise.resolve());
+  const borradorGeneracionRef = useRef(0);
+  const borradorPendienteRef = useRef(null);
+  const borradorBloqueadoRef = useRef(false);
+  const borradorFirmaBloqueadaRef = useRef(null);
+  const borradorBaselineListaRef = useRef(true);
+  const borradoresUltimosRef = useRef({});
+  const borradorRestauracionIdRef = useRef(0);
+  const borradorUsuariosListosRef = useRef({});
+  const borradorFirmasInicioRef = useRef({});
+  const formularioSesionRef = useRef(0);
+  const usuarioFormularioIdRef = useRef(usuarioFormularioId);
+  usuarioFormularioIdRef.current = usuarioFormularioId;
   const [detectandoCiudad, setDetectandoCiudad] = useState(isConnected !== false);
   const { width, height } = useWindowDimensions();
   const guiaRubrosImageHeight = Math.max(150, Math.min((width - spacing.md * 4) / 1.5, height * 0.38));
@@ -420,6 +453,293 @@ export default function FormularioActivacion({
   const actualizarCampo = (campo, valor) => {
     setFormulario(prev => ({ ...prev, [campo]: valor }));
   };
+
+  const esSesionFormularioActual = useCallback((sesion, propietarioId) => (
+    mountedRef.current
+    && sesion === formularioSesionRef.current
+    && propietarioId === usuarioFormularioIdRef.current
+  ), []);
+
+  const crearSnapshotBorrador = useCallback((usuarioId, campos, principal, cashIn, persistentes = fotosPersistentesRef.current || {}) => ({
+    usuario_id: usuarioId,
+    updatedAt: new Date().toISOString(),
+    campos,
+    fotos: {
+      fotoPrincipal: principal,
+      fotoCashIn: cashIn,
+      fotosPersistentes: persistentes,
+    },
+  }), []);
+
+  const firmaSnapshotBorrador = useCallback((snapshot) => JSON.stringify({
+    usuario_id: snapshot?.usuario_id || null,
+    campos: snapshot?.campos || null,
+    fotos: snapshot?.fotos || null,
+  }), []);
+
+  const encolarBorrador = useCallback((snapshot, generacion = borradorGeneracionRef.current, forzar = false) => {
+    if (!snapshot?.usuario_id) return borradorColaRef.current;
+    const key = borradorKey(snapshot.usuario_id);
+    borradorColaRef.current = borradorColaRef.current
+      .catch(() => {})
+      .then(async () => {
+        if (!forzar && (generacion !== borradorGeneracionRef.current || borradorBloqueadoRef.current)) return;
+        await secureLocalStorage.setItem(key, JSON.stringify(snapshot));
+      });
+    return borradorColaRef.current;
+  }, []);
+
+  const eliminarBorrador = useCallback(async (propietarioId) => {
+    const key = borradorKey(propietarioId);
+    if (!key) return;
+    borradorGeneracionRef.current += 1;
+    borradorBloqueadoRef.current = true;
+    borradorFirmaBloqueadaRef.current = null;
+    borradorBaselineListaRef.current = false;
+    borradorPendienteRef.current = null;
+    if (borradorTimerRef.current) {
+      globalThis.clearTimeout(borradorTimerRef.current);
+      borradorTimerRef.current = null;
+    }
+    borradorColaRef.current = borradorColaRef.current
+      .catch(() => {})
+      .then(() => secureLocalStorage.removeItem(key));
+    await borradorColaRef.current;
+  }, []);
+
+  const limpiarFormulario = useCallback(async () => {
+    const formularioLimpio = {
+      ...formularioInicial,
+      id: '',
+      impulsador: normalizarNombreVisible(usuario?.nombre || ''),
+      fecha_activacion: new Date().toISOString().split('T')[0],
+    };
+    const propietarioId = usuarioFormularioId;
+    formularioSesionRef.current += 1;
+    gpsSolicitudRef.current = null;
+    const eliminacion = eliminarBorrador(propietarioId);
+    // Borra solo archivos temporales propios (fotos persistentes del borrador).
+    const uris = new Set([
+      fotoPrincipal,
+      fotoCashIn,
+      formulario.foto_url,
+      formulario.foto_cash_in,
+      ...Object.values(fotosPersistentesRef.current || {}),
+    ]);
+    // Best-effort: un fallo eliminando un archivo nunca rechaza ni crashea.
+    await Promise.all([...uris].map(async (uri) => {
+      try {
+        if (typeof uri === 'string' && /^file:\/\//i.test(uri)) {
+          await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+        }
+      } catch {
+        // limpieza best-effort: se ignora el fallo individual
+      }
+    }));
+    await eliminacion;
+    // Permite restaurar un borrador futuro; el effect de restore no se
+    // re-ejecuta solo por resetear el ref, así que no restaura de inmediato.
+    borradorRestauradoRef.current = null;
+    fotosPersistentesRef.current = {};
+    ciudadManualRef.current = false;
+    if (borradorTimerRef.current) globalThis.clearTimeout(borradorTimerRef.current);
+    if (!mountedRef.current) return;
+    setFormulario(formularioLimpio);
+    setFotoPrincipal(null);
+    setFotoCashIn(null);
+    setEvidenciaPreview(null);
+    setActivacionGuardada(false);
+    setEstadoGuardado('');
+    setMensajeGuardado('');
+    setGuardando(false);
+    guardandoRef.current = false;
+    gpsSolicitudRef.current = null;
+    setBorradorResetToken((actual) => actual + 1);
+  }, [eliminarBorrador, fotoPrincipal, fotoCashIn, formulario.foto_url, formulario.foto_cash_in, usuario?.nombre, usuarioFormularioId]);
+
+  const confirmarBorrarFormulario = useCallback(() => {
+    Alert.alert(
+      'Borrar formulario',
+      'Se descartarán los datos y fotos no guardadas de este formulario. Esta acción no se puede deshacer.',
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        { text: 'Borrar', style: 'destructive', onPress: () => { limpiarFormulario(); } },
+      ]
+    );
+  }, [limpiarFormulario]);
+
+  const usuarioIdBorrador = usuarioFormularioId;
+  const snapshotBorradorActual = crearSnapshotBorrador(
+    usuarioIdBorrador,
+    formulario,
+    fotoPrincipal,
+    fotoCashIn,
+  );
+  if (usuarioIdBorrador) borradoresUltimosRef.current[usuarioIdBorrador] = snapshotBorradorActual;
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    gpsSolicitudRef.current = null;
+    if (borradorTimerRef.current) globalThis.clearTimeout(borradorTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    const nuevoUsuarioId = usuario?.id || null;
+    if (nuevoUsuarioId === usuarioFormularioId) return;
+
+    const usuarioAnteriorId = usuarioFormularioId;
+    const snapshotAnterior = usuarioAnteriorId ? borradoresUltimosRef.current[usuarioAnteriorId] : null;
+    if (borradorTimerRef.current) {
+      globalThis.clearTimeout(borradorTimerRef.current);
+      borradorTimerRef.current = null;
+    }
+    borradorPendienteRef.current = null;
+    const generacionTransicion = borradorGeneracionRef.current + 1;
+    borradorGeneracionRef.current = generacionTransicion;
+    if (snapshotAnterior && !borradorBloqueadoRef.current) {
+      // El snapshot conserva el owner original y su clave se calcula antes de
+      // preparar el formulario del usuario entrante.
+      encolarBorrador(snapshotAnterior, generacionTransicion, true);
+    }
+
+    formularioSesionRef.current += 1;
+    gpsSolicitudRef.current = null;
+    borradorBloqueadoRef.current = true;
+    borradorFirmaBloqueadaRef.current = null;
+    borradorBaselineListaRef.current = false;
+    borradorRestauracionIdRef.current += 1;
+    borradorRestauradoRef.current = null;
+    restaurandoBorradorRef.current = false;
+    fotosPersistentesRef.current = {};
+    ciudadManualRef.current = false;
+    setBorradorListoUsuario(null);
+    setFormulario({
+      ...formularioInicial,
+      id: '',
+      impulsador: normalizarNombreVisible(usuario?.nombre || ''),
+      fecha_activacion: new Date().toISOString().split('T')[0],
+    });
+    setFotoPrincipal(null);
+    setFotoCashIn(null);
+    setEvidenciaPreview(null);
+    setCamaraEvidencia(null);
+    setActivacionGuardada(false);
+    setEstadoGuardado('');
+    setMensajeGuardado('');
+    setGuardando(false);
+    guardandoRef.current = false;
+    setUsuarioFormularioId(nuevoUsuarioId);
+    setBorradorResetToken((actual) => actual + 1);
+  }, [encolarBorrador, usuario?.id, usuario?.nombre, usuarioFormularioId]);
+
+  useEffect(() => {
+    const usuarioId = usuarioFormularioId;
+    return () => {
+      const snapshot = usuarioId ? borradoresUltimosRef.current[usuarioId] : null;
+      const firmaInicial = usuarioId ? borradorFirmasInicioRef.current[usuarioId] : null;
+      const tieneCambios = snapshot && firmaSnapshotBorrador(snapshot) !== firmaInicial;
+      if (snapshot && !borradorBloqueadoRef.current && (borradorUsuariosListosRef.current[usuarioId] || tieneCambios)) {
+        encolarBorrador(snapshot, borradorGeneracionRef.current);
+      }
+    };
+  }, [encolarBorrador, firmaSnapshotBorrador, usuarioFormularioId]);
+
+  useEffect(() => {
+    if (!borradorResetToken || !usuarioFormularioId) return;
+    const snapshot = borradoresUltimosRef.current[usuarioFormularioId];
+    if (!snapshot) return;
+    borradorFirmaBloqueadaRef.current = firmaSnapshotBorrador(snapshot);
+    borradorBaselineListaRef.current = true;
+  }, [borradorResetToken, firmaSnapshotBorrador, usuarioFormularioId]);
+
+  // Restaurar borrador del usuario actual al volver al formulario.
+  useEffect(() => {
+    const usuarioId = usuario?.id;
+    if (!usuarioId || usuarioId !== usuarioFormularioId || activacionGuardada) return;
+    if (borradorRestauradoRef.current === usuarioId) return;
+    borradorRestauradoRef.current = usuarioId;
+    const restauracionId = ++borradorRestauracionIdRef.current;
+    const firmaInicial = firmaSnapshotBorrador(borradoresUltimosRef.current[usuarioId]);
+    borradorFirmasInicioRef.current[usuarioId] = firmaInicial;
+    borradorUsuariosListosRef.current[usuarioId] = false;
+    restaurandoBorradorRef.current = true;
+    let cancelado = false;
+    (async () => {
+      try {
+        const raw = await secureLocalStorage.getItem(borradorKey(usuarioId));
+        const borrador = raw ? JSON.parse(raw) : null;
+        const firmaActual = firmaSnapshotBorrador(borradoresUltimosRef.current[usuarioId]);
+        if (cancelado || !mountedRef.current || restauracionId !== borradorRestauracionIdRef.current) return;
+        if (firmaActual !== firmaInicial) return;
+        if (!borrador || borrador.usuario_id !== usuarioId || !borrador.campos) return;
+        const fotos = borrador.fotos || {};
+        const validarFotoRestaurada = async (uri) => {
+          if (!esFotoLocal(uri)) return uri || null;
+          const info = await FileSystem.getInfoAsync(uri, { size: true }).catch(() => null);
+          return info?.exists && (!Number.isFinite(info.size) || info.size > 0) ? uri : null;
+        };
+        const [principal, cashIn] = await Promise.all([
+          validarFotoRestaurada(fotos.fotoPrincipal),
+          validarFotoRestaurada(fotos.fotoCashIn),
+        ]);
+        if (cancelado || !mountedRef.current || restauracionId !== borradorRestauracionIdRef.current) return;
+        if (firmaSnapshotBorrador(borradoresUltimosRef.current[usuarioId]) !== firmaInicial) return;
+        const fotosPersistentes = {};
+        for (const [campo, uri] of Object.entries(fotos.fotosPersistentes || {})) {
+          const uriValida = await validarFotoRestaurada(uri);
+          if (uriValida) fotosPersistentes[campo] = uriValida;
+        }
+        if (cancelado || !mountedRef.current || restauracionId !== borradorRestauracionIdRef.current) return;
+        if (firmaSnapshotBorrador(borradoresUltimosRef.current[usuarioId]) !== firmaInicial) return;
+        fotosPersistentesRef.current = fotosPersistentes;
+        setFormulario({
+          ...formularioInicial,
+          ...borrador.campos,
+          foto_url: principal ? borrador.campos.foto_url : '',
+          foto_cash_in: cashIn ? borrador.campos.foto_cash_in : '',
+        });
+        setFotoPrincipal(principal);
+        setFotoCashIn(cashIn);
+      } catch {
+        // borrador inválido: se continúa con formulario limpio
+      } finally {
+        restaurandoBorradorRef.current = false;
+        if (!cancelado && mountedRef.current && restauracionId === borradorRestauracionIdRef.current) {
+          borradorUsuariosListosRef.current[usuarioId] = true;
+          setBorradorListoUsuario(usuarioId);
+        }
+      }
+    })();
+    return () => {
+      cancelado = true;
+    };
+  }, [usuario?.id, usuarioFormularioId, activacionGuardada, firmaSnapshotBorrador]);
+
+  // Autosave con debounce: solo borrador local, nunca sincroniza ni crea registros.
+  useEffect(() => {
+    const usuarioId = usuario?.id;
+    if (!usuarioId || usuarioId !== usuarioFormularioId || borradorListoUsuario !== usuarioId || activacionGuardada || restaurandoBorradorRef.current) return;
+    const snapshot = crearSnapshotBorrador(usuarioId, formulario, fotoPrincipal, fotoCashIn);
+    const firma = firmaSnapshotBorrador(snapshot);
+    if (borradorBloqueadoRef.current) {
+      if (!borradorBaselineListaRef.current) return;
+      if (firma === borradorFirmaBloqueadaRef.current) return;
+      borradorBloqueadoRef.current = false;
+      borradorFirmaBloqueadaRef.current = null;
+      borradorGeneracionRef.current += 1;
+    }
+    if (borradorTimerRef.current) {
+      globalThis.clearTimeout(borradorTimerRef.current);
+      borradorTimerRef.current = null;
+    }
+    const pendiente = { snapshot, generacion: borradorGeneracionRef.current };
+    borradorPendienteRef.current = pendiente;
+    borradorTimerRef.current = globalThis.setTimeout(() => {
+      borradorTimerRef.current = null;
+      if (borradorPendienteRef.current === pendiente) borradorPendienteRef.current = null;
+      encolarBorrador(pendiente.snapshot, pendiente.generacion);
+    }, BORRADOR_DEBOUNCE_MS);
+  }, [formulario, fotoPrincipal, fotoCashIn, usuario?.id, usuarioFormularioId, activacionGuardada, borradorListoUsuario, crearSnapshotBorrador, encolarBorrador, firmaSnapshotBorrador]);
 
   const tiposDisponibles = formulario.tipo_grupo === 'tienda_barrio'
     ? TIPOS_TIENDAS
@@ -472,8 +792,9 @@ export default function FormularioActivacion({
   const esTranseunteSimple = esActivacionTranseunte(formulario.tipo_activacion);
 
   const requiereFotos = true;
+  const requiereFotoPrincipal = !esTranseunteSimple;
   const requiereCashIn = !requiereValidacionReactivacion(formulario.tipo_activacion) && !esTranseunteSimple;
-  const totalFotosRequeridas = esTranseunteSimple ? 1 : requiereCashIn ? 2 : 1;
+  const totalFotosRequeridas = Number(requiereFotoPrincipal) + Number(requiereCashIn);
   const plazasTemporales = useMemo(
     () => Array.isArray(usuario?.plazas_temporales) ? usuario.plazas_temporales : [],
     [usuario?.plazas_temporales],
@@ -555,85 +876,148 @@ export default function FormularioActivacion({
   const detectarCiudadPorGps = useCallback(({ silent = false } = {}) => {
     if (Platform.OS === 'web') return Promise.resolve(null);
     if (gpsSolicitudRef.current) return gpsSolicitudRef.current;
+    const sesionFormulario = formularioSesionRef.current;
+    const propietarioFormulario = usuarioFormularioIdRef.current;
 
     let solicitud;
     solicitud = (async () => {
-      setDetectandoCiudad(true);
+      if (esSesionFormularioActual(sesionFormulario, propietarioFormulario)) setDetectandoCiudad(true);
       try {
         const permiso = await Location.requestForegroundPermissionsAsync();
+        if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) return null;
         if (permiso.status !== 'granted') {
-          if (!silent) {
+          if (!silent && esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
             Alert.alert('Ubicación desactivada', 'Activa el permiso de ubicación para detectar la ciudad automáticamente.');
           }
           return null;
         }
 
-        const ubicacion = await withTimeout(
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-          GPS_TIMEOUT_MS,
-          'La ubicación está tardando demasiado.'
-        );
-        const latitud = ubicacion?.coords?.latitude;
-        const longitud = ubicacion?.coords?.longitude;
-        if (!Number.isFinite(latitud) || !Number.isFinite(longitud)) {
-          throw new Error('La ubicación no devolvió coordenadas válidas.');
-        }
-        let direccionGps = {};
+        let serviciosActivos = true;
         try {
-          const geocoded = await withTimeout(
-            Location.reverseGeocodeAsync({
-              latitude: latitud,
-              longitude: longitud,
-            }),
+          serviciosActivos = await withTimeout(
+            Location.hasServicesEnabledAsync(),
+            CONOCIDA_TIMEOUT_MS,
+            'No se pudo verificar el GPS.'
+          );
+        } catch {
+          serviciosActivos = true;
+        }
+        if (serviciosActivos === false) {
+          if (!silent && esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
+            Alert.alert('GPS desactivado', 'Activa los servicios de ubicación (GPS) del dispositivo e intenta nuevamente.');
+          }
+          return null;
+        }
+
+        // Estrategia escalonada (sin loops, una sola solicitud a la vez vía gpsSolicitudRef):
+        // 1) última conocida reciente y precisa; 2) Balanced; 3) High solo si Balanced es imprecisa.
+        const esUbicacionAceptable = (coords) => {
+          if (!Number.isFinite(coords?.latitude) || !Number.isFinite(coords?.longitude)) return false;
+          return typeof coords.accuracy !== 'number' || coords.accuracy <= PRECISION_MAXIMA_METROS;
+        };
+
+        let coordenadas = null;
+        try {
+          const conocida = await withTimeout(
+            Location.getLastKnownPositionAsync(),
+            CONOCIDA_TIMEOUT_MS,
+            'Ubicación conocida no disponible.'
+          );
+          const edadMs = Date.now() - (conocida?.timestamp || 0);
+          if (esUbicacionAceptable(conocida?.coords) && edadMs <= UBICACION_CONOCIDA_MAX_MS) {
+            coordenadas = conocida.coords;
+          }
+        } catch {
+          // Sin ubicación conocida útil: se continúa con GPS en vivo.
+        }
+
+        if (!esUbicacionAceptable(coordenadas)) {
+          const enVivo = await withTimeout(
+            Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
             GPS_TIMEOUT_MS,
             'La ubicación está tardando demasiado.'
           );
-          direccionGps = geocoded?.[0] || {};
-        } catch (geocodeError) {
-          console.warn('No se pudo resolver la ciudad por GPS:', geocodeError?.message || geocodeError);
-        }
-
-        let ciudadGps = resolverCiudadDesdeDireccion(direccionGps);
-        if (!ciudadGps) {
-          ciudadGps = resolverCiudadKey(usuario?.plaza);
-        }
-        const ubicacionDerivada = extraerUbicacionDerivada(direccionGps);
-        if (!ciudadGps) {
-          if (!silent) {
-            Alert.alert(
-              'Ciudad no detectada',
-              'Se obtuvo tu ubicación, pero no pudimos identificar la ciudad automáticamente. Selecciónala manualmente.'
+          coordenadas = enVivo?.coords || null;
+          if (!esUbicacionAceptable(coordenadas)) {
+            const precisa = await withTimeout(
+              Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+              GPS_TIMEOUT_MS,
+              'La ubicación está tardando demasiado.'
             );
+            coordenadas = precisa?.coords || null;
+            if (!esUbicacionAceptable(coordenadas)) {
+              throw new Error('La ubicación es imprecisa. Intenta al aire libre con el GPS activado.');
+            }
           }
-          const resultado = { latitud, longitud, ...ubicacionDerivada };
-          setFormulario((prev) => ({ ...prev, ...resultado }));
-          return resultado;
         }
+        const latitud = coordenadas?.latitude;
+        const longitud = coordenadas?.longitude;
+        if (!Number.isFinite(latitud) || !Number.isFinite(longitud)) {
+          throw new Error('La ubicación no devolvió coordenadas válidas.');
+        }
+        if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) return null;
+        const resultado = { latitud, longitud };
+        setFormulario((prev) => ({ ...prev, ...resultado }));
 
-        const resultado = { ciudad_activacion: ciudadGps, latitud, longitud, ...ubicacionDerivada };
-        setFormulario((prev) => ({
-          ...prev,
-          ciudad_activacion: ciudadGps,
-          zona_activacion: prev.ciudad_activacion === ciudadGps ? prev.zona_activacion : '',
-          latitud,
-          longitud,
-          ...ubicacionDerivada,
-        }));
+        // Las coordenadas válidas liberan el flujo GPS. La ciudad y los datos
+        // derivados se completan después sin bloquear ni invalidar el GPS.
+        (async () => {
+          let direccionGps = {};
+          try {
+            const geocoded = await withTimeout(
+              Location.reverseGeocodeAsync({ latitude: latitud, longitude: longitud }),
+              GPS_TIMEOUT_MS,
+              'La ubicación está tardando demasiado.'
+            );
+            direccionGps = geocoded?.[0] || {};
+          } catch (geocodeError) {
+            console.warn('No se pudo resolver la ciudad por GPS:', geocodeError?.message || geocodeError);
+          }
+          if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) return;
+
+          const ciudadGps = resolverCiudadDesdeDireccion(direccionGps) || resolverCiudadKey(usuario?.plaza);
+          const ubicacionDerivada = extraerUbicacionDerivada(direccionGps);
+          if (!ciudadGps) {
+            if (!silent) {
+              Alert.alert(
+                'Ciudad no detectada',
+                'Se obtuvo tu ubicación, pero no pudimos identificar la ciudad automáticamente. Selecciónala manualmente.'
+              );
+            }
+            setFormulario((prev) => ({ ...prev, ...ubicacionDerivada }));
+            return;
+          }
+
+          setFormulario((prev) => {
+            // No sobrescribir ciudad elegida manualmente por un GPS tardío.
+            const ciudadFinal = ciudadManualRef.current && prev.ciudad_activacion
+              ? prev.ciudad_activacion
+              : ciudadGps;
+            return {
+              ...prev,
+              ciudad_activacion: ciudadFinal,
+              zona_activacion: prev.ciudad_activacion === ciudadFinal ? prev.zona_activacion : '',
+              ...ubicacionDerivada,
+            };
+          });
+        })().catch((geocodeError) => {
+          console.warn('No se pudo completar la ubicación derivada:', geocodeError?.message || geocodeError);
+        });
         return resultado;
       } catch (error) {
         console.warn('No se pudo detectar ciudad por GPS:', error?.message || error);
-        if (!silent) {
-          Alert.alert('Error de ubicación', 'No se pudo obtener la ubicación actual.');
+        if (!silent && esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
+          Alert.alert('Error de ubicación', error?.message || 'No se pudo obtener la ubicación actual.');
         }
         return null;
       } finally {
         if (gpsSolicitudRef.current === solicitud) gpsSolicitudRef.current = null;
-        setDetectandoCiudad(false);
+        if (esSesionFormularioActual(sesionFormulario, propietarioFormulario)) setDetectandoCiudad(false);
       }
     })();
     gpsSolicitudRef.current = solicitud;
     return solicitud;
-  }, [usuario?.plaza]);
+  }, [esSesionFormularioActual, usuario?.plaza]);
 
   // Auto-set de datos provenientes del usuario y fecha actual
   useEffect(() => {
@@ -650,50 +1034,25 @@ export default function FormularioActivacion({
 
   useEffect(() => {
     if (activacionGuardada || tieneCoordenadasValidas(formulario)) return;
-    let cancelado = false;
-    const detectarAutomaticamente = async () => {
-      const primerIntento = await detectarCiudadPorGps({ silent: true });
-      if (!cancelado && !tieneCoordenadasValidas(primerIntento || {})) {
-        await detectarCiudadPorGps({ silent: true });
-      }
-    };
-    detectarAutomaticamente();
-    return () => {
-      cancelado = true;
-    };
+    detectarCiudadPorGps({ silent: true });
   }, [activacionGuardada, detectarCiudadPorGps, formulario.latitud, formulario.longitud]);
 
-  const tomarFoto = async (setter, fieldName) => {
+  const procesarFotoCapturada = async (uri, setter, fieldName) => {
+    const sesionFormulario = formularioSesionRef.current;
+    const propietarioFormulario = usuarioFormularioIdRef.current;
     try {
-      const camPerm = await ImagePicker.requestCameraPermissionsAsync();
-      if (camPerm.status !== 'granted') {
-        return Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la cámara.');
-      }
-
-      const result = await ImagePicker.launchCameraAsync({
-        // MediaTypeOptions es la opción estable; MediaType puede no estar definido en ciertas versiones
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.5,
-        allowsEditing: true,
-      });
-
-      if (result.canceled) return;
-
-      const asset = result.assets?.[0];
-      const uri = asset?.uri;
       if (!uri) {
         return Alert.alert('Error', 'La ruta de imagen no es válida');
       }
 
       let sizeMB = 0;
       try {
-        const assetSize = typeof asset?.fileSize === 'number' ? asset.fileSize : null;
-        if (assetSize !== null) {
-          sizeMB = Number(assetSize) / 1024 / 1024;
-        } else {
-          const info = await FileSystem.getInfoAsync(uri, { size: true });
-          sizeMB = info?.size ? Number(info.size) / 1024 / 1024 : 0;
-        }
+        const info = await withTimeout(
+          FileSystem.getInfoAsync(uri, { size: true }),
+          PHOTO_FILE_TIMEOUT_MS,
+          'La lectura local de la foto excedió el tiempo permitido.'
+        );
+        sizeMB = info?.size ? Number(info.size) / 1024 / 1024 : 0;
       } catch {
         // en algunos dispositivos no retorna size; continuamos
       }
@@ -704,6 +1063,10 @@ export default function FormularioActivacion({
 
       // Persistimos la foto en documentDirectory para que no se pierda antes de sincronizar.
       const destino = await prepararImagenPersistente(uri, fieldName);
+      if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
+        await FileSystem.deleteAsync(destino, { idempotent: true }).catch(() => {});
+        return;
+      }
       formDebug('foto capturada', { fieldName, capturedUri: uri, persistedUri: destino });
       const anterior = formulario[fieldName];
       if (/^file:\/\//i.test(anterior || '') && anterior !== destino) {
@@ -716,21 +1079,53 @@ export default function FormularioActivacion({
 
     } catch (error) {
       console.error('❌ Error al tomar o subir imagen:', error);
-      Alert.alert('Error crítico', `No se pudo procesar la imagen. ${error?.message || ''}`);
+      const code = error?.photoCode || await registrarErrorFoto('persist', error);
+      Alert.alert('Error al procesar foto', `No se pudo procesar la imagen. (${code})`);
+    } finally {
+      await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
     }
   };
 
+  const abrirCamara = (setter, fieldName, label) => {
+    setCamaraEvidencia({ setter, fieldName, label });
+  };
+
+  const usarFotoCamara = (uri) => {
+    const destino = camaraEvidencia;
+    setCamaraEvidencia(null);
+    if (!destino) return;
+    procesarFotoCapturada(uri, destino.setter, destino.fieldName);
+  };
+
   const seleccionarImagen = async (setter, fieldName) => {
+    if (galeriaOperacionRef.current) {
+      Alert.alert('Galería ocupada', 'Espera a que termine la selección anterior o cierra el selector abierto.');
+      return;
+    }
+    const sesionFormulario = formularioSesionRef.current;
+    const propietarioFormulario = usuarioFormularioIdRef.current;
+    let selectorFinalizado = false;
+    let operacionGaleria = null;
     try {
-      const permiso = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (permiso.status !== 'granted') {
-        return Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la galería.');
-      }
-      const result = await ImagePicker.launchImageLibraryAsync({
+      // Photo Picker del sistema (Android 13+ sin permiso; Android 12 con
+      // fallback del picker): no se solicita permiso previo para no bloquear.
+      const promesaNativa = ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         quality: 0.5,
-        allowsEditing: true,
+        allowsEditing: false,
       });
+      operacionGaleria = { invalidada: false };
+      galeriaOperacionRef.current = operacionGaleria;
+      promesaNativa.catch(() => {}).finally(() => {
+        if (galeriaOperacionRef.current === operacionGaleria) galeriaOperacionRef.current = null;
+      });
+      const result = await withTimeout(
+        promesaNativa,
+        GALLERY_TIMEOUT_MS,
+        'La galería excedió el tiempo permitido.'
+      );
+      selectorFinalizado = true;
+      if (operacionGaleria.invalidada) return;
       if (result.canceled) return;
       const asset = result.assets?.[0];
       if (!asset?.uri) return Alert.alert('Error', 'La ruta de imagen no es válida.');
@@ -738,7 +1133,11 @@ export default function FormularioActivacion({
       if (extension && !['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'].includes(extension)) {
         return Alert.alert('Error', 'Selecciona una foto válida (JPG o PNG).');
       }
-      const infoArchivo = await FileSystem.getInfoAsync(asset.uri, { size: true }).catch(() => null);
+      const infoArchivo = await withTimeout(
+        FileSystem.getInfoAsync(asset.uri, { size: true }),
+        PHOTO_FILE_TIMEOUT_MS,
+        'La lectura local de la foto excedió el tiempo permitido.'
+      ).catch(() => null);
       if (infoArchivo && infoArchivo.exists === false) {
         return Alert.alert('Error', 'No se pudo leer la imagen seleccionada.');
       }
@@ -750,6 +1149,10 @@ export default function FormularioActivacion({
         return Alert.alert('❌ Imagen demasiado grande', 'Selecciona una imagen más liviana (≤ 6 MB).');
       }
       const destino = await prepararImagenPersistente(asset.uri, fieldName);
+      if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
+        await FileSystem.deleteAsync(destino, { idempotent: true }).catch(() => {});
+        return;
+      }
       formDebug('foto seleccionada', { fieldName, capturedUri: asset.uri, persistedUri: destino });
       const anterior = formulario[fieldName];
       if (/^file:\/\//i.test(anterior || '') && anterior !== destino) {
@@ -760,7 +1163,21 @@ export default function FormularioActivacion({
       actualizarCampo(fieldName, destino);
     } catch (error) {
       console.error('❌ Error al seleccionar imagen:', error);
-      Alert.alert('Error crítico', `No se pudo procesar la imagen. ${error?.message || ''}`);
+      if (!selectorFinalizado && operacionGaleria) operacionGaleria.invalidada = true;
+      const code = error?.photoCode || await registrarErrorFoto(selectorFinalizado ? 'persist' : 'gallery', error);
+      const operacionSigueActiva = galeriaOperacionRef.current === operacionGaleria;
+      Alert.alert(
+        'Error de galería',
+        operacionSigueActiva
+          ? `No se pudo procesar la imagen. (${code})\nCierra el selector y vuelve a intentarlo.`
+          : `No se pudo procesar la imagen. (${code})`,
+        operacionSigueActiva
+          ? [{ text: 'Cerrar', style: 'cancel' }]
+          : [
+            { text: 'Cerrar', style: 'cancel' },
+            { text: 'Reintentar', onPress: () => seleccionarImagen(setter, fieldName) },
+          ]
+      );
     }
   };
 
@@ -778,10 +1195,10 @@ export default function FormularioActivacion({
         Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
           { text: 'Cancelar', style: 'cancel' },
           { text: 'Galería', onPress: () => seleccionarImagen(setter, fieldName) },
-          { text: 'Cámara', onPress: () => tomarFoto(setter, fieldName) },
+          { text: 'Cámara', onPress: () => abrirCamara(setter, fieldName, label) },
         ]);
       } else {
-        tomarFoto(setter, fieldName);
+        abrirCamara(setter, fieldName, label);
       }
       return;
     }
@@ -796,11 +1213,11 @@ export default function FormularioActivacion({
       Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
         { text: 'Cancelar', style: 'cancel' },
         { text: 'Galería', onPress: () => seleccionarImagen(actual.setter, actual.fieldName) },
-        { text: 'Cámara', onPress: () => tomarFoto(actual.setter, actual.fieldName) },
+        { text: 'Cámara', onPress: () => abrirCamara(actual.setter, actual.fieldName, actual.label) },
       ]);
       return;
     }
-    tomarFoto(actual.setter, actual.fieldName);
+    abrirCamara(actual.setter, actual.fieldName, actual.label);
   };
 
   const eliminarEvidencia = async () => {
@@ -860,10 +1277,13 @@ export default function FormularioActivacion({
 
   const fotoPrincipalUri = fotoPrincipal || formulario.foto_url;
   const fotoCashInUri = fotoCashIn || formulario.foto_cash_in;
-  const fotosCapturadas = esTranseunteSimple
-    ? Number(Boolean(fotoCashInUri))
-    : Number(Boolean(fotoPrincipalUri)) + Number(Boolean(fotoCashInUri));
-  const gpsListo = formulario.ciudad_activacion && tieneCoordenadasValidas(formulario);
+  const fotosCapturadas = Number(Boolean(fotoPrincipalUri)) + Number(Boolean(fotoCashInUri));
+  const fotosObligatoriasCapturadas = Number(requiereFotoPrincipal && Boolean(fotoPrincipalUri))
+    + Number(requiereCashIn && Boolean(fotoCashInUri));
+  const resumenFotos = esTranseunteSimple
+    ? `${fotosCapturadas} adjunta${fotosCapturadas === 1 ? '' : 's'} · Opcionales`
+    : `${fotosObligatoriasCapturadas}/${totalFotosRequeridas}`;
+  const gpsListo = tieneCoordenadasValidas(formulario);
   const gpsResumen = detectandoCiudad
     ? 'Detectando'
     : gpsListo
@@ -874,6 +1294,8 @@ export default function FormularioActivacion({
 
   const guardarFormulario = async () => {
     if (guardandoRef.current) return;
+    const sesionGuardado = formularioSesionRef.current;
+    const propietarioGuardado = usuarioFormularioIdRef.current;
     guardandoRef.current = true;
     setGuardando(true);
     setEstadoGuardado('Guardando…');
@@ -897,6 +1319,7 @@ export default function FormularioActivacion({
       const ubicacionFinal = tieneCoordenadasValidas(resultadoActivo || {})
         ? resultadoActivo
         : await detectarCiudadPorGps({ silent: true });
+      if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
       if (ubicacionFinal) {
         formularioConBasicos = { ...formularioConBasicos, ...ubicacionFinal };
         errorMsg = validar(formularioConBasicos);
@@ -931,6 +1354,7 @@ export default function FormularioActivacion({
           registroId: formId,
           fechaReferencia: fecha,
         });
+        if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
         if (!elegibilidad.ok) {
           setEstadoGuardado(`Error: ${elegibilidad.mensaje}`);
           Alert.alert('Periodo mínimo no cumplido', enmascararMarcaVisible(elegibilidad.mensaje, usuario));
@@ -947,6 +1371,7 @@ export default function FormularioActivacion({
           const coordenadas = tieneCoordenadasValidas(resultadoActivo || {})
             ? resultadoActivo
             : await detectarCiudadPorGps({ silent: true });
+          if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
           if (!tieneCoordenadasValidas(coordenadas || {})) {
             throw new Error('La ubicación no devolvió coordenadas válidas.');
           }
@@ -986,10 +1411,11 @@ export default function FormularioActivacion({
       const esBaseComercio = baseActivacion === 'comercio';
       const fotoPrincipalPersistente = fotosPersistentesRef.current.foto_url || fotoPrincipal || formulario.foto_url;
       const fotoCashInPersistente = fotosPersistentesRef.current.foto_cash_in || fotoCashIn || formulario.foto_cash_in;
-      const fotoLocalError = (!esActivacionTranseunte(formularioConBasicos.tipo_activacion)
-        ? await validarFotoLocalDisponible(fotoPrincipalPersistente, 'activación')
-        : null)
+      // Valida la foto principal siempre que esté presente (incluye evidencia
+      // voluntaria de transeúnte); su ausencia sigue permitida solo para transeúnte.
+      const fotoLocalError = await validarFotoLocalDisponible(fotoPrincipalPersistente, 'activación')
         || (fotoCashInPersistente ? await validarFotoLocalDisponible(fotoCashInPersistente, 'Cash-In') : null);
+      if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
       if (fotoLocalError) {
         setEstadoGuardado(`Error: ${fotoLocalError}`);
         Alert.alert('Foto no disponible', fotoLocalError);
@@ -1005,12 +1431,13 @@ export default function FormularioActivacion({
         distrito_gps: formularioConBasicos.distrito_gps || null,
         region_gps: formularioConBasicos.region_gps || null,
         es_reactivacion: esReactivacion,
-        usuario_id: usuario.id,
+        usuario_id: propietarioGuardado,
         impulsador: formularioConBasicos.impulsador,
         plaza: formularioConBasicos.es_plaza_temporal
           ? formularioConBasicos.plaza_temporal
           : plazaBaseValor,
-        foto_url: esActivacionTranseunte(formularioConBasicos.tipo_activacion) ? null : fotoPrincipalPersistente || null,
+        // Transeúnte: ausencia permitida, pero la evidencia voluntaria se conserva.
+        foto_url: fotoPrincipalPersistente || null,
         foto_cash_in: fotoCashInPersistente || null,
         tipo_tienda: null,
         tamano_tienda: esBaseTienda ? optionalTextOrNull(formularioConBasicos.tamano_tienda) : null,
@@ -1026,7 +1453,9 @@ export default function FormularioActivacion({
           error: null,
           requiresEligibilityCheck: !isConnected && requiereElegibilidad,
           localPhotos: {
-            ...(!esActivacionTranseunte(formularioConBasicos.tipo_activacion) && typeof fotoPrincipalPersistente === 'string' && /^file:\/\//i.test(fotoPrincipalPersistente)
+            // Incluye foto_url siempre que sea URI local (cubre evidencia
+            // voluntaria de transeúnte); su ausencia sigue permitida.
+            ...(typeof fotoPrincipalPersistente === 'string' && /^file:\/\//i.test(fotoPrincipalPersistente)
               ? { foto_url: fotoPrincipalPersistente }
               : {}),
             ...(typeof fotoCashInPersistente === 'string' && /^file:\/\//i.test(fotoCashInPersistente)
@@ -1043,22 +1472,30 @@ export default function FormularioActivacion({
       });
 
       const idLocalGuardado = await guardarFormularioLocal(datosFormulario);
-      const mensajePendiente = 'Activación guardada. Sincronización pendiente.';
-      setEstadoGuardado(mensajePendiente);
-      setMensajeGuardado(mensajePendiente);
-      contarFormulariosLocales?.();
-      setFormulario({
+      if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
+      const formularioNuevaActivacion = {
         ...formularioInicial,
         id: '',
         impulsador: normalizarNombreVisible(usuario?.nombre || ''),
         ciudad_activacion: isConnected === false
           ? resolverCiudadKey(usuario?.plaza)
           : formularioConBasicos.ciudad_activacion,
-      });
+      };
+      // Guardado correcto: el borrador ya no se necesita.
+      formularioSesionRef.current += 1;
+      gpsSolicitudRef.current = null;
+      await eliminarBorrador(datosFormulario.usuario_id);
+      const mensajePendiente = 'Activación guardada. Sincronización pendiente.';
+      setEstadoGuardado(mensajePendiente);
+      setMensajeGuardado(mensajePendiente);
+      contarFormulariosLocales?.();
+      ciudadManualRef.current = false;
+      setFormulario(formularioNuevaActivacion);
       fotosPersistentesRef.current = {};
       setFotoPrincipal(null);
       setFotoCashIn(null);
       setActivacionGuardada(true);
+      setBorradorResetToken((actual) => actual + 1);
       setGuardando(false);
       guardandoRef.current = false;
       if (isConnected && typeof onSincronizar === 'function') {
@@ -1077,14 +1514,29 @@ export default function FormularioActivacion({
           });
       }
     } catch (err) {
+      if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
       console.error('Error al guardar formulario:', err);
       Alert.alert('Error', enmascararMarcaVisible(err?.message ? err.message : 'No se pudo guardar el formulario.', usuario));
       setEstadoGuardado(`Error: ${err?.message || 'No se pudo guardar'}`);
     } finally {
-      guardandoRef.current = false;
-      setGuardando(false);
+      if (esSesionFormularioActual(sesionGuardado, propietarioGuardado)) {
+        guardandoRef.current = false;
+        setGuardando(false);
+      }
     }
   };
+
+  const usuarioActualId = usuario?.id || null;
+  if (usuarioFormularioId !== usuarioActualId) {
+    return (
+      <View style={[styles.container, width <= 430 && styles.containerMobile]}>
+        <View style={styles.saveDoneCard}>
+          <ActivityIndicator size="small" color={colors.primary} />
+          <Text style={styles.saveDoneText}>Preparando formulario...</Text>
+        </View>
+      </View>
+    );
+  }
 
   if (!usuario || !usuario.id) {
     return <Text style={{ padding: 20, color: colors.text }}>Cargando usuario...</Text>;
@@ -1137,7 +1589,11 @@ export default function FormularioActivacion({
             <Text style={styles.badgeText}>Pendientes: {cantidadOffline}</Text>
           </View>
           <View style={[styles.badge, styles.badgeAccent]}>
-            <Text style={styles.badgeText}>{totalFotosRequeridas} foto{totalFotosRequeridas === 1 ? '' : 's'} obligatoria{totalFotosRequeridas === 1 ? '' : 's'}</Text>
+            <Text style={styles.badgeText}>
+              {esTranseunteSimple
+                ? 'Evidencias opcionales'
+                : `${totalFotosRequeridas} foto${totalFotosRequeridas === 1 ? '' : 's'} obligatoria${totalFotosRequeridas === 1 ? '' : 's'}`}
+            </Text>
           </View>
           {!!formulario.fecha_activacion && (
             <View style={[styles.badge, styles.badgeNeutral]}>
@@ -1147,26 +1603,6 @@ export default function FormularioActivacion({
         </View>
       </View>
 
-      {esTranseunteSimple ? (
-        <View style={[styles.card, styles.compactCard]}>
-          <Text style={styles.sectionTitle}>Ubicación GPS</Text>
-          <Text style={styles.locationStatus}>
-            {detectandoCiudad
-              ? 'Detectando ubicación...'
-              : tieneCoordenadasValidas(formulario)
-                ? 'GPS listo'
-                : 'GPS pendiente'}
-          </Text>
-          <TouchableOpacity
-            style={[styles.gpsButton, detectandoCiudad && styles.botonDisabled]}
-            onPress={() => detectarCiudadPorGps()}
-            disabled={detectandoCiudad}
-            activeOpacity={0.85}
-          >
-            {detectandoCiudad ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.gpsButtonText}>Actualizar ubicación</Text>}
-          </TouchableOpacity>
-        </View>
-      ) : (
         <View style={[styles.card, styles.compactCard]}>
           <Text style={styles.sectionTitle}>Ubicación</Text>
           {isConnected === false ? (
@@ -1175,7 +1611,7 @@ export default function FormularioActivacion({
               <Text style={styles.label}>Ciudad de Activación</Text>
               <Picker
                 selectedValue={formulario.ciudad_activacion}
-                onValueChange={(v) => setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' }))}
+                onValueChange={(v) => { ciudadManualRef.current = true; setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' })); }}
                 style={styles.picker}
               >
                 <Picker.Item label="Seleccionar..." value="" />
@@ -1214,18 +1650,16 @@ export default function FormularioActivacion({
             </>
           )}
         </View>
-      )}
 
       <View style={styles.statusSummary}>
-        {!esTranseunteSimple && (
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>GPS</Text>
           <Text style={styles.statusSummaryValue}>{gpsResumen}</Text>
         </View>
-        )}
+
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>Fotos</Text>
-          <Text style={styles.statusSummaryValue}>{fotosCapturadas}/{totalFotosRequeridas}</Text>
+          <Text style={styles.statusSummaryValue}>{resumenFotos}</Text>
         </View>
         <View style={styles.statusSummaryItem}>
           <Text style={styles.statusSummaryLabel}>Formulario</Text>
@@ -1335,7 +1769,7 @@ export default function FormularioActivacion({
           </>
         )}
 
-        {!esTranseunteSimple && zonasDisponibles.length > 1 && (
+        {zonasDisponibles.length > 1 && (
           <>
             <Text style={styles.label}>Zona de Activación</Text>
             <Picker
@@ -1349,10 +1783,9 @@ export default function FormularioActivacion({
             </Picker>
           </>
         )}
-        {!esTranseunteSimple && (
-          <>
-            <Text style={styles.label}>Ubicación de Interés (Eventos)</Text>
-            {plazasTemporalesVisibles.length === 0 ? (
+        <>
+          <Text style={styles.label}>Ubicación de Interés (Eventos)</Text>
+          {plazasTemporalesVisibles.length === 0 ? (
               <View style={styles.fixedPlaza}>
                 <Text style={styles.plazaTag}>Base</Text>
                 <Text style={styles.fixedPlazaText}>{plazaBaseLabel}</Text>
@@ -1371,20 +1804,9 @@ export default function FormularioActivacion({
               </Picker>
             )}
           </>
-        )}
+
       </View>
 
-       {esTranseunteSimple ? (
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Nombre</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="Nombre del transeúnte"
-          value={formulario.nombres_cliente}
-          onChangeText={(v) => actualizarCampo('nombres_cliente', v)}
-        />
-      </View>
-    ) : (
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Datos del cliente</Text>
         <Text style={styles.label}>Nombres</Text>
@@ -1427,9 +1849,7 @@ export default function FormularioActivacion({
           onChangeText={(v) => actualizarCampo('email_cliente', v)}
         />
       </View>
-      )}
 
-      {!esTranseunteSimple && (
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Checklist de activación</Text>
         {['descargo_app', 'registro', 'cash_in', 'cash_out', 'p2p', 'qr_fisico', 'respaldo'].map(key => (
@@ -1468,22 +1888,23 @@ export default function FormularioActivacion({
           </>
         )}
       </View>
-      )}
 
       {requiereFotos ? (
         <View style={styles.card}>
-          <Text style={styles.evidenceSectionTitle}>📸 Evidencias ({fotosCapturadas}/{totalFotosRequeridas})</Text>
+          <Text style={styles.evidenceSectionTitle}>
+            {esTranseunteSimple
+              ? `📸 Evidencias opcionales (${fotosCapturadas} adjunta${fotosCapturadas === 1 ? '' : 's'})`
+              : `📸 Evidencias (${fotosObligatoriasCapturadas}/${totalFotosRequeridas})`}
+          </Text>
           <View style={styles.evidenceButtonsRow}>
-            {!esTranseunteSimple && (
-              <TouchableOpacity
-                onPress={() => abrirEvidencia(fotoPrincipalUri, setFotoPrincipal, 'foto_url', 'Activación')}
-                style={[styles.evidenceButton, fotoPrincipalUri && styles.evidenceButtonCaptured]}
-                activeOpacity={0.8}
-              >
-                <Text style={[styles.evidenceButtonIcon, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>{fotoPrincipalUri ? '✓' : '📷'}</Text>
-                <Text style={[styles.evidenceButtonText, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>Activación</Text>
-              </TouchableOpacity>
-            )}
+            <TouchableOpacity
+              onPress={() => abrirEvidencia(fotoPrincipalUri, setFotoPrincipal, 'foto_url', 'Activación')}
+              style={[styles.evidenceButton, fotoPrincipalUri && styles.evidenceButtonCaptured]}
+              activeOpacity={0.8}
+            >
+              <Text style={[styles.evidenceButtonIcon, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>{fotoPrincipalUri ? '✓' : '📷'}</Text>
+              <Text style={[styles.evidenceButtonText, fotoPrincipalUri && styles.evidenceButtonTextCaptured]}>Activación</Text>
+            </TouchableOpacity>
             <TouchableOpacity
               onPress={() => abrirEvidencia(fotoCashInUri, setFotoCashIn, 'foto_cash_in', 'Cash-In')}
               style={[styles.evidenceButton, fotoCashInUri && styles.evidenceButtonCaptured]}
@@ -1500,7 +1921,7 @@ export default function FormularioActivacion({
         <View style={styles.previewBackdrop}>
           <View style={styles.previewPanel}>
             <Text style={styles.previewTitle}>{evidenciaPreview?.label}</Text>
-            {!!evidenciaPreview?.uri && <Image source={{ uri: evidenciaPreview.uri }} style={styles.previewImage} resizeMode="contain" />}
+            {!!evidenciaPreview?.uri && <Image source={{ uri: evidenciaPreview.uri }} style={styles.previewImage} resizeMode="contain" resizeMethod="resize" />}
             <View style={styles.previewActions}>
               <TouchableOpacity style={styles.previewActionPrimary} onPress={cambiarEvidencia}><Text style={styles.previewActionPrimaryText}>Cambiar foto</Text></TouchableOpacity>
               <TouchableOpacity style={styles.previewActionDanger} onPress={eliminarEvidencia}><Text style={styles.previewActionDangerText}>Eliminar foto</Text></TouchableOpacity>
@@ -1509,6 +1930,13 @@ export default function FormularioActivacion({
           </View>
         </View>
       </Modal>
+
+      <CameraEvidencia
+        visible={!!camaraEvidencia}
+        label={camaraEvidencia?.label}
+        onCancel={() => setCamaraEvidencia(null)}
+        onUse={usarFotoCamara}
+      />
 
       {!!estadoGuardado && (
         <View style={styles.saveStatus}>
@@ -1524,6 +1952,14 @@ export default function FormularioActivacion({
           activeOpacity={0.85}
         >
           <Text style={styles.botonTextoMini}>{guardando ? 'Guardando…' : 'Guardar Activación'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={confirmarBorrarFormulario}
+          disabled={guardando}
+          style={[styles.botonMini, styles.botonBorrar]}
+          activeOpacity={0.85}
+        >
+          <Text style={styles.botonBorrarTexto}>Borrar formulario</Text>
         </TouchableOpacity>
       </View>
     </ScrollView>
@@ -1767,6 +2203,18 @@ const styles = StyleSheet.create({
   },
   botonSecundario: {
     marginLeft: spacing.sm,
+  },
+  botonBorrar: {
+    marginLeft: spacing.sm,
+    borderWidth: 1,
+    borderColor: '#B4232A',
+    backgroundColor: 'transparent',
+  },
+  botonBorrarTexto: {
+    color: '#B4232A',
+    fontSize: fontSizes.medium,
+    fontWeight: '700',
+    textAlign: 'center',
   },
   botonTextoMini: {
     color: '#FFFFFF',

@@ -15,9 +15,13 @@ import { withTimeout } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { enmascararDatoCliente } from '../lib/customerMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
+import CameraEvidencia from './CameraEvidencia';
+import { registrarErrorFoto } from '../lib/photoDiagnostics';
 
 const PAGE_SIZE = 20;
 const QUERY_TIMEOUT_MS = 10000;
+const GALLERY_TIMEOUT_MS = 30000;
+const PHOTO_FILE_TIMEOUT_MS = 12000;
 const esFotoLocal = (value) => /^(file|content):\/\//i.test(String(value || ''));
 const esPendienteSync = (item) => item?._origen === 'local' || item?.estado_sync === 'offline_pending' || item?._sync?.status === 'pending';
 const fechaRealActivacion = (item) => item?.fecha_activacion || item?._created_at || item?.created_at || item?.creado_en;
@@ -61,9 +65,11 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
   const [detalleFotoCashInUrl, setDetalleFotoCashInUrl] = useState('');
   const [fotoDetalleActiva, setFotoDetalleActiva] = useState('activacion');
   const [fotosPerdidas, setFotosPerdidas] = useState({});
+  const [camaraReparacion, setCamaraReparacion] = useState(null);
 
   const pageRef = useRef(0);
   const channelRef = useRef(null);
+  const galeriaOperacionRef = useRef(null);
   const hoyLocal = fechaLocalIso(new Date());
   const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
 
@@ -78,17 +84,13 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     if (!usuarioId) return;
     try {
       const locales = await obtenerFormulariosLocales();
-      const filtrados = (locales || []).filter((f) => {
-        if (f?.usuario_id && f.usuario_id === usuarioId) return true;
-        if (usuarioNombre && f?.impulsador && mismoNombreActivador(f.impulsador, usuarioNombre)) return true;
-        return false;
-      });
+      const filtrados = (locales || []).filter((f) => f?.usuario_id === usuarioId);
       setFormulariosLocales(filtrados);
     } catch (err) {
       console.warn('⚠️ No se pudieron cargar formularios locales:', err?.message || err);
       setFormulariosLocales([]);
     }
-  }, [usuarioNombre, usuarioId]);
+  }, [usuarioId]);
 
   const formularios = useMemo(() => {
     const remotos = Array.isArray(formulariosRemotos) ? formulariosRemotos : [];
@@ -367,43 +369,49 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     }
   };
 
-  const tomarFotoReparada = async (fieldName) => {
+  const usarFotoReparada = async (uri) => {
+    const fieldName = camaraReparacion;
+    setCamaraReparacion(null);
+    if (!fieldName) return;
     try {
-      const permiso = await ImagePicker.requestCameraPermissionsAsync();
-      if (permiso.status !== 'granted') {
-        Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la cámara.');
-        return;
-      }
-      const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.5,
-        allowsEditing: true,
-      });
-      if (result.canceled) return;
-      const uri = result.assets?.[0]?.uri;
-      if (!uri) {
-        Alert.alert('Error', 'La ruta de imagen no es válida.');
-        return;
-      }
       await guardarFotoReparada(fieldName, uri);
     } catch (error) {
       console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
-      Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo actualizar la foto pendiente.', usuario));
+      const message = error?.photoCode
+        ? `No se pudo actualizar la foto pendiente. (${error.photoCode})`
+        : error?.message || 'No se pudo actualizar la foto pendiente.';
+      Alert.alert('Error de foto', enmascararMarcaVisible(message, usuario));
+    } finally {
+      await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
     }
   };
 
   const seleccionarFotoReparada = async (fieldName) => {
+    if (galeriaOperacionRef.current) {
+      Alert.alert('Galería ocupada', 'Espera a que termine la selección anterior o cierra el selector abierto.');
+      return;
+    }
+    let selectorFinalizado = false;
+    let operacionGaleria = null;
     try {
-      const permiso = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (permiso.status !== 'granted') {
-        Alert.alert('Permiso denegado', 'Se requiere permiso para acceder a la galería.');
-        return;
-      }
-      const result = await ImagePicker.launchImageLibraryAsync({
+      // Photo Picker del sistema: sin solicitud de permiso previa.
+      const promesaNativa = ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
         quality: 0.5,
-        allowsEditing: true,
+        allowsEditing: false,
       });
+      operacionGaleria = { invalidada: false };
+      galeriaOperacionRef.current = operacionGaleria;
+      promesaNativa.catch(() => {}).finally(() => {
+        if (galeriaOperacionRef.current === operacionGaleria) galeriaOperacionRef.current = null;
+      });
+      const result = await withTimeout(
+        promesaNativa,
+        GALLERY_TIMEOUT_MS,
+        'La galería excedió el tiempo permitido.'
+      );
+      selectorFinalizado = true;
+      if (operacionGaleria.invalidada) return;
       if (result.canceled) return;
       const uri = result.assets?.[0]?.uri;
       if (!uri) {
@@ -415,7 +423,11 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         Alert.alert('Error', 'Selecciona una foto válida (JPG o PNG).');
         return;
       }
-      const infoArchivo = await FileSystem.getInfoAsync(uri, { size: true }).catch(() => null);
+      const infoArchivo = await withTimeout(
+        FileSystem.getInfoAsync(uri, { size: true }),
+        PHOTO_FILE_TIMEOUT_MS,
+        'La lectura local de la foto excedió el tiempo permitido.'
+      ).catch(() => null);
       if (infoArchivo && infoArchivo.exists === false) {
         Alert.alert('Error', 'No se pudo leer la imagen seleccionada.');
         return;
@@ -434,7 +446,32 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       await guardarFotoReparada(fieldName, uri);
     } catch (error) {
       console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
-      Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo actualizar la foto pendiente.', usuario));
+      if (!selectorFinalizado && operacionGaleria) operacionGaleria.invalidada = true;
+      if (error?.photoCode) {
+        Alert.alert('Error de foto', enmascararMarcaVisible(`No se pudo actualizar la foto pendiente. (${error.photoCode})`, usuario));
+        return;
+      }
+      if (selectorFinalizado) {
+        Alert.alert('Error', enmascararMarcaVisible(error?.message || 'No se pudo sincronizar la foto pendiente.', usuario));
+        return;
+      }
+      const code = await registrarErrorFoto('gallery', error);
+      const operacionSigueActiva = galeriaOperacionRef.current === operacionGaleria;
+      Alert.alert(
+        'Error de galería',
+        enmascararMarcaVisible(
+          operacionSigueActiva
+            ? `No se pudo abrir la galería. (${code}) Cierra el selector y vuelve a intentarlo.`
+            : `No se pudo abrir la galería. (${code})`,
+          usuario
+        ),
+        operacionSigueActiva
+          ? [{ text: 'Cerrar', style: 'cancel' }]
+          : [
+            { text: 'Cerrar', style: 'cancel' },
+            { text: 'Reintentar', onPress: () => seleccionarFotoReparada(fieldName) },
+          ]
+      );
     }
   };
 
@@ -443,11 +480,11 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
         { text: 'Cancelar', style: 'cancel' },
         { text: 'Galería', onPress: () => seleccionarFotoReparada(fieldName) },
-        { text: 'Cámara', onPress: () => tomarFotoReparada(fieldName) },
+        { text: 'Cámara', onPress: () => setCamaraReparacion(fieldName) },
       ]);
       return;
     }
-    return tomarFotoReparada(fieldName);
+    setCamaraReparacion(fieldName);
   };
 
   const renderItem = ({ item }) => {
@@ -458,6 +495,15 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     const cliente = enmascararMarcaVisible([item.nombres_cliente, item.apellidos_cliente].filter(Boolean).join(' ').trim(), usuario);
     const plazaVisible = enmascararMarcaVisible(etiquetaPlaza(item?.es_plaza_temporal ? item?.plaza_temporal : item?.plaza), usuario);
     const syncErrorText = pendiente ? enmascararMarcaVisible(item?._sync?.error, usuario) : '';
+    const syncInfo = item?._sync || {};
+    const intentoFecha = syncInfo.lastAttemptAt
+      ? new Date(syncInfo.lastAttemptAt).toLocaleString('es-BO', { dateStyle: 'short', timeStyle: 'short' })
+      : 'no registrado';
+    const intentoCodigo = syncInfo.lastAttemptCode
+      || (syncInfo.lastAttemptResult === 'running' ? syncInfo.lastAttemptStage : null)
+      || (syncInfo.lastAttemptResult === 'success' ? 'FOTO-OK' : null)
+      || (syncErrorText ? 'HISTORICO' : null);
+    const intentoVersion = syncInfo.lastAttemptVersionCode || 'no registrada';
 
     return (
       <TouchableOpacity onPress={() => abrirDetalle(item)} activeOpacity={0.75}>
@@ -479,6 +525,12 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
           <Text style={styles.itemMeta}>Tipo: {tipo}</Text>
           {!!plazaVisible && <Text style={styles.itemMeta}>Plaza: {plazaVisible}</Text>}
           {!!syncErrorText && <Text style={styles.syncErrorText}>Error sync: {syncErrorText}</Text>}
+          {pendiente && intentoCodigo && (
+            <Text style={styles.syncAttemptText}>
+              Código: {intentoCodigo}{'\n'}
+              Último intento: {intentoFecha} · Versión: code {intentoVersion} · Intentos: {syncInfo.tries || 0}
+            </Text>
+          )}
           <Text style={styles.itemLink}>Ver detalle</Text>
         </View>
       </TouchableOpacity>
@@ -655,6 +707,12 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
           </View>
         </View>
       </Modal>
+      <CameraEvidencia
+        visible={!!camaraReparacion}
+        label={camaraReparacion === 'foto_cash_in' ? 'Evidencia Cash-In' : 'Evidencia de activación'}
+        onCancel={() => setCamaraReparacion(null)}
+        onUse={usarFotoReparada}
+      />
     </View>
   );
 }
@@ -759,6 +817,11 @@ const styles = StyleSheet.create({
     color: colors.danger || '#B42318',
     fontSize: fontSizes.small,
     fontWeight: '600',
+    marginTop: spacing.xs,
+  },
+  syncAttemptText: {
+    color: colors.textMuted,
+    fontSize: fontSizes.small,
     marginTop: spacing.xs,
   },
   itemLink: {

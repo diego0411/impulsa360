@@ -34,7 +34,13 @@
         "backgroundColor": "#FFFFFF"
       },
       "package": "com.integrat360.impulsa360",
-      "versionCode": 51
+      "versionCode": 56,
+      "blockedPermissions": [
+  "android.permission.RECORD_AUDIO",
+  "android.permission.READ_MEDIA_IMAGES",
+  "android.permission.READ_MEDIA_VIDEO",
+  "android.permission.WRITE_EXTERNAL_STORAGE"
+]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -48,7 +54,14 @@
     "plugins": [
       "expo-asset",
       "./plugins/withAndroidNoBackup",
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Impulsa360 usa la cámara para capturar evidencias de activaciones.",
+          "recordAudioAndroid": false
+        }
+      ]
     ]
   }
 }

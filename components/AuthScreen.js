@@ -37,6 +37,11 @@ const formatSecondsToMinSec = (seconds = 0) => {
 const AUTH_TIMEOUT_MS = 12000;
 const QUERY_TIMEOUT_MS = 10000;
 const isDev = typeof __DEV__ !== 'undefined' && __DEV__;
+const perfilTieneAcceso = (perfil) => (
+  !!perfil?.usuario_id
+  && String(perfil?.estado || '').trim().toLowerCase() === 'activo'
+);
+const esPerfilAusente = (error) => error?.code === 'PGRST116';
 
 const normalizePinInput = (value) =>
   String(value || '').replace(/\D/g, '').slice(0, pinPolicy.maxLength);
@@ -44,6 +49,7 @@ const normalizePinInput = (value) =>
 export default function AuthScreen({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [mostrarPassword, setMostrarPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const [isConnected, setIsConnected] = useState(null);
@@ -104,7 +110,12 @@ export default function AuthScreen({ onLogin }) {
     setCachedUser(usuarioLocal);
 
     if (usuarioLocal?.id) {
-      const pinStatus = await getOfflinePinStatus(usuarioLocal.id);
+      let pinStatus;
+      try {
+        pinStatus = await getOfflinePinStatus(usuarioLocal.id);
+      } catch {
+        pinStatus = { configured: false, remainingSeconds: 0, attemptsLeft: pinPolicy.maxFailedAttempts };
+      }
       if (!mountedRef.current) return;
       setOfflinePinConfigured(pinStatus.configured);
       setOfflinePinLockSeconds(pinStatus.remainingSeconds || 0);
@@ -145,14 +156,14 @@ export default function AuthScreen({ onLogin }) {
     return () => globalThis.clearInterval(timer);
   }, [offlinePinLockSeconds]);
 
-  const continuarConUsuario = useCallback((usuarioFinal) => {
+  const continuarConUsuario = useCallback((usuarioFinal, { autenticadoOnline = false } = {}) => {
     if (!usuarioFinal?.id) return;
 
     setOfflinePinInput('');
     setPinSetupUser(null);
     setPinSetupValue('');
     setPinSetupConfirm('');
-    onLogin(usuarioFinal);
+    onLogin(usuarioFinal, { autenticadoOnline });
   }, [onLogin]);
 
   const manejarIngresoOfflineConPin = async () => {
@@ -221,8 +232,17 @@ export default function AuthScreen({ onLogin }) {
     setSubmitting(true);
     try {
       await saveOfflinePin({ userId: pinSetupUser.id, pin });
+      let status;
+      try {
+        status = await getOfflinePinStatus(pinSetupUser.id);
+      } catch (verifyError) {
+        throw new Error(`El PIN se guardó, pero no pudo verificarse. ${verifyError?.message || 'Intenta nuevamente.'}`);
+      }
+      if (!status?.configured) {
+        throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
+      }
       await hydrateOfflineState({ knownIsConnected: true });
-      continuarConUsuario(pinSetupUser);
+      continuarConUsuario(pinSetupUser, { autenticadoOnline: true });
     } catch (err) {
       Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta nuevamente.');
     } finally {
@@ -241,7 +261,7 @@ export default function AuthScreen({ onLogin }) {
         {
           text: 'Continuar',
           style: 'destructive',
-          onPress: () => continuarConUsuario(pinSetupUser),
+          onPress: () => continuarConUsuario(pinSetupUser, { autenticadoOnline: true }),
         },
       ],
     );
@@ -319,9 +339,17 @@ export default function AuthScreen({ onLogin }) {
       const perfil = perfilResult?.data;
       const errorPerfil = perfilResult?.error;
       if (errorPerfil) {
-        if (isDev) {
-          console.warn('No se pudo obtener el perfil del impulsador:', errorPerfil.message);
+        if (esPerfilAusente(errorPerfil)) {
+          await supabase.auth.signOut().catch(() => {});
+          Alert.alert('Acceso no autorizado', 'No existe un perfil habilitado para este usuario.');
+          return;
         }
+        throw new Error(`No se pudo validar el perfil. ${errorPerfil.message || 'Intenta nuevamente.'}`);
+      }
+      if (!perfilTieneAcceso(perfil)) {
+        await supabase.auth.signOut().catch(() => {});
+        Alert.alert('Acceso no autorizado', 'Tu perfil está inactivo o no tiene acceso a la aplicación.');
+        return;
       }
       const rolesCrudos = [
         perfil?.rol || perfil?.role,
@@ -357,7 +385,7 @@ export default function AuthScreen({ onLogin }) {
         return;
       }
 
-      continuarConUsuario(usuarioFinal);
+      continuarConUsuario(usuarioFinal, { autenticadoOnline: true });
     } catch (err) {
       Alert.alert(isTimeoutError(err) ? 'Conexión lenta' : 'Error crítico', enmascararMarcaVisible(err?.message || 'Ocurrió un error inesperado.', pinSetupUser || cachedUser));
       if (isDev) {
@@ -603,14 +631,24 @@ export default function AuthScreen({ onLogin }) {
             />
 
             <Text style={styles.fieldLabel}>Contraseña</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="Contraseña"
-              placeholderTextColor={colors.muted}
-              value={password}
-              onChangeText={setPassword}
-              secureTextEntry
-            />
+            <View style={styles.passwordRow}>
+              <TextInput
+                style={[styles.input, styles.passwordInput]}
+                placeholder="Contraseña"
+                placeholderTextColor={colors.muted}
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry={!mostrarPassword}
+              />
+              <TouchableOpacity
+                onPress={() => setMostrarPassword((prev) => !prev)}
+                style={styles.passwordToggle}
+                activeOpacity={0.7}
+                accessibilityLabel={mostrarPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+              >
+                <Text style={styles.passwordToggleText}>{mostrarPassword ? 'Ocultar' : 'Ver'}</Text>
+              </TouchableOpacity>
+            </View>
 
             <TouchableOpacity
               onPress={manejarAutenticacion}
@@ -855,6 +893,31 @@ const styles = StyleSheet.create({
     fontSize: fontSizes.medium,
     color: colors.text,
     marginBottom: spacing.md,
+  },
+  passwordRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.md,
+  },
+  passwordInput: {
+    flex: 1,
+    marginBottom: 0,
+    borderTopRightRadius: 0,
+    borderBottomRightRadius: 0,
+  },
+  passwordToggle: {
+    backgroundColor: '#F5F9FD',
+    borderColor: '#CBDCEC',
+    borderWidth: 1,
+    borderLeftWidth: 0,
+    borderTopRightRadius: radius.md,
+    borderBottomRightRadius: radius.md,
+    padding: spacing.md,
+  },
+  passwordToggleText: {
+    color: '#1C344D',
+    fontSize: fontSizes.small,
+    fontWeight: '700',
   },
   helperMuted: {
     color: '#506C86',

@@ -7,13 +7,17 @@ import {
   Alert,
   StyleSheet,
   AppState,
+  Modal,
+  TextInput,
+  ActivityIndicator,
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SplashScreen from 'expo-splash-screen';
+import Constants from 'expo-constants';
 import { v4 as uuidv4 } from 'uuid';
 
-import { supabase } from './lib/supabase';
+import { clearLocalSupabaseSession, supabase } from './lib/supabase';
 import { HAS_SUPABASE_CONFIG, SUPABASE_CONFIG_ERROR } from './lib/config';
 import { secureLocalStorage } from './lib/secureLocalStorage';
 import { colors, spacing, fontSizes } from './styles/theme';
@@ -41,7 +45,13 @@ import {
   limpiarFotosPendientesHuerfanas,
   subirImagenASupabase,
 } from './lib/upload';
-import { hasOfflinePin } from './lib/offlinePin';
+import {
+  clearOfflinePin,
+  hasOfflinePin,
+  saveOfflinePin,
+  getOfflinePinStatus,
+  pinPolicy,
+} from './lib/offlinePin';
 import { obtenerConteoNoLeidas } from './lib/notificaciones';
 
 const MIN_BRANDED_INTRO_MS = 3200;
@@ -49,6 +59,21 @@ const SESSION_TIMEOUT_MS = 8000;
 const QUERY_TIMEOUT_MS = 10000;
 const SYNC_UPSERT_TIMEOUT_MS = 12000;
 const PHOTO_UPLOAD_TIMEOUT_MS = 45000;
+const SYNC_MAX_RETRIES = 3;
+const SYNC_RETRY_BACKOFF_MS = [2000, 5000, 10000];
+const APP_VERSION_CODE = String(
+  Constants.nativeBuildVersion || Constants.expoConfig?.android?.versionCode || 'desconocida'
+);
+const perfilTieneAcceso = (perfil) => (
+  !!perfil?.usuario_id
+  && String(perfil?.estado || '').trim().toLowerCase() === 'activo'
+);
+const esPerfilAusente = (error) => error?.code === 'PGRST116';
+const esErrorAuthDefinitivo = (error) => {
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('refresh token')
+    && (message.includes('invalid') || message.includes('not found') || message.includes('expired'));
+};
 const syncDebug = (...args) => {
   if (typeof __DEV__ !== 'undefined' && __DEV__) console.log('[sync]', ...args);
 };
@@ -74,6 +99,50 @@ const syncErrorMessage = (error) => {
     info.details ? `details=${info.details}` : '',
     info.hint ? `hint=${info.hint}` : '',
   ].filter(Boolean).join(' | ');
+};
+const syncErrorStatus = (error) => {
+  const raw = error?.status ?? error?.statusCode;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const esErrorTransitorioSync = (error) => {
+  const status = syncErrorStatus(error);
+  if ([400, 401, 403].includes(status)) return false;
+  if (status === 408 || status === 425 || status === 429 || status >= 500) return true;
+
+  const name = String(error?.name || error?.causeName || '').toLowerCase();
+  const code = String(error?.code || '').toLowerCase();
+  const message = String(error?.message || '').toLowerCase();
+  if (name === 'timeouterror' || name === 'authretryablefetcherror' || name === 'storageunknownerror') return true;
+  if (/^(econn|enet|etimedout|ehost|dns)/.test(code)) return true;
+  return /network request failed|failed to fetch|fetch failed|network error|timeout|timed out|connection reset|connection aborted|socket hang up|internet.*unreachable/.test(message);
+};
+const esperarSyncRetry = (ms) => new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+const hayConexionParaRetry = async () => {
+  try {
+    const state = await NetInfo.fetch();
+    return !!state?.isConnected && state?.isInternetReachable !== false;
+  } catch {
+    return false;
+  }
+};
+const ejecutarConRetrySync = async (operation, { onFailure } = {}) => {
+  let retry = 0;
+  while (true) {
+    try {
+      return await operation(retry + 1);
+    } catch (error) {
+      const transitorio = esErrorTransitorioSync(error);
+      const puedeReintentar = transitorio && retry < SYNC_MAX_RETRIES;
+      if (typeof onFailure === 'function') {
+        await onFailure(error, { attempt: retry + 1, willRetry: puedeReintentar });
+      }
+      if (!puedeReintentar) throw error;
+      if (!(await hayConexionParaRetry())) throw error;
+      await esperarSyncRetry(SYNC_RETRY_BACKOFF_MS[retry]);
+      retry += 1;
+    }
+  }
 };
 const isLocalPhotoUri = (value) => typeof value === 'string' && /^(file|content):\/\//i.test(value);
 const esActivacionTranseunte = (tipoActivacion) =>
@@ -235,15 +304,28 @@ function AppShell() {
   const [isConnected, setIsConnected] = useState(null);
   const [vistaActiva, setVistaActiva] = useState('formulario');
   const [notificacionesNoLeidas, setNotificacionesNoLeidas] = useState(0);
+  const [pinModalVisible, setPinModalVisible] = useState(false);
+  const [pinConfigurado, setPinConfigurado] = useState(false);
+  const [pinNuevo, setPinNuevo] = useState('');
+  const [pinConfirm, setPinConfirm] = useState('');
+  const [pinGuardando, setPinGuardando] = useState(false);
+  const [sesionOnlineValida, setSesionOnlineValida] = useState(false);
   const syncingRef = useRef(false);
   const lastSyncRef = useRef(0);
   const splashHiddenRef = useRef(false);
-  const sesionRecienAutenticadaRef = useRef(false);
+  const validacionSesionRef = useRef(null);
+  const revalidarSesionRef = useRef(false);
+  const logoutEnCursoRef = useRef(false);
+  const restauracionInicialCompletaRef = useRef(false);
+  const usuarioRef = useRef(usuario);
+  const sesionOnlineValidaRef = useRef(sesionOnlineValida);
+  usuarioRef.current = usuario;
+  sesionOnlineValidaRef.current = sesionOnlineValida;
 
   const contarFormulariosLocales = useCallback(async () => {
     const datos = await obtenerFormulariosLocales();
-    setCantidadOffline(datos.length);
-  }, []);
+    setCantidadOffline(usuario?.id ? datos.filter((item) => item?.usuario_id === usuario.id).length : 0);
+  }, [usuario?.id]);
 
   const sincronizarFormularios = useCallback(async ({ showAlerts = true, force = false, targetLocalId = null } = {}) => {
     if (syncingRef.current) {
@@ -266,6 +348,12 @@ function AppShell() {
       }
       return { status: 'offline', synced: 0, errors: [] };
     }
+    if (!sesionOnlineValida) {
+      if (showAlerts) {
+        Alert.alert('Sesión pendiente', 'Espera mientras se valida tu acceso antes de sincronizar.');
+      }
+      return { status: 'unauthorized', synced: 0, errors: ['Sesión online no validada'] };
+    }
 
     const now = Date.now();
     if (!showAlerts && !force && now - lastSyncRef.current < 10000) return { status: 'busy', synced: 0, errors: [] };
@@ -275,10 +363,34 @@ function AppShell() {
     syncDebug('inicio', { force, showAlerts });
     try {
       const todosFormularios = await obtenerFormulariosLocales();
+      const pendientesLegacy = todosFormularios.filter((f) => !f?.usuario_id);
+      const pendientesOtroUsuario = todosFormularios.filter(
+        (f) => f?.usuario_id && f.usuario_id !== usuario.id,
+      );
+      const pendientesPropios = todosFormularios.filter((f) => f?.usuario_id === usuario.id);
+      const objetivo = targetLocalId
+        ? todosFormularios.find((f) => f?._id_local === targetLocalId || f?.id === targetLocalId)
+        : null;
+
+      if (objetivo && !objetivo.usuario_id) {
+        const mensaje = 'El pendiente no tiene usuario propietario y se conservará sin sincronizar.';
+        if (showAlerts) Alert.alert('Pendiente legacy bloqueado', mensaje);
+        return { status: 'blocked', synced: 0, errors: [mensaje], legacyWithoutOwner: 1 };
+      }
+      if (objetivo && objetivo.usuario_id !== usuario.id) {
+        const mensaje = 'El pendiente pertenece a otro usuario y no puede sincronizarse desde esta sesión.';
+        if (showAlerts) Alert.alert('Pendiente no autorizado', mensaje);
+        return { status: 'forbidden', synced: 0, errors: [mensaje] };
+      }
+
       const formularios = targetLocalId
-        ? todosFormularios.filter((f) => f?._id_local === targetLocalId || f?.id === targetLocalId)
-        : todosFormularios;
-      syncDebug('formularios pendientes', { count: formularios.length });
+        ? pendientesPropios.filter((f) => f?._id_local === targetLocalId || f?.id === targetLocalId)
+        : pendientesPropios;
+      syncDebug('formularios pendientes', {
+        propios: formularios.length,
+        otrosUsuarios: pendientesOtroUsuario.length,
+        legacySinOwner: pendientesLegacy.length,
+      });
       if (!formularios.length) {
         if (targetLocalId) {
           return {
@@ -290,9 +402,18 @@ function AppShell() {
           };
         }
         if (showAlerts) {
-          Alert.alert('Sin formularios', 'No hay formularios pendientes.');
+          const legacyInfo = pendientesLegacy.length
+            ? ` Hay ${pendientesLegacy.length} pendiente(s) legacy sin propietario, preservados y bloqueados.`
+            : '';
+          Alert.alert('Sin formularios', `No hay formularios pendientes para este usuario.${legacyInfo}`);
         }
-        return { status: 'empty', synced: 0, errors: [] };
+        return {
+          status: 'empty',
+          synced: 0,
+          errors: [],
+          legacyWithoutOwner: pendientesLegacy.length,
+          skippedOtherOwners: pendientesOtroUsuario.length,
+        };
       }
 
       let ok = 0;
@@ -348,6 +469,11 @@ function AppShell() {
 
         // Clonamos para no mutar el original
         const { _id_local, _created_at, _updated_at, _sync, ...formulario } = f;
+        const ownerId = formulario.usuario_id;
+        if (!ownerId || ownerId !== usuario.id) {
+          // Defensa adicional: nunca mutar un pendiente cuyo owner no coincida.
+          continue;
+        }
 
         // Asegura id UUID estable
         const recordId = (formulario.id && typeof formulario.id === 'string' && formulario.id.length > 20)
@@ -389,6 +515,19 @@ function AppShell() {
         }
 
         const localPhotosForCleanup = { ...(_sync?.localPhotos || {}) };
+        let syncMetadata = { ...(_sync || {}), localPhotos: localPhotosForCleanup };
+        const actualizarEtapaFoto = async (stage, result = 'running', extra = {}) => {
+          const attemptAt = extra.lastAttemptAt || new Date().toISOString();
+          syncMetadata = {
+            ...syncMetadata,
+            ...extra,
+            lastAttemptAt: attemptAt,
+            lastAttemptVersionCode: APP_VERSION_CODE,
+            lastAttemptStage: stage,
+            lastAttemptResult: result,
+          };
+          await actualizarFormularioLocal(localId, { _sync: syncMetadata });
+        };
         const effectiveFotoUrl = formulario.foto_url || localPhotosForCleanup.foto_url;
         const effectiveFotoCashIn = formulario.foto_cash_in || localPhotosForCleanup.foto_cash_in;
         const esTranseunte = esActivacionTranseunte(formulario.tipo_activacion);
@@ -405,8 +544,11 @@ function AppShell() {
           continue;
         }
 
-        // Sube imágenes pendientes
-        const fotoKeys = [...(requiereFotoPrincipal ? ['foto_url'] : []), ...(effectiveFotoCashIn ? ['foto_cash_in'] : [])];
+        // Sube imágenes pendientes. foto_url se incluye siempre que exista
+        // (cubre evidencia voluntaria de transeúnte); el loop solo sube URIs
+        // locales y omite remotas ya subidas. La obligatoriedad sigue en el
+        // bloque de validación de arriba y no cambia.
+        const fotoKeys = [...(effectiveFotoUrl ? ['foto_url'] : []), ...(effectiveFotoCashIn ? ['foto_cash_in'] : [])];
         let fotoUploadFailed = false;
         syncDebug('rehydratedUri', { localId, recordId, localPhotos: localPhotosForCleanup });
         for (const key of fotoKeys) {
@@ -417,6 +559,13 @@ function AppShell() {
           let shouldUploadLocal = isLocalPhotoUri(uploadSourceUri) && !fieldAlreadyRemote;
 
           if (shouldUploadLocal) {
+            const photoAttemptAt = new Date().toISOString();
+            await actualizarEtapaFoto('FOTO-LOCAL-READ', 'running', {
+              error: null,
+              lastAttemptAt: photoAttemptAt,
+              lastAttemptCode: null,
+              lastAttemptField: key,
+            });
             let fileInfo = await FileSystem.getInfoAsync(uploadSourceUri, { size: true }).catch(() => null);
             syncDebug('existsBeforeUpload', {
               localId,
@@ -455,7 +604,15 @@ function AppShell() {
               const errorMsg = key === 'foto_cash_in'
                 ? 'Foto Cash-In original no recuperable. Reemplázala para sincronizar.'
                 : 'Foto de activación original no recuperable. Reemplázala para sincronizar.';
-              await marcarErrorSync(localId, errorMsg);
+              await marcarErrorSync(localId, errorMsg, {
+                ...syncMetadata,
+                lastAttemptAt: photoAttemptAt,
+                lastAttemptVersionCode: APP_VERSION_CODE,
+                lastAttemptStage: 'FOTO-LOCAL-READ',
+                lastAttemptCode: 'FOTO-LOCAL-READ',
+                lastAttemptResult: 'error',
+                lastAttemptField: key,
+              });
               errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
@@ -468,7 +625,15 @@ function AppShell() {
               const errorMsg = key === 'foto_cash_in'
                 ? 'Foto Cash-In no pudo guardarse en almacenamiento persistente. Reemplázala para sincronizar.'
                 : 'Foto de activación no pudo guardarse en almacenamiento persistente. Reemplázala para sincronizar.';
-              await marcarErrorSync(localId, errorMsg);
+              await marcarErrorSync(localId, errorMsg, {
+                ...syncMetadata,
+                lastAttemptAt: photoAttemptAt,
+                lastAttemptVersionCode: APP_VERSION_CODE,
+                lastAttemptStage: 'FOTO-LOCAL-READ',
+                lastAttemptCode: 'FOTO-LOCAL-READ',
+                lastAttemptResult: 'error',
+                lastAttemptField: key,
+              });
               errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
@@ -482,7 +647,15 @@ function AppShell() {
                 const errorMsg = key === 'foto_cash_in'
                   ? 'Foto Cash-In original no recuperable. Reemplázala para sincronizar.'
                   : 'Foto de activación original no recuperable. Reemplázala para sincronizar.';
-                await marcarErrorSync(localId, errorMsg);
+                await marcarErrorSync(localId, errorMsg, {
+                  ...syncMetadata,
+                  lastAttemptAt: photoAttemptAt,
+                  lastAttemptVersionCode: APP_VERSION_CODE,
+                  lastAttemptStage: 'FOTO-LOCAL-READ',
+                  lastAttemptCode: 'FOTO-LOCAL-READ',
+                  lastAttemptResult: 'error',
+                  lastAttemptField: key,
+                });
                 errores.push(`ID local ${localId}: ${errorMsg}`);
                 fotoUploadFailed = true;
                 continue;
@@ -498,24 +671,73 @@ function AppShell() {
               });
             }
             try {
-              const path = buildPhotoStoragePath(usuario.id, recordId, key);
-              syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', { localId, recordId, path });
-              const storagePath = await withTimeout(
-                subirImagenASupabase(uploadSourceUri, path),
-                PHOTO_UPLOAD_TIMEOUT_MS,
-                'La señal está muy débil para subir la foto. Se reintentará luego.'
+              const path = buildPhotoStoragePath(ownerId, recordId, key);
+              let intentoFotoAt = photoAttemptAt;
+              const storagePath = await ejecutarConRetrySync(
+                async (attempt) => {
+                  intentoFotoAt = new Date().toISOString();
+                  await actualizarEtapaFoto('FOTO-LOCAL-READ', 'running', {
+                    error: null,
+                    lastAttemptAt: intentoFotoAt,
+                    lastAttemptCode: null,
+                    lastAttemptField: key,
+                    lastAttemptRetry: attempt,
+                  });
+                  syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', {
+                    localId,
+                    recordId,
+                    path,
+                    attempt,
+                  });
+                  return withTimeout(
+                    subirImagenASupabase(uploadSourceUri, path, {
+                      onStage: (stage) => actualizarEtapaFoto(stage, 'running', {
+                        lastAttemptAt: intentoFotoAt,
+                        lastAttemptRetry: attempt,
+                      }),
+                    }),
+                    PHOTO_UPLOAD_TIMEOUT_MS,
+                    'La señal está muy débil para subir la foto. Se reintentará luego.'
+                  );
+                },
+                {
+                  onFailure: async (error, { attempt, willRetry }) => {
+                    const errorCode = error?.photoSyncCode || 'FOTO-STORAGE-NETWORK';
+                    const errorMsg = `No se pudo subir la foto (${key}): ${syncErrorMessage(error)}`;
+                    syncMetadata = {
+                      ...syncMetadata,
+                      status: 'pending',
+                      tries: Number(syncMetadata.tries || 0) + 1,
+                      error: errorMsg,
+                      lastAttemptAt: intentoFotoAt,
+                      lastAttemptVersionCode: APP_VERSION_CODE,
+                      lastAttemptStage: errorCode,
+                      lastAttemptCode: errorCode,
+                      lastAttemptResult: willRetry ? 'retrying' : 'error',
+                      lastAttemptField: key,
+                      lastAttemptRetry: attempt,
+                    };
+                    await actualizarFormularioLocal(localId, { _sync: syncMetadata });
+                  },
+                }
               );
               if (storagePath) {
                 formulario[key] = storagePath;
                 localPhotosForCleanup[key] = uploadSourceUri;
+                syncMetadata = {
+                  ...syncMetadata,
+                  status: 'pending',
+                  error: null,
+                  localPhotos: localPhotosForCleanup,
+                  lastAttemptAt: intentoFotoAt,
+                  lastAttemptVersionCode: APP_VERSION_CODE,
+                  lastAttemptStage: 'FOTO-STORAGE-HTTP',
+                  lastAttemptCode: null,
+                  lastAttemptResult: 'success',
+                };
                 await actualizarFormularioLocal(localId, {
                   [key]: storagePath,
-                  _sync: {
-                    ...(_sync || {}),
-                    status: 'pending',
-                    error: null,
-                    localPhotos: localPhotosForCleanup,
-                  },
+                  _sync: syncMetadata,
                 });
               } else {
                 syncWarn('upload sin storagePath', { localId, recordId, key, path });
@@ -528,7 +750,6 @@ function AppShell() {
             } catch (e) {
               syncError('fallo upload foto', { localId, recordId, key, error: syncErrorInfo(e) });
               const errorMsg = `No se pudo subir la foto (${key}): ${syncErrorMessage(e)}`;
-              await marcarErrorSync(localId, errorMsg);
               errores.push(`ID local ${localId}: ${errorMsg}`);
               fotoUploadFailed = true;
               continue;
@@ -548,26 +769,43 @@ function AppShell() {
         }, {});
         payload = sanitizeActivationPayload(payload);
 
-        // Añade datos del usuario actual
+        // El owner persistido es definitivo; la sesión actual solo autoriza
+        // procesar pendientes cuyo usuario_id ya coincide.
         const nombreImpulsador = normalizarNombreVisible(usuario?.nombre || '');
         const plazaFallback = tienePlazaValida(usuario?.plaza) ? usuario.plaza : null;
         const datosConUsuario = {
           ...payload,
           id: recordId,
-          usuario_id: usuario?.id,
-          impulsador: nombreImpulsador || payload.impulsador || usuario?.email || '',
+          usuario_id: ownerId,
+          impulsador: payload.impulsador || nombreImpulsador || usuario?.email || '',
           plaza: payload.plaza || plazaFallback,
           estado_sync: 'online',
         };
 
-        const { error } = await withTimeout(
-          supabase.from('activaciones').upsert(datosConUsuario, { onConflict: 'id' }),
-          SYNC_UPSERT_TIMEOUT_MS,
-          'La señal está muy débil para sincronizar. Se reintentará luego.'
-        );
-        syncDebug('upsert', { localId, recordId, ok: !error });
+        let upsertError = null;
+        try {
+          await ejecutarConRetrySync(
+            async (attempt) => {
+              const { error } = await withTimeout(
+                supabase.from('activaciones').upsert(datosConUsuario, { onConflict: 'id' }),
+                SYNC_UPSERT_TIMEOUT_MS,
+                'La señal está muy débil para sincronizar. Se reintentará luego.'
+              );
+              syncDebug('upsert', { localId, recordId, ok: !error, attempt });
+              if (error) throw error;
+            },
+            {
+              onFailure: async (error) => {
+                const errorMsg = `Upsert activacion: ${syncErrorMessage(error)}`;
+                await marcarErrorSync(localId, errorMsg);
+              },
+            }
+          );
+        } catch (error) {
+          upsertError = error;
+        }
 
-        if (!error) {
+        if (!upsertError) {
           const cleanupUris = Object.values(localPhotosForCleanup)
             .filter((uri) => typeof uri === 'string' && /^file:\/\//i.test(uri));
           await Promise.all(cleanupUris.map((uri) => FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {})));
@@ -577,9 +815,8 @@ function AppShell() {
           syncedLocalIds.push(localId);
           syncedRecordIds.push(recordId);
         } else {
-          syncError('fallo upsert activacion', { localId, recordId, error: syncErrorInfo(error) });
-          const errorMsg = `Upsert activacion: ${syncErrorMessage(error)}`;
-          await marcarErrorSync(localId, errorMsg);
+          syncError('fallo upsert activacion', { localId, recordId, error: syncErrorInfo(upsertError) });
+          const errorMsg = `Upsert activacion: ${syncErrorMessage(upsertError)}`;
           errores.push(`ID local ${localId}: ${errorMsg}`);
         }
       }
@@ -600,6 +837,8 @@ function AppShell() {
         errors: errores,
         syncedLocalIds,
         syncedRecordIds,
+        legacyWithoutOwner: pendientesLegacy.length,
+        skippedOtherOwners: pendientesOtroUsuario.length,
       };
       syncDebug('finalizacion', result);
       return result;
@@ -614,7 +853,7 @@ function AppShell() {
       syncingRef.current = false;
       syncDebug('lock liberado');
     }
-  }, [contarFormulariosLocales, isConnected, usuario]);
+  }, [contarFormulariosLocales, isConnected, sesionOnlineValida, usuario]);
 
   const refrescarConteoNoLeidas = useCallback(async ({ silent = true } = {}) => {
     if (!usuario?.id) {
@@ -636,61 +875,98 @@ function AppShell() {
     }
   }, [isConnected, usuario?.id]);
 
-  const verificarSesion = useCallback(async () => {
-    // Ingreso fresco desde AuthScreen: usuarioFinal ya trae perfil, roles,
-    // plazas y puede_activar; se omite la recarga de red para mostrar la
-    // pantalla principal de inmediato (restauración en frío sigue intacta).
-    if (sesionRecienAutenticadaRef.current && usuario?.id) {
-      sesionRecienAutenticadaRef.current = false;
-      contarFormulariosLocales();
-      setLoading(false);
-      return;
-    }
-    sesionRecienAutenticadaRef.current = false;
-    setLoading(true);
-    let storedUser = null;
-    let usuarioCache = null;
-    try {
-      // Siempre intenta cargar usuario local primero (útil si tarda la red)
-      storedUser = await secureLocalStorage.getItem('usuario_autenticado_local');
-      if (storedUser) {
-        try {
-          const parsed = JSON.parse(storedUser);
-          if (parsed?.id) {
-            usuarioCache = parsed;
-          }
-        } catch {
-          // ignorar usuario local corrupto
-        }
-      }
+  const limpiarAccesoLocal = useCallback(async () => {
+    await secureLocalStorage.removeItem('usuario_autenticado_local').catch(() => {});
+    setVistaActiva('formulario');
+    setNotificacionesNoLeidas(0);
+    setSesionOnlineValida(false);
+    setUsuario(null);
+  }, []);
 
-      if (!isConnected) {
-        if (usuario?.id) return;
-        if (!storedUser) {
-          if (typeof __DEV__ !== 'undefined' && __DEV__) {
-            console.warn('⚠️ No se encontró usuario local (offline).');
-          }
-          setUsuario(null);
-          return;
+  const verificarSesion = useCallback(({ mostrarCarga = false } = {}) => {
+    if (logoutEnCursoRef.current) return Promise.resolve(false);
+    if (validacionSesionRef.current) {
+      revalidarSesionRef.current = true;
+      return validacionSesionRef.current;
+    }
+
+    const validacion = (async () => {
+      if (mostrarCarga) setLoading(true);
+      setSesionOnlineValida(false);
+      let usuarioCache = null;
+      try {
+        const storedUser = await secureLocalStorage.getItem('usuario_autenticado_local');
+        try {
+          const parsed = storedUser ? JSON.parse(storedUser) : null;
+          if (parsed?.id) usuarioCache = parsed;
+        } catch {
+          // Cache corrupto: la sesión persistida sigue siendo la fuente inicial.
         }
-        if (usuarioCache?.id) {
-          const pinConfigurado = await hasOfflinePin(usuarioCache.id);
-          if (pinConfigurado) {
-            // Fuerza desbloqueo con PIN local cuando no hay red.
-            setUsuario(null);
-          } else {
-            setUsuario(usuarioCache);
+
+        let session = null;
+        try {
+          const { data, error } = await withTimeout(
+            supabase.auth.getSession(),
+            SESSION_TIMEOUT_MS,
+            'La sesión local tardó demasiado en restaurarse.'
+          );
+          if (error) throw error;
+          session = data?.session || null;
+        } catch (sessionError) {
+          if (esErrorAuthDefinitivo(sessionError)) {
+            await supabase.auth.signOut().catch(() => {});
+            await limpiarAccesoLocal();
+            return false;
           }
-        } else {
-          setUsuario(null);
+          if (!logoutEnCursoRef.current && usuarioCache?.id && !usuarioRef.current?.id) setUsuario(usuarioCache);
+          return false;
         }
-      } else {
-        const { data: { user }, error } = await withTimeout(
-          supabase.auth.getUser(),
-          SESSION_TIMEOUT_MS,
-          'La red tardó demasiado al verificar la sesión.'
-        );
-        if (error || !user) throw new Error(error?.message || 'No user');
+
+        if (!session?.user?.id) {
+          if (!isConnected && usuarioCache?.id) {
+            const pinConfigurado = await hasOfflinePin(usuarioCache.id).catch(() => false);
+            if (!logoutEnCursoRef.current) setUsuario(pinConfigurado ? null : usuarioCache);
+            return false;
+          }
+          await limpiarAccesoLocal();
+          return false;
+        }
+
+        const sessionUserId = session.user.id;
+        const cacheMismoUsuario = usuarioCache?.id === sessionUserId ? usuarioCache : null;
+        if (!isConnected) {
+          if (usuarioRef.current?.id === sessionUserId) return false;
+          const pinConfigurado = cacheMismoUsuario
+            ? await hasOfflinePin(sessionUserId).catch(() => false)
+            : false;
+          if (!logoutEnCursoRef.current) setUsuario(pinConfigurado ? null : cacheMismoUsuario);
+          return false;
+        }
+
+        let user;
+        try {
+          const { data, error } = await withTimeout(
+            supabase.auth.getUser(),
+            SESSION_TIMEOUT_MS,
+            'La red tardó demasiado al verificar la sesión.'
+          );
+          if (error) throw error;
+          user = data?.user || null;
+        } catch (userError) {
+          if (esErrorAuthDefinitivo(userError)) {
+            await supabase.auth.signOut().catch(() => {});
+            await limpiarAccesoLocal();
+            return false;
+          }
+          if (!logoutEnCursoRef.current && cacheMismoUsuario && !usuarioRef.current?.id) setUsuario(cacheMismoUsuario);
+          return false;
+        }
+
+        if (!user?.id || user.id !== sessionUserId) {
+          await supabase.auth.signOut().catch(() => {});
+          await limpiarAccesoLocal();
+          return false;
+        }
 
         const { data: perfil, error: errorPerfil } = await withTimeout(
           supabase
@@ -701,17 +977,28 @@ function AppShell() {
           QUERY_TIMEOUT_MS,
           'La red tardó demasiado al cargar el perfil.'
         );
+        if (errorPerfil) {
+          if (esPerfilAusente(errorPerfil)) {
+            await supabase.auth.signOut().catch(() => {});
+            await limpiarAccesoLocal();
+          } else if (cacheMismoUsuario && !usuarioRef.current?.id) {
+            if (!logoutEnCursoRef.current) setUsuario(cacheMismoUsuario);
+          }
+          return false;
+        }
+        if (!perfilTieneAcceso(perfil)) {
+          await supabase.auth.signOut().catch(() => {});
+          await limpiarAccesoLocal();
+          return false;
+        }
 
-        if (errorPerfil && typeof __DEV__ !== 'undefined' && __DEV__) console.warn('⚠️ Perfil no encontrado:', errorPerfil.message);
-
-        const cacheMismoUsuario = usuarioCache?.id === user.id ? usuarioCache : null;
-        const nombrePerfil = normalizarNombreVisible(perfil?.nombre || '');
+        const nombrePerfil = normalizarNombreVisible(perfil.nombre || '');
         const nombreCache = normalizarNombreVisible(cacheMismoUsuario?.nombre || '');
         const nombreMetadata = normalizarNombreVisible(user.user_metadata?.nombre || '');
-        const plazaPerfil = normalizarNombreVisible(perfil?.plaza || '');
+        const plazaPerfil = normalizarNombreVisible(perfil.plaza || '');
         const plazaCache = normalizarNombreVisible(cacheMismoUsuario?.plaza || '');
         const plazasTemporales = await obtenerPlazasTemporales({
-          activadorId: perfil?.usuario_id,
+          activadorId: perfil.usuario_id,
           usuarioId: user.id,
         });
 
@@ -724,43 +1011,57 @@ function AppShell() {
           );
           if (Array.isArray(rolesData)) filasRoles = rolesData;
         } catch {
-          // Sin multirrol (RLS/red): se conserva el rol legacy de activadores.
+          // El perfil activo ya autorizó el acceso; se conserva el rol legacy.
         }
         const rolesCrudos = [
-          perfil?.rol || perfil?.role,
+          perfil.rol || perfil.role,
           ...filasRoles.map((fila) => fila?.rol),
           ...(Array.isArray(cacheMismoUsuario?.roles) ? cacheMismoUsuario.roles : []),
         ].filter((rol) => typeof rol === 'string' && rol.trim());
-
         const usuarioFinal = {
           id: user.id,
           email: user.email,
           nombre: nombrePerfil || nombreCache || nombreMetadata || user.email,
           plaza: plazaPerfil || plazaCache || 'No especificada',
           plazas_temporales: plazasTemporales,
-          rol: perfil?.rol || perfil?.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || user.user_metadata?.rol || user.user_metadata?.role || 'activador',
+          rol: perfil.rol || perfil.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || 'activador',
           roles: Array.from(new Set(rolesCrudos)),
-          puede_activar: perfil?.puede_activar === true || cacheMismoUsuario?.puede_activar === true,
+          puede_activar: perfil.puede_activar === true,
         };
 
-        setUsuario(usuarioFinal);
+        if (logoutEnCursoRef.current) return false;
         await secureLocalStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+        if (logoutEnCursoRef.current) {
+          await secureLocalStorage.removeItem('usuario_autenticado_local');
+          return false;
+        }
+        setUsuario(usuarioFinal);
+        setSesionOnlineValida(true);
+        return true;
+      } catch (error) {
+        if (typeof __DEV__ !== 'undefined' && __DEV__) {
+          console.warn('No se pudo validar la sesión; se conserva el estado local:', error?.message || error);
+        }
+        if (!logoutEnCursoRef.current && usuarioCache?.id && !usuarioRef.current?.id) setUsuario(usuarioCache);
+        return false;
+      } finally {
+        contarFormulariosLocales();
+        if (mostrarCarga) setLoading(false);
       }
-    } catch (e) {
-      if (typeof __DEV__ !== 'undefined' && __DEV__) {
-        console.error('❌ Error verificando sesión:', e?.message || e);
+    })();
+
+    const validacionSeguida = validacion.finally(() => {
+      if (validacionSesionRef.current === validacionSeguida) {
+        validacionSesionRef.current = null;
+        if (revalidarSesionRef.current) {
+          revalidarSesionRef.current = false;
+          globalThis.setTimeout(() => verificarSesion(), 0);
+        }
       }
-      if (usuarioCache?.id && !usuario?.id) {
-        const pinConfigurado = await hasOfflinePin(usuarioCache.id);
-        setUsuario(pinConfigurado ? null : usuarioCache);
-      } else if (!usuario?.id) {
-        setUsuario(null);
-      }
-    } finally {
-      contarFormulariosLocales();
-      setLoading(false);
-    }
-  }, [contarFormulariosLocales, isConnected, usuario?.id]);
+    });
+    validacionSesionRef.current = validacionSeguida;
+    return validacionSeguida;
+  }, [contarFormulariosLocales, isConnected, limpiarAccesoLocal]);
 
   // Detectar cambios de conexión + estado inicial
   useEffect(() => {
@@ -797,16 +1098,42 @@ function AppShell() {
   // Verificar sesión una vez detectado el estado de conexión
   useEffect(() => {
     if (isConnected !== null) {
-      verificarSesion();
+      verificarSesion({ mostrarCarga: !restauracionInicialCompletaRef.current }).finally(() => {
+        restauracionInicialCompletaRef.current = true;
+      });
     }
   }, [isConnected, verificarSesion]);
 
+  useEffect(() => {
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'INITIAL_SESSION') return;
+      if (event === 'SIGNED_OUT') {
+        logoutEnCursoRef.current = true;
+        limpiarAccesoLocal();
+        return;
+      }
+      if (logoutEnCursoRef.current) return;
+      if (
+        restauracionInicialCompletaRef.current
+        && session?.user?.id
+        && (
+          ['TOKEN_REFRESHED', 'USER_UPDATED'].includes(event)
+          || (event === 'SIGNED_IN' && !!usuarioRef.current?.id)
+        )
+        && (!sesionOnlineValidaRef.current || usuarioRef.current?.id !== session.user.id)
+      ) {
+        verificarSesion();
+      }
+    });
+    return () => data?.subscription?.unsubscribe();
+  }, [limpiarAccesoLocal, verificarSesion]);
+
   // Auto-sync al volver a conexión o primer plano (sin alertas intrusivas)
   useEffect(() => {
-    if (isConnected) {
+    if (isConnected && sesionOnlineValida) {
       sincronizarFormularios({ showAlerts: false });
     }
-  }, [isConnected, sincronizarFormularios]);
+  }, [isConnected, sesionOnlineValida, sincronizarFormularios]);
 
   useEffect(() => {
     if (usuario?.id && isConnected) {
@@ -858,19 +1185,50 @@ function AppShell() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
       if (state === 'active' && isConnected) {
-        sincronizarFormularios({ showAlerts: false });
-        refrescarConteoNoLeidas();
+        verificarSesion().then((sesionValida) => {
+          if (!sesionValida) return;
+          sincronizarFormularios({ showAlerts: false });
+          refrescarConteoNoLeidas();
+        });
       }
     });
     return () => sub.remove();
-  }, [isConnected, refrescarConteoNoLeidas, sincronizarFormularios]);
+  }, [isConnected, refrescarConteoNoLeidas, sincronizarFormularios, verificarSesion]);
 
   const cerrarSesion = async () => {
+    const usuarioIdLogout = usuarioRef.current?.id || null;
+    logoutEnCursoRef.current = true;
+    revalidarSesionRef.current = false;
+    setSesionOnlineValida(false);
+    setUsuario(null);
     try {
-      await supabase.auth.signOut();
+      await supabase.auth.stopAutoRefresh().catch(() => {});
+      const { error } = await withTimeout(
+        supabase.auth.signOut({ scope: 'global' }),
+        SESSION_TIMEOUT_MS,
+        'El cierre remoto de sesión tardó demasiado.'
+      );
+      if (error) throw error;
     } catch (e) {
       if (typeof __DEV__ !== 'undefined' && __DEV__) {
         console.warn('⚠️ Error cerrando sesión:', e.message);
+      }
+    } finally {
+      let sesionLocalEliminada = false;
+      for (let attempt = 0; attempt < 2 && !sesionLocalEliminada; attempt += 1) {
+        try {
+          await clearLocalSupabaseSession();
+          sesionLocalEliminada = true;
+        } catch {
+          // Segundo intento inmediato: la limpieza local no depende de red.
+        }
+      }
+      await Promise.allSettled([
+        secureLocalStorage.removeItem('usuario_autenticado_local'),
+        clearOfflinePin(usuarioIdLogout),
+      ]);
+      if (!sesionLocalEliminada) {
+        Alert.alert('Cierre local incompleto', 'No se pudo eliminar la sesión guardada. Reinicia la app e intenta cerrar sesión nuevamente.');
       }
     }
     try {
@@ -886,17 +1244,80 @@ function AppShell() {
         console.warn('⚠️ No se pudieron limpiar fotos huérfanas:', e?.message || e);
       }
     }
-    await secureLocalStorage.removeItem('usuario_autenticado_local');
-    setVistaActiva('formulario');
-    setNotificacionesNoLeidas(0);
-    setUsuario(null);
+    await limpiarAccesoLocal();
   };
 
-  const handleLogin = async (user) => {
-    sesionRecienAutenticadaRef.current = true;
+  const handleLogin = async (user, { autenticadoOnline = false } = {}) => {
+    logoutEnCursoRef.current = false;
+    if (autenticadoOnline) supabase.auth.startAutoRefresh().catch(() => {});
+    setSesionOnlineValida(autenticadoOnline);
     setUsuario(user);
     setVistaActiva('formulario');
     contarFormulariosLocales();
+  };
+
+  const normalizarPinLocal = (value) =>
+    String(value || '').replace(/\D/g, '').slice(0, pinPolicy.maxLength);
+
+  const refrescarEstadoPin = useCallback(async () => {
+    if (!usuario?.id) {
+      setPinConfigurado(false);
+      return;
+    }
+    try {
+      setPinConfigurado(await hasOfflinePin(usuario.id));
+    } catch {
+      setPinConfigurado(false);
+    }
+  }, [usuario?.id]);
+
+  useEffect(() => {
+    refrescarEstadoPin();
+  }, [refrescarEstadoPin]);
+
+  const abrirPinModal = () => {
+    setPinNuevo('');
+    setPinConfirm('');
+    setPinModalVisible(true);
+  };
+
+  const guardarPinLocal = async () => {
+    if (pinGuardando) return;
+    if (!usuario?.id) return;
+
+    const pin = normalizarPinLocal(pinNuevo);
+    const confirm = normalizarPinLocal(pinConfirm);
+    if (pin.length < pinPolicy.minLength || pin.length > pinPolicy.maxLength) {
+      Alert.alert('PIN inválido', `El PIN debe tener entre ${pinPolicy.minLength} y ${pinPolicy.maxLength} dígitos.`);
+      return;
+    }
+    if (pin !== confirm) {
+      Alert.alert('PIN no coincide', 'La confirmación debe ser exactamente igual.');
+      return;
+    }
+
+    setPinGuardando(true);
+    try {
+      await saveOfflinePin({ userId: usuario.id, pin });
+      let status;
+      try {
+        status = await getOfflinePinStatus(usuario.id);
+      } catch (verifyError) {
+        throw new Error(`El PIN se guardó, pero no pudo verificarse. ${verifyError?.message || 'Intenta nuevamente.'}`);
+      }
+      if (!status?.configured) {
+        throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
+      }
+      setPinConfigurado(true);
+      setPinModalVisible(false);
+      setPinNuevo('');
+      setPinConfirm('');
+      Alert.alert('PIN guardado', 'Tu PIN local quedó activo para desbloqueo sin internet.');
+    } catch (err) {
+      Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta de nuevo.');
+    } finally {
+      setPinGuardando(false);
+    }
   };
 
   const firstName = enmascararMarcaVisible(usuario?.nombre?.split(' ')[0] || 'Usuario', usuario);
@@ -979,6 +1400,11 @@ function AppShell() {
             <View style={[styles.statusChip, isConnected ? styles.statusOnline : styles.statusOffline]}>
               <Text style={styles.statusText}>{isConnected ? 'En línea' : 'Sin red'}</Text>
             </View>
+            {sesionOnlineValida ? (
+              <TouchableOpacity style={styles.logoutLink} onPress={abrirPinModal}>
+                <Text style={styles.logoutLinkText}>{pinConfigurado ? 'Cambiar PIN' : 'Configurar PIN'}</Text>
+              </TouchableOpacity>
+            ) : null}
             <TouchableOpacity style={styles.logoutLink} onPress={cerrarSesion}>
               <Text style={styles.logoutLinkText}>Salir</Text>
             </TouchableOpacity>
@@ -1054,6 +1480,59 @@ function AppShell() {
           />
         )}
       </View>
+
+      <Modal visible={pinModalVisible} transparent animationType="fade" onRequestClose={() => { if (!pinGuardando) setPinModalVisible(false); }}>
+        <View style={styles.pinModalBackdrop}>
+          <View style={styles.pinModalCard}>
+            <Text style={styles.pinModalTitle}>{pinConfigurado ? 'Cambiar PIN local' : 'Configurar PIN local'}</Text>
+            <Text style={styles.pinModalSub}>
+              PIN de {pinPolicy.minLength} a {pinPolicy.maxLength} dígitos para desbloquear sin internet.
+            </Text>
+            <TextInput
+              style={styles.pinInput}
+              placeholder="Nuevo PIN"
+              value={pinNuevo}
+              onChangeText={(v) => setPinNuevo(normalizarPinLocal(v))}
+              keyboardType="number-pad"
+              secureTextEntry
+              maxLength={pinPolicy.maxLength}
+              editable={!pinGuardando}
+            />
+            <TextInput
+              style={styles.pinInput}
+              placeholder="Confirmar PIN"
+              value={pinConfirm}
+              onChangeText={(v) => setPinConfirm(normalizarPinLocal(v))}
+              keyboardType="number-pad"
+              secureTextEntry
+              maxLength={pinPolicy.maxLength}
+              editable={!pinGuardando}
+            />
+            <View style={styles.pinModalActions}>
+              <TouchableOpacity
+                style={[styles.pinBtnSecondary, pinGuardando && styles.pinBtnDisabled]}
+                onPress={() => { if (!pinGuardando) setPinModalVisible(false); }}
+                disabled={pinGuardando}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.pinBtnSecondaryText}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.pinBtnPrimary, pinGuardando && styles.pinBtnDisabled]}
+                onPress={guardarPinLocal}
+                disabled={pinGuardando}
+                activeOpacity={0.85}
+              >
+                {pinGuardando ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <Text style={styles.pinBtnPrimaryText}>Guardar PIN</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -1169,6 +1648,68 @@ const styles = StyleSheet.create({
     color: '#AFC4DB',
     fontSize: 12,
     fontWeight: '600',
+  },
+  pinModalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(4, 10, 18, 0.6)',
+    justifyContent: 'center',
+    paddingHorizontal: spacing.lg,
+  },
+  pinModalCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: spacing.lg,
+  },
+  pinModalTitle: {
+    fontSize: fontSizes.large,
+    fontWeight: '700',
+    color: colors.text,
+    marginBottom: 6,
+  },
+  pinModalSub: {
+    fontSize: fontSizes.small,
+    color: colors.muted,
+    marginBottom: spacing.md,
+  },
+  pinInput: {
+    borderWidth: 1,
+    borderColor: '#CBDCEC',
+    borderRadius: 10,
+    padding: spacing.md,
+    fontSize: fontSizes.medium,
+    color: colors.text,
+    marginBottom: spacing.sm,
+  },
+  pinModalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: spacing.sm,
+  },
+  pinBtnPrimary: {
+    backgroundColor: colors.primary,
+    borderRadius: 10,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    minWidth: 120,
+    alignItems: 'center',
+    marginLeft: spacing.sm,
+  },
+  pinBtnPrimaryText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  pinBtnSecondary: {
+    borderRadius: 10,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    alignItems: 'center',
+  },
+  pinBtnSecondaryText: {
+    color: colors.primary,
+    fontWeight: '700',
+  },
+  pinBtnDisabled: {
+    opacity: 0.6,
   },
   actionsRow: {
     marginTop: spacing.sm,
