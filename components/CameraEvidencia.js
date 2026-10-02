@@ -4,7 +4,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
 import { colors, fontSizes, radius, spacing } from '../styles/theme';
 import { withTimeout } from '../lib/asyncTimeout';
-import { registrarErrorFoto } from '../lib/photoDiagnostics';
+import { registrarErrorFoto, registrarHitoCamara } from '../lib/photoDiagnostics';
 
 const PERMISSION_TIMEOUT_MS = 10000;
 const CAMERA_READY_TIMEOUT_MS = 10000;
@@ -36,12 +36,18 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   const cameraRef = useRef(null);
   const capturandoRef = useRef(false);
   const capturaOperacionRef = useRef(null);
-  const consultandoTamanosRef = useRef(false);
+  const consultandoTamanosRef = useRef(null);
   const procesandoRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionRef = useRef(0);
+  const cameraAttemptRef = useRef(0);
+  const esperandoReinicioRef = useRef(false);
   const permisoSolicitadoRef = useRef(false);
+  const permisoReportadoRef = useRef(false);
   const [permission, requestPermission] = useCameraPermissions();
+  const [modalShown, setModalShown] = useState(false);
+  const [cameraAttempt, setCameraAttempt] = useState(null);
+  const [cameraPhase, setCameraPhase] = useState('idle');
   const [cameraReady, setCameraReady] = useState(false);
   const [pictureSize, setPictureSize] = useState(null);
   const [fotoCapturada, setFotoCapturada] = useState(null);
@@ -60,26 +66,53 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     return () => {
       mountedRef.current = false;
       sessionRef.current += 1;
+      cameraAttemptRef.current += 1;
     };
   }, []);
 
   useEffect(() => {
     sessionRef.current += 1;
+    cameraAttemptRef.current += 1;
     permisoSolicitadoRef.current = false;
+    permisoReportadoRef.current = false;
+    esperandoReinicioRef.current = false;
+    consultandoTamanosRef.current = null;
+    cameraRef.current = null;
+    setModalShown(false);
+    setCameraAttempt(null);
+    setCameraPhase('idle');
     if (!visible) return;
     setCameraReady(false);
     setPictureSize(null);
     setFotoCapturada(null);
     setCapturando(false);
     setCapturaNativaPendiente(Boolean(capturaOperacionRef.current));
-    consultandoTamanosRef.current = false;
     procesandoRef.current = false;
     setProcesando(false);
     setError('');
   }, [visible]);
 
   useEffect(() => {
-    if (!visible || permission) return undefined;
+    if (!visible || !modalShown || !permission?.granted || permisoReportadoRef.current) return;
+    permisoReportadoRef.current = true;
+    registrarHitoCamara('FOTO-CAMERA-PERMISSION-GRANTED');
+  }, [modalShown, permission?.granted, visible]);
+
+  useEffect(() => {
+    if (!visible || !modalShown || !permission?.granted || fotoCapturada || error || cameraAttempt !== null) return;
+    const attempt = cameraAttemptRef.current + 1;
+    cameraAttemptRef.current = attempt;
+    esperandoReinicioRef.current = false;
+    consultandoTamanosRef.current = null;
+    setCameraReady(false);
+    setPictureSize(null);
+    setCameraAttempt(attempt);
+    setCameraPhase('mounting');
+    registrarHitoCamara('FOTO-CAMERA-MOUNTED');
+  }, [cameraAttempt, error, fotoCapturada, modalShown, permission?.granted, visible]);
+
+  useEffect(() => {
+    if (!visible || !modalShown || permission) return undefined;
     const session = sessionRef.current;
     const timer = globalThis.setTimeout(() => {
       const timeoutError = new Error('La lectura del permiso de cámara excedió el tiempo permitido.');
@@ -89,20 +122,39 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
       });
     }, PERMISSION_TIMEOUT_MS);
     return () => globalThis.clearTimeout(timer);
-  }, [permission, visible]);
+  }, [modalShown, permission, visible]);
 
   useEffect(() => {
-    if (!visible || !permission?.granted || cameraReady || fotoCapturada) return undefined;
+    if (
+      !visible
+      || !modalShown
+      || !permission?.granted
+      || cameraReady
+      || fotoCapturada
+      || cameraAttempt === null
+      || !['mounting', 'restarting'].includes(cameraPhase)
+    ) return undefined;
     const session = sessionRef.current;
+    const attempt = cameraAttempt;
     const timer = globalThis.setTimeout(() => {
+      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
       const timeoutError = new Error('La cámara no informó que está lista dentro del tiempo permitido.');
       timeoutError.name = 'TimeoutError';
+      cameraAttemptRef.current += 1;
+      consultandoTamanosRef.current = null;
+      esperandoReinicioRef.current = false;
+      cameraRef.current = null;
+      setCameraAttempt(null);
+      setCameraPhase('idle');
+      setCameraReady(false);
+      setPictureSize(null);
+      setError('La cámara tardó demasiado en iniciar.');
       reportarError('camera_ready', timeoutError, 'La cámara tardó demasiado en iniciar.').then((message) => {
-        if (mountedRef.current && sessionRef.current === session && !cameraReady) setError(message);
+        if (mountedRef.current && sessionRef.current === session && cameraAttemptRef.current === attempt + 1) setError(message);
       });
     }, CAMERA_READY_TIMEOUT_MS);
     return () => globalThis.clearTimeout(timer);
-  }, [cameraReady, fotoCapturada, permission?.granted, visible]);
+  }, [cameraAttempt, cameraPhase, cameraReady, fotoCapturada, modalShown, permission?.granted, visible]);
 
   const solicitarPermiso = async () => {
     const session = sessionRef.current;
@@ -120,7 +172,7 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   };
 
   useEffect(() => {
-    if (visible && permission && !permission.granted && permission.canAskAgain && !permisoSolicitadoRef.current) {
+    if (visible && modalShown && permission && !permission.granted && permission.canAskAgain && !permisoSolicitadoRef.current) {
       permisoSolicitadoRef.current = true;
       const session = sessionRef.current;
       withTimeout(
@@ -132,17 +184,27 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
         if (mountedRef.current && sessionRef.current === session) setError(message);
       });
     }
-  }, [permission, requestPermission, visible]);
+  }, [modalShown, permission, requestPermission, visible]);
 
-  const cargarTamanos = async () => {
-    if ((pictureSize && cameraReady) || consultandoTamanosRef.current || procesandoRef.current) return;
+  const cargarTamanos = async (attempt) => {
+    if (
+      attempt !== cameraAttemptRef.current
+      || cameraAttempt !== attempt
+      || procesandoRef.current
+      || cameraReady
+    ) return;
     const session = sessionRef.current;
-    consultandoTamanosRef.current = true;
-    if (mountedRef.current) {
-      setCameraReady(false);
-      setPictureSize(null);
-      setError('');
+    if (pictureSize && esperandoReinicioRef.current) {
+      esperandoReinicioRef.current = false;
+      setCameraPhase('ready');
+      setCameraReady(true);
+      return;
     }
+
+    if (pictureSize || consultandoTamanosRef.current !== null) return;
+    registrarHitoCamara('FOTO-CAMERA-READY');
+    consultandoTamanosRef.current = attempt;
+    setCameraPhase('sizes');
     try {
       const sizes = await withTimeout(
         cameraRef.current?.getAvailablePictureSizesAsync(),
@@ -153,17 +215,56 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
       if (!seleccion) {
         throw new Error('La cámara no informó una resolución segura de 12 MP o menos.');
       }
-      if (!mountedRef.current || sessionRef.current !== session) return;
+      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
+      esperandoReinicioRef.current = true;
       setPictureSize(seleccion);
-      setCameraReady(true);
+      setCameraPhase('restarting');
+      registrarHitoCamara('FOTO-CAMERA-SIZES-LOADED');
     } catch (cameraError) {
-      if (!mountedRef.current || sessionRef.current !== session) return;
-      const message = await reportarError('camera_ready', cameraError, 'No se pudo preparar la cámara.');
-      if (!mountedRef.current || sessionRef.current !== session) return;
-      setError(message);
+      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
+      cameraAttemptRef.current += 1;
+      cameraRef.current = null;
+      setCameraAttempt(null);
+      setCameraPhase('idle');
       setCameraReady(false);
+      setPictureSize(null);
+      esperandoReinicioRef.current = false;
+      setError('No se pudo preparar la cámara.');
+      const message = await reportarError('camera_ready', cameraError, 'No se pudo preparar la cámara.');
+      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt + 1) return;
+      setError(message);
     } finally {
-      consultandoTamanosRef.current = false;
+      if (consultandoTamanosRef.current === attempt) consultandoTamanosRef.current = null;
+    }
+  };
+
+  const reintentarCamara = () => {
+    cameraAttemptRef.current += 1;
+    cameraRef.current = null;
+    consultandoTamanosRef.current = null;
+    esperandoReinicioRef.current = false;
+    setCameraAttempt(null);
+    setCameraPhase('idle');
+    setCameraReady(false);
+    setPictureSize(null);
+    setError('');
+  };
+
+  const manejarErrorMontaje = async (attempt, event) => {
+    if (attempt !== cameraAttemptRef.current || cameraAttempt !== attempt) return;
+    const session = sessionRef.current;
+    cameraAttemptRef.current += 1;
+    cameraRef.current = null;
+    consultandoTamanosRef.current = null;
+    esperandoReinicioRef.current = false;
+    setCameraAttempt(null);
+    setCameraPhase('idle');
+    setCameraReady(false);
+    setPictureSize(null);
+    setError('No se pudo iniciar la cámara.');
+    const message = await reportarError('camera_ready', event, 'No se pudo iniciar la cámara.');
+    if (mountedRef.current && sessionRef.current === session && cameraAttemptRef.current === attempt + 1) {
+      setError(message);
     }
   };
 
@@ -211,6 +312,9 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
         await FileSystem.deleteAsync(foto.uri, { idempotent: true }).catch(() => {});
         return;
       }
+      cameraAttemptRef.current += 1;
+      setCameraAttempt(null);
+      setCameraPhase('idle');
       setFotoCapturada(foto);
     } catch (cameraError) {
       operacion.invalidada = true;
@@ -258,6 +362,9 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     await limpiarCapturaTemporal();
     if (!mountedRef.current) return;
     setFotoCapturada(null);
+    cameraAttemptRef.current += 1;
+    setCameraAttempt(null);
+    setCameraPhase('idle');
     setCameraReady(false);
     setPictureSize(null);
     setError('');
@@ -268,6 +375,13 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   const cancelar = async () => {
     if (procesandoRef.current) return;
     if (capturaOperacionRef.current) capturaOperacionRef.current.invalidada = true;
+    cameraAttemptRef.current += 1;
+    cameraRef.current = null;
+    consultandoTamanosRef.current = null;
+    esperandoReinicioRef.current = false;
+    setCameraAttempt(null);
+    setCameraPhase('idle');
+    setModalShown(false);
     procesandoRef.current = true;
     if (mountedRef.current) setProcesando(true);
     await limpiarCapturaTemporal();
@@ -278,10 +392,27 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   if (!visible) return null;
 
   return (
-    <Modal visible animationType="slide" onRequestClose={cancelar}>
+    <Modal
+      visible
+      animationType="slide"
+      onRequestClose={cancelar}
+      onShow={() => {
+        if (!mountedRef.current || !visible) return;
+        setModalShown(true);
+        registrarHitoCamara('FOTO-CAMERA-MODAL-OPEN');
+      }}
+    >
       <View style={styles.container}>
         <Text style={styles.title}>{label || 'Evidencia'}</Text>
-        {!permission ? (
+        {!modalShown ? (
+          <View style={styles.center}>
+            <ActivityIndicator color="#FFFFFF" />
+            <Text style={styles.message}>Iniciando cámara...</Text>
+            <TouchableOpacity style={styles.secondaryButton} onPress={cancelar} disabled={procesando}>
+              <Text style={styles.secondaryText}>Cerrar</Text>
+            </TouchableOpacity>
+          </View>
+        ) : !permission ? (
           <View style={styles.center}>
             {!error ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.error}>{error}</Text>}
             {!!error && (
@@ -318,40 +449,55 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
               </TouchableOpacity>
             </View>
           </View>
+        ) : cameraAttempt === null ? (
+          <View style={styles.center}>
+            {!error ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.error}>{error}</Text>}
+            <Text style={styles.message}>{error ? 'La cámara no pudo iniciarse.' : 'Iniciando cámara...'}</Text>
+            {!!error && (
+              <TouchableOpacity style={styles.primaryButton} onPress={reintentarCamara} disabled={procesando}>
+                <Text style={styles.primaryText}>Reintentar</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity style={styles.secondaryButton} onPress={cancelar} disabled={procesando}>
+              <Text style={styles.secondaryText}>Cerrar</Text>
+            </TouchableOpacity>
+          </View>
         ) : (
           <View style={styles.content}>
             <CameraView
+              key={`camera-${cameraAttempt}`}
               ref={cameraRef}
               style={styles.camera}
               facing="back"
               mode="picture"
               pictureSize={pictureSize || undefined}
-              onCameraReady={cargarTamanos}
-              onMountError={async (event) => {
-                const message = await reportarError('camera_ready', event, 'No se pudo iniciar la cámara.');
-                if (mountedRef.current) setError(message);
-              }}
+              onCameraReady={() => cargarTamanos(cameraAttempt)}
+              onMountError={(event) => manejarErrorMontaje(cameraAttempt, event)}
             />
-            {!!error && <Text style={styles.error}>{error}</Text>}
-            {!!error && (
-              <TouchableOpacity style={styles.retryButton} onPress={cargarTamanos} disabled={consultandoTamanosRef.current}>
-                <Text style={styles.secondaryText}>Reintentar</Text>
-              </TouchableOpacity>
+            {!cameraReady ? (
+              <View style={styles.initializingOverlay}>
+                <ActivityIndicator color="#FFFFFF" />
+                <Text style={styles.message}>Iniciando cámara...</Text>
+                <TouchableOpacity style={styles.secondaryButton} onPress={cancelar} disabled={procesando}>
+                  <Text style={styles.secondaryText}>Cerrar</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <View style={styles.actions}>
+                <TouchableOpacity
+                  style={[styles.primaryButton, (capturando || capturaNativaPendiente) && styles.disabled]}
+                  onPress={tomarFoto}
+                  disabled={capturando || capturaNativaPendiente}
+                >
+                  {capturando
+                    ? <ActivityIndicator color="#FFFFFF" />
+                    : <Text style={styles.primaryText}>{capturaNativaPendiente ? 'Finalizando cámara...' : 'Tomar foto'}</Text>}
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.secondaryButton} onPress={cancelar}>
+                  <Text style={styles.secondaryText}>Cancelar</Text>
+                </TouchableOpacity>
+              </View>
             )}
-            <View style={styles.actions}>
-              <TouchableOpacity
-                style={[styles.primaryButton, (!cameraReady || capturando || capturaNativaPendiente) && styles.disabled]}
-                onPress={tomarFoto}
-                disabled={!cameraReady || capturando || capturaNativaPendiente}
-              >
-                {capturando
-                  ? <ActivityIndicator color="#FFFFFF" />
-                  : <Text style={styles.primaryText}>{capturaNativaPendiente ? 'Finalizando cámara...' : 'Tomar foto'}</Text>}
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.secondaryButton} onPress={cancelar}>
-                <Text style={styles.secondaryText}>Cancelar</Text>
-              </TouchableOpacity>
-            </View>
           </View>
         )}
       </View>
@@ -366,6 +512,7 @@ const styles = StyleSheet.create({
   title: { color: '#FFFFFF', fontSize: fontSizes.large, fontWeight: '700', marginBottom: spacing.md, textAlign: 'center' },
   message: { color: '#FFFFFF', fontSize: fontSizes.medium, textAlign: 'center' },
   camera: { flex: 1, borderRadius: radius.base, overflow: 'hidden' },
+  initializingOverlay: { ...StyleSheet.absoluteFillObject, zIndex: 2, elevation: 2, alignItems: 'center', justifyContent: 'center', gap: spacing.md, backgroundColor: '#05080D', paddingHorizontal: spacing.lg },
   preview: { flex: 1, width: '100%' },
   actions: { flexDirection: 'row', gap: spacing.sm, paddingVertical: spacing.md },
   primaryButton: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primary, borderRadius: radius.base, paddingHorizontal: spacing.md },
@@ -374,5 +521,4 @@ const styles = StyleSheet.create({
   secondaryText: { color: '#FFFFFF', fontSize: fontSizes.medium, fontWeight: '700' },
   disabled: { opacity: 0.5 },
   error: { color: '#FFB4AB', fontSize: fontSizes.small, paddingTop: spacing.sm, textAlign: 'center' },
-  retryButton: { alignSelf: 'center', marginTop: spacing.sm, minHeight: 42, justifyContent: 'center', borderWidth: 1, borderColor: '#FFFFFF', borderRadius: radius.base, paddingHorizontal: spacing.lg },
 });
