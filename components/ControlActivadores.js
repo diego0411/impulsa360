@@ -45,12 +45,6 @@ const esRolAdministrador = (value) => {
     (item) => roles.includes(item),
   );
 };
-const esRolLider = (value) => {
-  const roles = rolesNormalizados(value);
-  return ['lider', 'leader', 'supervisor'].some(
-    (item) => roles.includes(item),
-  );
-};
 const esRolActivador = (value) => rolesNormalizados(value).includes('activador');
 
 const TIPOS_ACTIVACION = [
@@ -189,7 +183,6 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const { height } = useWindowDimensions();
   const rolesUsuario = [usuario?.rol, usuario?.role, usuario?.roles];
   const administrador = esRolAdministrador(rolesUsuario);
-  const lider = esRolLider(rolesUsuario);
   const activadorSolo = !administrador && esRolActivador(rolesUsuario);
   const usuarioId = usuario?.id;
   const hoyLocal = fechaLocalIso(new Date());

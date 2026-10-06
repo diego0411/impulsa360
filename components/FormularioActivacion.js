@@ -12,6 +12,7 @@ import {
   useWindowDimensions,
   Platform,
   ActivityIndicator,
+  AppState,
   Modal,
 } from 'react-native';
 import { Picker } from '@react-native-picker/picker';
@@ -30,6 +31,9 @@ import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
 import CameraEvidencia from './CameraEvidencia';
 import { registrarErrorFoto } from '../lib/photoDiagnostics';
+import { setEdicionActiva } from '../lib/edicionActiva';
+import { photoSizeBucket, recordEvent } from '../lib/telemetry';
+import { liberarFotoEnProceso, marcarFotoEnProceso } from '../lib/upload';
 
 const DEVICE_INFO = `react-native-${Platform.OS}`;
 const GPS_TIMEOUT_MS = 15000;
@@ -47,6 +51,30 @@ const formDebug = (...args) => {
   }
 };
 const esFotoLocal = (value) => typeof value === 'string' && /^file:\/\//i.test(value);
+const textoSeguro = (value) => (typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value));
+
+// Normaliza un borrador restaurado para que nunca rompa render/validación:
+// todo texto se coerce a string y las fotos a string|null. No cambia reglas.
+const normalizarCamposBorrador = (campos = {}) => {
+  const base = campos && typeof campos === 'object' ? campos : {};
+  return {
+    ...base,
+    nombres_cliente: textoSeguro(base.nombres_cliente),
+    apellidos_cliente: textoSeguro(base.apellidos_cliente),
+    ci_cliente: textoSeguro(base.ci_cliente),
+    telefono_cliente: textoSeguro(base.telefono_cliente),
+    email_cliente: textoSeguro(base.email_cliente),
+    rubro_comercio_otro: textoSeguro(base.rubro_comercio_otro),
+    descripcion_error: textoSeguro(base.descripcion_error),
+    tipo_error: textoSeguro(base.tipo_error),
+    tipo_activacion: textoSeguro(base.tipo_activacion),
+    tipo_grupo: textoSeguro(base.tipo_grupo),
+    ciudad_activacion: textoSeguro(base.ciudad_activacion),
+    zona_activacion: textoSeguro(base.zona_activacion),
+    foto_url: typeof base.foto_url === 'string' ? base.foto_url : '',
+    foto_cash_in: typeof base.foto_cash_in === 'string' ? base.foto_cash_in : '',
+  };
+};
 
 const validarFotoLocalDisponible = async (uri, label) => {
   if (!esFotoLocal(uri)) return null;
@@ -440,9 +468,16 @@ export default function FormularioActivacion({
   const borradorRestauracionIdRef = useRef(0);
   const borradorUsuariosListosRef = useRef({});
   const borradorFirmasInicioRef = useRef({});
+  const borradorPersistenciaErrorRef = useRef(null);
+  const borradorEscribiendoRef = useRef(false);
+  const borradorCoalescidoRef = useRef(null);
+  const borradorFirmaPersistidaRef = useRef(null);
+  const appStateRef = useRef(AppState.currentState);
   const formularioSesionRef = useRef(0);
   const usuarioFormularioIdRef = useRef(usuarioFormularioId);
   usuarioFormularioIdRef.current = usuarioFormularioId;
+  const usuarioActualIdRef = useRef(usuario?.id || null);
+  usuarioActualIdRef.current = usuario?.id || null;
   const [detectandoCiudad, setDetectandoCiudad] = useState(isConnected !== false);
   const { width, height } = useWindowDimensions();
   const guiaRubrosImageHeight = Math.max(150, Math.min((width - spacing.md * 4) / 1.5, height * 0.38));
@@ -479,15 +514,69 @@ export default function FormularioActivacion({
 
   const encolarBorrador = useCallback((snapshot, generacion = borradorGeneracionRef.current, forzar = false) => {
     if (!snapshot?.usuario_id) return borradorColaRef.current;
+    // Coalescencia: si ya hay una escritura en vuelo, conserva solo el
+    // snapshot más nuevo en lugar de encolar indefinidamente.
+    if (borradorEscribiendoRef.current && !forzar) {
+      borradorCoalescidoRef.current = { snapshot, generacion };
+      return borradorColaRef.current;
+    }
     const key = borradorKey(snapshot.usuario_id);
     borradorColaRef.current = borradorColaRef.current
       .catch(() => {})
       .then(async () => {
         if (!forzar && (generacion !== borradorGeneracionRef.current || borradorBloqueadoRef.current)) return;
-        await secureLocalStorage.setItem(key, JSON.stringify(snapshot));
+        let actual = snapshot;
+        let genActual = generacion;
+        // Si llegó un snapshot más nuevo mientras se esperaba turno, usarlo.
+        const coalescidoPrevio = borradorCoalescidoRef.current;
+        if (coalescidoPrevio && !forzar) {
+          actual = coalescidoPrevio.snapshot;
+          genActual = coalescidoPrevio.generacion;
+          borradorCoalescidoRef.current = null;
+        }
+        if (!forzar && genActual !== borradorGeneracionRef.current) return;
+        // No persistir si la firma no cambió respecto a lo ya guardado.
+        try {
+          const firma = firmaSnapshotBorrador(actual);
+          if (!forzar && firma === borradorFirmaPersistidaRef.current) return;
+          borradorEscribiendoRef.current = true;
+          await secureLocalStorage.setItem(key, JSON.stringify(actual));
+          borradorFirmaPersistidaRef.current = firma;
+          borradorPersistenciaErrorRef.current = null;
+          recordEvent('draft_write_ok', { app_state: 'active', phase: 'draft' }).catch(() => {});
+        } catch (error) {
+          borradorPersistenciaErrorRef.current = error;
+          recordEvent('draft_write_error', { app_state: 'active', phase: 'draft', error_category: 'draft_write' }).catch(() => {});
+        } finally {
+          borradorEscribiendoRef.current = false;
+        }
       });
     return borradorColaRef.current;
-  }, []);
+  }, [firmaSnapshotBorrador]);
+
+  const flushBorradorActual = useCallback(() => {
+    const propietarioId = usuarioFormularioIdRef.current;
+    if (
+      !propietarioId
+      || propietarioId !== usuarioActualIdRef.current
+      || borradorBloqueadoRef.current
+    ) return borradorColaRef.current;
+
+    const snapshot = borradoresUltimosRef.current[propietarioId];
+    if (!snapshot || snapshot.usuario_id !== propietarioId) return borradorColaRef.current;
+    const firmaInicial = borradorFirmasInicioRef.current[propietarioId];
+    const tieneCambios = firmaSnapshotBorrador(snapshot) !== firmaInicial;
+    if (
+      (restaurandoBorradorRef.current || !borradorUsuariosListosRef.current[propietarioId])
+      && !tieneCambios
+    ) return borradorColaRef.current;
+    if (borradorTimerRef.current) {
+      globalThis.clearTimeout(borradorTimerRef.current);
+      borradorTimerRef.current = null;
+    }
+    borradorPendienteRef.current = null;
+    return encolarBorrador(snapshot, borradorGeneracionRef.current);
+  }, [encolarBorrador, firmaSnapshotBorrador]);
 
   const eliminarBorrador = useCallback(async (propietarioId) => {
     const key = borradorKey(propietarioId);
@@ -496,6 +585,9 @@ export default function FormularioActivacion({
     borradorBloqueadoRef.current = true;
     borradorFirmaBloqueadaRef.current = null;
     borradorBaselineListaRef.current = false;
+    borradorFirmaPersistidaRef.current = null;
+    borradorCoalescidoRef.current = null;
+    borradorEscribiendoRef.current = false;
     borradorPendienteRef.current = null;
     if (borradorTimerRef.current) {
       globalThis.clearTimeout(borradorTimerRef.current);
@@ -577,11 +669,38 @@ export default function FormularioActivacion({
   );
   if (usuarioIdBorrador) borradoresUltimosRef.current[usuarioIdBorrador] = snapshotBorradorActual;
 
+  // Señal de edición activa (boolean barato, sin persistencia por tecla).
+  useEffect(() => {
+    if (activacionGuardada || !usuarioIdBorrador) {
+      setEdicionActiva(false);
+      return;
+    }
+    const firmaInicial = borradorFirmasInicioRef.current[usuarioIdBorrador];
+    const firmaActual = firmaSnapshotBorrador(snapshotBorradorActual);
+    const hayEdicion = (firmaInicial && firmaActual !== firmaInicial) || !!fotoPrincipal || !!fotoCashIn;
+    setEdicionActiva(hayEdicion === true);
+    if (hayEdicion) {
+      recordEvent('form_edit', { app_state: 'active', phase: 'form' }).catch(() => {});
+    }
+  }, [activacionGuardada, firmaSnapshotBorrador, fotoCashIn, fotoPrincipal, snapshotBorradorActual, usuarioIdBorrador]);
+
   useEffect(() => () => {
     mountedRef.current = false;
     gpsSolicitudRef.current = null;
+    setEdicionActiva(false);
     if (borradorTimerRef.current) globalThis.clearTimeout(borradorTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextState;
+      if (previousState === 'active' && (nextState === 'background' || nextState === 'inactive')) {
+        flushBorradorActual();
+      }
+    });
+    return () => sub.remove();
+  }, [flushBorradorActual]);
 
   useEffect(() => {
     const nuevoUsuarioId = usuario?.id || null;
@@ -692,11 +811,12 @@ export default function FormularioActivacion({
         if (cancelado || !mountedRef.current || restauracionId !== borradorRestauracionIdRef.current) return;
         if (firmaSnapshotBorrador(borradoresUltimosRef.current[usuarioId]) !== firmaInicial) return;
         fotosPersistentesRef.current = fotosPersistentes;
+        const camposNormalizados = normalizarCamposBorrador(borrador.campos);
         setFormulario({
           ...formularioInicial,
-          ...borrador.campos,
-          foto_url: principal ? borrador.campos.foto_url : '',
-          foto_cash_in: cashIn ? borrador.campos.foto_cash_in : '',
+          ...camposNormalizados,
+          foto_url: principal ? camposNormalizados.foto_url : '',
+          foto_cash_in: cashIn ? camposNormalizados.foto_cash_in : '',
         });
         setFotoPrincipal(principal);
         setFotoCashIn(cashIn);
@@ -1062,7 +1182,10 @@ export default function FormularioActivacion({
       }
 
       // Persistimos la foto en documentDirectory para que no se pierda antes de sincronizar.
+      marcarFotoEnProceso(uri);
+      recordEvent('photo_process_start', { app_state: 'active', phase: 'photo', photo_size_bucket: photoSizeBucket(sizeMB * 1024 * 1024) }).catch(() => {});
       const destino = await prepararImagenPersistente(uri, fieldName);
+      marcarFotoEnProceso(destino);
       if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
         await FileSystem.deleteAsync(destino, { idempotent: true }).catch(() => {});
         return;
@@ -1076,12 +1199,16 @@ export default function FormularioActivacion({
       fotosPersistentesRef.current[fieldName] = destino;
       setter(destino);
       actualizarCampo(fieldName, destino);
+      liberarFotoEnProceso(destino);
+      recordEvent('photo_process_ok', { app_state: 'active', phase: 'photo' }).catch(() => {});
 
     } catch (error) {
       console.error('❌ Error al tomar o subir imagen:', error);
       const code = error?.photoCode || await registrarErrorFoto('persist', error);
+      recordEvent('photo_process_error', { app_state: 'active', phase: 'photo', error_category: 'photo_process' }).catch(() => {});
       Alert.alert('Error al procesar foto', `No se pudo procesar la imagen. (${code})`);
     } finally {
+      liberarFotoEnProceso(uri);
       await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
     }
   };
@@ -1243,14 +1370,14 @@ export default function FormularioActivacion({
     if (!impulsadorActual) return 'No se pudo obtener el nombre del activador.';
 
     if (!esTranseunte) {
-      if (!data.nombres_cliente.trim()) return 'Ingresa los nombres del cliente.';
-      if (!data.apellidos_cliente.trim()) return 'Ingresa los apellidos del cliente.';
+      if (!textoSeguro(data.nombres_cliente).trim()) return 'Ingresa los nombres del cliente.';
+      if (!textoSeguro(data.apellidos_cliente).trim()) return 'Ingresa los apellidos del cliente.';
       if (!/^\d{7,9}$/.test(carnetNormalizado)) return 'La cédula debe tener 7 a 9 números.';
       if (!/^\d{8}$/.test(telefonoNormalizado)) return 'El teléfono debe tener exactamente 8 números.';
       if (telefonoNormalizado && telefonoNormalizado === carnetNormalizado) {
         return 'El número de teléfono no puede ser igual al carnet';
       }
-      if (data.email_cliente && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email_cliente)) return 'El correo no parece válido.';
+      if (textoSeguro(data.email_cliente) && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(textoSeguro(data.email_cliente))) return 'El correo no parece válido.';
     }
 
     if (requiereTiendaBarrio && !data.tamano_tienda) {
@@ -1259,10 +1386,10 @@ export default function FormularioActivacion({
     // Nota: `tipo_tienda` se mantiene en el estado para compatibilidad,
     // pero la UI ya usa `tamano_tienda` como campo único de tamaño.
     if (requiereComercioGeneral && !data.rubro_comercio) return 'Selecciona el rubro del comercio.';
-    if (requiereComercioGeneral && data.rubro_comercio === 'Otro' && !data.rubro_comercio_otro.trim()) return 'Especifica el otro rubro del comercio.';
+    if (requiereComercioGeneral && data.rubro_comercio === 'Otro' && !textoSeguro(data.rubro_comercio_otro).trim()) return 'Especifica el otro rubro del comercio.';
     if (requiereComercioGeneral && data.comercio_fuera_mercado === null) return 'Indica si el comercio está fuera del mercado.';
     if (data.hubo_error && !data.tipo_error) return 'Selecciona el tipo de error.';
-    if (data.hubo_error && data.tipo_error === 'Otro' && !data.descripcion_error.trim()) return 'Describe el error.';
+    if (data.hubo_error && data.tipo_error === 'Otro' && !textoSeguro(data.descripcion_error).trim()) return 'Describe el error.';
     if (data.es_plaza_temporal && !plazasTemporales.some((item) => item?.nombre === data.plaza_temporal)) return 'La plaza temporal seleccionada no está autorizada.';
 
     if (!data.fecha_activacion) {
@@ -1482,8 +1609,10 @@ export default function FormularioActivacion({
           : formularioConBasicos.ciudad_activacion,
       };
       // Guardado correcto: el borrador ya no se necesita.
+      // eliminarBorrador solo se ejecuta si guardarFormularioLocal no lanzó.
       formularioSesionRef.current += 1;
       gpsSolicitudRef.current = null;
+      setEdicionActiva(false);
       await eliminarBorrador(datosFormulario.usuario_id);
       const mensajePendiente = 'Activación guardada. Sincronización pendiente.';
       setEstadoGuardado(mensajePendiente);
@@ -2075,20 +2204,6 @@ const styles = StyleSheet.create({
     borderColor: colors.inputBorder,
     minHeight: 48,
   },
-  gpsCityBox: {
-    marginBottom: spacing.sm,
-    borderWidth: 1,
-    borderColor: colors.cardBorder,
-    borderRadius: radius.md,
-    backgroundColor: colors.surfaceAlt,
-    padding: spacing.sm,
-  },
-  gpsCityText: {
-    color: colors.text,
-    fontSize: fontSizes.small,
-    fontWeight: '600',
-    marginBottom: spacing.xs,
-  },
   gpsButton: {
     backgroundColor: colors.primary,
     borderRadius: radius.md,
@@ -2135,16 +2250,6 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: fontSizes.small,
     fontWeight: '600',
-  },
-  helperRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: radius.md,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.sm,
-    marginBottom: spacing.xs,
   },
   helperLabel: {
     color: colors.textMuted,
@@ -2201,9 +2306,6 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     minWidth: 130,
   },
-  botonSecundario: {
-    marginLeft: spacing.sm,
-  },
   botonBorrar: {
     marginLeft: spacing.sm,
     borderWidth: 1,
@@ -2221,14 +2323,6 @@ const styles = StyleSheet.create({
     fontSize: fontSizes.medium,
     fontWeight: '700',
     textAlign: 'center',
-  },
-  imagenMiniatura: {
-    width: '100%',
-    height: 180,
-    borderRadius: radius.md,
-    marginTop: spacing.sm,
-    borderWidth: 1,
-    borderColor: colors.cardBorder,
   },
   statusSummary: {
     flexDirection: 'row',

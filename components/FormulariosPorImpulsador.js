@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   View, Text, FlatList, ActivityIndicator, StyleSheet, RefreshControl, Alert,
-  Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
+  AppState, Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
 } from 'react-native';
+import NetInfo from '@react-native-community/netinfo';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../lib/supabase';
@@ -37,6 +38,23 @@ const esRolAdministrador = (value) => {
     (item) => rol === item || rol.startsWith(`${item}_`),
   );
 };
+const rolesDeUsuario = (usuario) => (
+  [usuario?.rol, usuario?.role, ...(Array.isArray(usuario?.roles) ? usuario.roles : [])]
+    .map((rol) => (typeof rol === 'string' ? rol : rol?.rol || rol?.role))
+    .filter(Boolean)
+);
+const combinarRemotosSinDuplicados = (anteriores = [], nuevos = []) => {
+  const resultado = [];
+  const ids = new Set();
+  [...anteriores, ...nuevos].forEach((item) => {
+    const id = String(item?.id || item?._id_local || '');
+    if (id && ids.has(id)) return;
+    if (id) ids.add(id);
+    resultado.push(item);
+  });
+  return resultado;
+};
+const claveFormulario = (item) => String(item?.id || item?._id_local || '');
 
 const resolverFotoDetalle = async (value) => {
   if (!value) return { uri: '', perdida: false };
@@ -49,13 +67,16 @@ const resolverFotoDetalle = async (value) => {
 };
 
 export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
+  const usuarioId = usuario?.id;
   const [formulariosRemotos, setFormulariosRemotos] = useState([]);
   const [formulariosLocales, setFormulariosLocales] = useState([]);
+  const [historialOwnerId, setHistorialOwnerId] = useState(usuarioId || null);
   const [cargando, setCargando] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [lastError, setLastError] = useState(null);
+  const [cargaRemotaCompletada, setCargaRemotaCompletada] = useState(false);
 
   // Detalle
   const [detalleVisible, setDetalleVisible] = useState(false);
@@ -70,25 +91,44 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
   const pageRef = useRef(0);
   const channelRef = useRef(null);
   const galeriaOperacionRef = useRef(null);
+  const requestIdRef = useRef(0);
+  const localRequestIdRef = useRef(0);
+  const refreshEnCursoRef = useRef(null);
+  const refreshOwnerRef = useRef(null);
+  const refreshPendienteRef = useRef(false);
+  const appStateRef = useRef(AppState.currentState);
+  const conexionDisponibleRef = useRef(null);
+  const mountedRef = useRef(true);
+  const ownerActualRef = useRef(usuarioId || null);
+  const localesActualesRef = useRef({ ownerId: usuarioId || null, rows: [] });
+  const localesAusentesConfirmacionesRef = useRef(new Map());
+  ownerActualRef.current = usuarioId || null;
   const hoyLocal = fechaLocalIso(new Date());
   const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
 
-  const usuarioId = usuario?.id;
   const usuarioNombre = normalizarNombreVisible(usuario?.nombre || '');
-  const administrador = esRolAdministrador(usuario?.rol || usuario?.role);
+  const administrador = rolesDeUsuario(usuario).some(esRolAdministrador);
   const { height } = useWindowDimensions();
   const modalMaxHeight = Math.min(height * 0.85, 640);
   const fotoHeight = Math.min(height * 0.35, 260);
 
   const cargarLocales = useCallback(async () => {
     if (!usuarioId) return;
+    const ownerId = usuarioId;
+    const requestId = ++localRequestIdRef.current;
     try {
       const locales = await obtenerFormulariosLocales();
-      const filtrados = (locales || []).filter((f) => f?.usuario_id === usuarioId);
-      setFormulariosLocales(filtrados);
+      if (
+        !mountedRef.current
+        || ownerActualRef.current !== ownerId
+        || requestId !== localRequestIdRef.current
+      ) return;
+      const filtrados = (locales || []).filter((f) => f?.usuario_id === ownerId);
+      localesActualesRef.current = { ownerId, rows: filtrados };
+      setFormulariosLocales((prev) => combinarRemotosSinDuplicados(filtrados, prev));
     } catch (err) {
       console.warn('⚠️ No se pudieron cargar formularios locales:', err?.message || err);
-      setFormulariosLocales([]);
+      // Un fallo transitorio no reemplaza pendientes válidos ya visibles.
     }
   }, [usuarioId]);
 
@@ -114,8 +154,10 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     });
   }, [administrador, formulariosLocales, formulariosRemotos, rangoQuincena]);
 
-  const fetchPage = useCallback(async ({ reset = false } = {}) => {
-    if (!usuarioId) return;
+  const fetchPage = useCallback(async ({ reset = false, silent = false } = {}) => {
+    if (!usuarioId || ownerActualRef.current !== usuarioId) return;
+    const ownerId = usuarioId;
+    const requestId = ++requestIdRef.current;
 
     try {
       setLastError(null);
@@ -133,7 +175,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       let query = supabase
           .from('activaciones')
           .select('*')
-          .eq('usuario_id', usuarioId)
+          .eq('usuario_id', ownerId)
           .order('fecha_activacion', { ascending: false })
           .range(from, Math.max(from, to));
       if (!administrador) {
@@ -150,10 +192,9 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
       if (error) {
         console.error('❌ Supabase select error:', error);
+        if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
         setLastError(error.message || String(error));
-        if (reset) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron cargar los formularios.\n${error.message || ''}`, usuario));
-        if (reset) setFormulariosRemotos([]);
-        setHasMore(false);
+        if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${error.message || ''}`, usuario));
         return;
       }
 
@@ -181,30 +222,105 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         }
       }
 
-      setFormulariosRemotos(prev => (reset ? rows : [...prev, ...rows]));
+      if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
+      setFormulariosRemotos((prev) => (reset ? combinarRemotosSinDuplicados([], rows) : combinarRemotosSinDuplicados(prev, rows)));
+      if (reset && localesActualesRef.current.ownerId === ownerId) {
+        const localesActuales = localesActualesRef.current.rows;
+        const idsActuales = new Set(localesActuales.map(claveFormulario).filter(Boolean));
+        const idsRemotos = new Set(rows.map(claveFormulario).filter(Boolean));
+        setFormulariosLocales((prev) => {
+          const retenidos = prev.filter((item) => {
+            const id = claveFormulario(item);
+            if (!id || idsActuales.has(id) || idsRemotos.has(id)) {
+              if (id) localesAusentesConfirmacionesRef.current.delete(id);
+              return false;
+            }
+            const confirmaciones = localesAusentesConfirmacionesRef.current.get(id) || 0;
+            localesAusentesConfirmacionesRef.current.set(id, confirmaciones + 1);
+            return confirmaciones === 0;
+          });
+          return combinarRemotosSinDuplicados(localesActuales, retenidos);
+        });
+      }
+      setCargaRemotaCompletada(true);
 
       const noMore = !rows || rows.length < PAGE_SIZE;
       setHasMore(!noMore);
       if (!noMore) pageRef.current += 1;
     } catch (err) {
       console.error('❌ FetchPage error:', err);
+      if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
       setLastError(err?.message || String(err));
-      if (reset) setFormulariosRemotos([]);
-      setHasMore(false);
-      if (reset) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron cargar los formularios.\n${err?.message || ''}`, usuario));
+      if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${err?.message || ''}`, usuario));
     } finally {
+      if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
       setCargando(false);
       setRefreshing(false);
       setLoadingMore(false);
     }
   }, [administrador, rangoQuincena, usuario, usuarioId, usuarioNombre]);
 
+  const refrescarHistorial = useCallback(({ silent = true } = {}) => {
+    const ownerId = usuarioId;
+    if (!ownerId || ownerActualRef.current !== ownerId) return Promise.resolve();
+    if (refreshEnCursoRef.current && refreshOwnerRef.current === ownerId) {
+      refreshPendienteRef.current = true;
+      return refreshEnCursoRef.current;
+    }
+
+    const run = cargarLocales().then(() => {
+      if (ownerActualRef.current !== ownerId) return;
+      return fetchPage({ reset: true, silent });
+    });
+    const tracked = run.finally(() => {
+      if (refreshEnCursoRef.current !== tracked || refreshOwnerRef.current !== ownerId) return;
+      refreshEnCursoRef.current = null;
+      refreshOwnerRef.current = null;
+      if (refreshPendienteRef.current && mountedRef.current && ownerActualRef.current === ownerId) {
+        refreshPendienteRef.current = false;
+        globalThis.setTimeout(() => refrescarHistorial({ silent: true }), 0);
+      }
+    });
+    refreshEnCursoRef.current = tracked;
+    refreshOwnerRef.current = ownerId;
+    return tracked;
+  }, [cargarLocales, fetchPage, usuarioId]);
+
+  useEffect(() => {
+    requestIdRef.current += 1;
+    localRequestIdRef.current += 1;
+    refreshEnCursoRef.current = null;
+    refreshOwnerRef.current = null;
+    refreshPendienteRef.current = false;
+    if (galeriaOperacionRef.current) galeriaOperacionRef.current.invalidada = true;
+    galeriaOperacionRef.current = null;
+    localesActualesRef.current = { ownerId: usuarioId || null, rows: [] };
+    localesAusentesConfirmacionesRef.current.clear();
+    pageRef.current = 0;
+    setFormulariosRemotos([]);
+    setFormulariosLocales([]);
+    setLastError(null);
+    setCargaRemotaCompletada(false);
+    setCargando(Boolean(usuarioId));
+    setHasMore(true);
+    setLoadingMore(false);
+    setRefreshing(false);
+    setDetalleVisible(false);
+    setDetalle(null);
+    setDetalleLoading(false);
+    setDetalleFotoUrl('');
+    setDetalleFotoCashInUrl('');
+    setFotoDetalleActiva('activacion');
+    setFotosPerdidas({});
+    setCamaraReparacion(null);
+    setHistorialOwnerId(usuarioId || null);
+  }, [usuarioId]);
+
   useEffect(() => {
     if (usuarioId) {
-      cargarLocales();
-      fetchPage({ reset: true });
+      refrescarHistorial({ silent: false });
     }
-  }, [usuarioId, fetchPage, cargarLocales]);
+  }, [usuarioId, refrescarHistorial]);
 
   // Realtime por usuario
   useEffect(() => {
@@ -221,8 +337,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'activaciones', filter: `usuario_id=eq.${usuarioId}` },
         () => {
-          cargarLocales();
-          fetchPage({ reset: true });
+          refrescarHistorial({ silent: true });
         }
       )
       .subscribe();
@@ -235,16 +350,47 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         channelRef.current = null;
       }
     };
-  }, [usuarioId, fetchPage, cargarLocales]);
+  }, [usuarioId, refrescarHistorial]);
+
+  useEffect(() => {
+    const appStateSub = AppState.addEventListener('change', (nextState) => {
+      const previousState = appStateRef.current;
+      appStateRef.current = nextState;
+      if (previousState !== 'active' && nextState === 'active') {
+        refrescarHistorial({ silent: true });
+      }
+    });
+    const netInfoSub = NetInfo.addEventListener((state) => {
+      const disponible = !!state?.isConnected && state?.isInternetReachable !== false;
+      const anterior = conexionDisponibleRef.current;
+      conexionDisponibleRef.current = disponible;
+      if (anterior === false && disponible) refrescarHistorial({ silent: true });
+    });
+    return () => {
+      appStateSub.remove();
+      netInfoSub();
+    };
+  }, [refrescarHistorial]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestIdRef.current += 1;
+      localRequestIdRef.current += 1;
+      refreshEnCursoRef.current = null;
+      refreshOwnerRef.current = null;
+      refreshPendienteRef.current = false;
+    };
+  }, []);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    cargarLocales();
-    fetchPage({ reset: true });
-  }, [fetchPage, cargarLocales]);
+    refrescarHistorial({ silent: true });
+  }, [refrescarHistorial]);
 
   const onEndReached = useCallback(() => {
-    if (!loadingMore && hasMore && !cargando) {
+    if (!refreshEnCursoRef.current && !loadingMore && hasMore && !cargando) {
       fetchPage({ reset: false });
     }
   }, [loadingMore, hasMore, cargando, fetchPage]);
@@ -537,7 +683,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     );
   };
 
-  if (!usuarioId) {
+  if (!usuarioId || historialOwnerId !== usuarioId) {
     return (
       <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
         <ActivityIndicator size="large" color={colors.primary} />
@@ -555,30 +701,44 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
       {cargando && formularios.length === 0 ? (
         <ActivityIndicator size="large" color={colors.primary} />
+      ) : formularios.length === 0 && lastError && !cargaRemotaCompletada ? (
+        <View style={styles.historyErrorBox}>
+          <Text style={styles.emptyText}>No se pudo cargar el historial.</Text>
+          <TouchableOpacity style={styles.historyRetryButton} onPress={onRefresh}>
+            <Text style={styles.historyRetryText}>Reintentar</Text>
+          </TouchableOpacity>
+        </View>
       ) : formularios.length === 0 ? (
         <View>
           <Text style={styles.emptyText}>No hay formularios registrados.</Text>
-          {lastError ? <Text style={[styles.emptyText, { marginTop: 6 }]}>⚠️ {enmascararMarcaVisible(lastError, usuario)}</Text> : null}
+          {lastError ? (
+            <Text style={styles.historyWarning}>No se pudo actualizar el historial.</Text>
+          ) : null}
         </View>
       ) : (
-        <FlatList
-          data={formularios}
-          keyExtractor={(item) => String(item.id || item._id_local)}
-          renderItem={renderItem}
-          contentContainerStyle={{ paddingBottom: 100 }}
-          onEndReached={onEndReached}
-          onEndReachedThreshold={0.3}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />
-          }
-          ListFooterComponent={
-            loadingMore ? (
-              <View style={{ paddingVertical: spacing.md }}>
-                <ActivityIndicator size="small" color={colors.primary} />
-              </View>
-            ) : null
-          }
-        />
+        <>
+          {lastError ? (
+            <Text style={styles.historyWarning}>No se pudo actualizar. Mostrando los últimos datos disponibles.</Text>
+          ) : null}
+          <FlatList
+            data={formularios}
+            keyExtractor={(item) => String(item.id || item._id_local)}
+            renderItem={renderItem}
+            contentContainerStyle={{ paddingBottom: 100 }}
+            onEndReached={onEndReached}
+            onEndReachedThreshold={0.3}
+            refreshControl={
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />
+            }
+            ListFooterComponent={
+              loadingMore ? (
+                <View style={{ paddingVertical: spacing.md }}>
+                  <ActivityIndicator size="small" color={colors.primary} />
+                </View>
+              ) : null
+            }
+          />
+        </>
       )}
 
       {/* Modal de Detalle */}
@@ -837,6 +997,26 @@ const styles = StyleSheet.create({
   emptyText: {
     color: colors.textMuted,
     fontSize: fontSizes.medium,
+  },
+  historyErrorBox: {
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  historyRetryButton: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.sm,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+  },
+  historyRetryText: {
+    color: colors.headerText,
+    fontSize: fontSizes.small,
+    fontWeight: '700',
+  },
+  historyWarning: {
+    color: colors.warning,
+    fontSize: fontSizes.small,
+    marginBottom: spacing.sm,
   },
 
   // Modal

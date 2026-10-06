@@ -11,45 +11,21 @@ const CAMERA_READY_TIMEOUT_MS = 10000;
 const CAPTURE_TIMEOUT_MS = 25000;
 const FILE_CLEANUP_TIMEOUT_MS = 10000;
 
-const parsePictureSize = (value) => {
-  const match = /^(\d+)x(\d+)$/i.exec(String(value || '').trim());
-  if (!match) return null;
-  const width = Number(match[1]);
-  const height = Number(match[2]);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
-  return { value, width, height, maxDimension: Math.max(width, height), pixels: width * height };
-};
-
-const seleccionarPictureSize = (sizes = []) => {
-  const disponibles = sizes
-    .map(parsePictureSize)
-    .filter((size) => size && size.pixels <= 12000000);
-  const preferidos = disponibles
-    .filter((size) => size.maxDimension >= 1280 && size.maxDimension <= 1920)
-    .sort((a, b) => b.maxDimension - a.maxDimension || b.pixels - a.pixels);
-  if (preferidos.length) return preferidos[0].value;
-
-  return disponibles.sort((a, b) => a.pixels - b.pixels)[0]?.value || null;
-};
-
 export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   const cameraRef = useRef(null);
   const capturandoRef = useRef(false);
   const capturaOperacionRef = useRef(null);
-  const consultandoTamanosRef = useRef(null);
   const procesandoRef = useRef(false);
   const mountedRef = useRef(true);
   const sessionRef = useRef(0);
-  const cameraAttemptRef = useRef(0);
-  const esperandoReinicioRef = useRef(false);
+  const cameraInstanceRef = useRef(0);
+  const inicioAutomaticoRef = useRef(false);
   const permisoSolicitadoRef = useRef(false);
   const permisoReportadoRef = useRef(false);
   const [permission, requestPermission] = useCameraPermissions();
   const [modalShown, setModalShown] = useState(false);
-  const [cameraAttempt, setCameraAttempt] = useState(null);
-  const [cameraPhase, setCameraPhase] = useState('idle');
+  const [cameraInstance, setCameraInstance] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
-  const [pictureSize, setPictureSize] = useState(null);
   const [fotoCapturada, setFotoCapturada] = useState(null);
   const [capturando, setCapturando] = useState(false);
   const [capturaNativaPendiente, setCapturaNativaPendiente] = useState(false);
@@ -66,24 +42,21 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     return () => {
       mountedRef.current = false;
       sessionRef.current += 1;
-      cameraAttemptRef.current += 1;
+      cameraInstanceRef.current += 1;
     };
   }, []);
 
   useEffect(() => {
     sessionRef.current += 1;
-    cameraAttemptRef.current += 1;
+    cameraInstanceRef.current += 1;
     permisoSolicitadoRef.current = false;
     permisoReportadoRef.current = false;
-    esperandoReinicioRef.current = false;
-    consultandoTamanosRef.current = null;
+    inicioAutomaticoRef.current = false;
     cameraRef.current = null;
     setModalShown(false);
-    setCameraAttempt(null);
-    setCameraPhase('idle');
+    setCameraInstance(null);
     if (!visible) return;
     setCameraReady(false);
-    setPictureSize(null);
     setFotoCapturada(null);
     setCapturando(false);
     setCapturaNativaPendiente(Boolean(capturaOperacionRef.current));
@@ -99,17 +72,22 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   }, [modalShown, permission?.granted, visible]);
 
   useEffect(() => {
-    if (!visible || !modalShown || !permission?.granted || fotoCapturada || error || cameraAttempt !== null) return;
-    const attempt = cameraAttemptRef.current + 1;
-    cameraAttemptRef.current = attempt;
-    esperandoReinicioRef.current = false;
-    consultandoTamanosRef.current = null;
+    if (
+      !visible
+      || !modalShown
+      || !permission?.granted
+      || fotoCapturada
+      || error
+      || cameraInstance !== null
+      || inicioAutomaticoRef.current
+    ) return;
+    inicioAutomaticoRef.current = true;
+    const instance = cameraInstanceRef.current + 1;
+    cameraInstanceRef.current = instance;
     setCameraReady(false);
-    setPictureSize(null);
-    setCameraAttempt(attempt);
-    setCameraPhase('mounting');
+    setCameraInstance(instance);
     registrarHitoCamara('FOTO-CAMERA-MOUNTED');
-  }, [cameraAttempt, error, fotoCapturada, modalShown, permission?.granted, visible]);
+  }, [cameraInstance, error, fotoCapturada, modalShown, permission?.granted, visible]);
 
   useEffect(() => {
     if (!visible || !modalShown || permission) return undefined;
@@ -131,30 +109,25 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
       || !permission?.granted
       || cameraReady
       || fotoCapturada
-      || cameraAttempt === null
-      || !['mounting', 'restarting'].includes(cameraPhase)
+      || cameraInstance === null
     ) return undefined;
     const session = sessionRef.current;
-    const attempt = cameraAttempt;
+    const instance = cameraInstance;
     const timer = globalThis.setTimeout(() => {
-      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
+      if (!mountedRef.current || sessionRef.current !== session || cameraInstanceRef.current !== instance) return;
       const timeoutError = new Error('La cámara no informó que está lista dentro del tiempo permitido.');
       timeoutError.name = 'TimeoutError';
-      cameraAttemptRef.current += 1;
-      consultandoTamanosRef.current = null;
-      esperandoReinicioRef.current = false;
+      cameraInstanceRef.current += 1;
       cameraRef.current = null;
-      setCameraAttempt(null);
-      setCameraPhase('idle');
+      setCameraInstance(null);
       setCameraReady(false);
-      setPictureSize(null);
       setError('La cámara tardó demasiado en iniciar.');
       reportarError('camera_ready', timeoutError, 'La cámara tardó demasiado en iniciar.').then((message) => {
-        if (mountedRef.current && sessionRef.current === session && cameraAttemptRef.current === attempt + 1) setError(message);
+        if (mountedRef.current && sessionRef.current === session && cameraInstanceRef.current === instance + 1) setError(message);
       });
     }, CAMERA_READY_TIMEOUT_MS);
     return () => globalThis.clearTimeout(timer);
-  }, [cameraAttempt, cameraPhase, cameraReady, fotoCapturada, modalShown, permission?.granted, visible]);
+  }, [cameraInstance, cameraReady, fotoCapturada, modalShown, permission?.granted, visible]);
 
   const solicitarPermiso = async () => {
     const session = sessionRef.current;
@@ -186,90 +159,43 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     }
   }, [modalShown, permission, requestPermission, visible]);
 
-  const cargarTamanos = async (attempt) => {
+  const manejarCamaraLista = (instance) => {
     if (
-      attempt !== cameraAttemptRef.current
-      || cameraAttempt !== attempt
+      instance !== cameraInstanceRef.current
+      || cameraInstance !== instance
       || procesandoRef.current
       || cameraReady
     ) return;
-    const session = sessionRef.current;
-    if (pictureSize && esperandoReinicioRef.current) {
-      esperandoReinicioRef.current = false;
-      setCameraPhase('ready');
-      setCameraReady(true);
-      return;
-    }
-
-    if (pictureSize || consultandoTamanosRef.current !== null) return;
+    setCameraReady(true);
     registrarHitoCamara('FOTO-CAMERA-READY');
-    consultandoTamanosRef.current = attempt;
-    setCameraPhase('sizes');
-    try {
-      const sizes = await withTimeout(
-        cameraRef.current?.getAvailablePictureSizesAsync(),
-        CAMERA_READY_TIMEOUT_MS,
-        'La cámara tardó demasiado en informar sus resoluciones.'
-      );
-      const seleccion = seleccionarPictureSize(Array.isArray(sizes) ? sizes : []);
-      if (!seleccion) {
-        throw new Error('La cámara no informó una resolución segura de 12 MP o menos.');
-      }
-      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
-      esperandoReinicioRef.current = true;
-      setPictureSize(seleccion);
-      setCameraPhase('restarting');
-      registrarHitoCamara('FOTO-CAMERA-SIZES-LOADED');
-    } catch (cameraError) {
-      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt) return;
-      cameraAttemptRef.current += 1;
-      cameraRef.current = null;
-      setCameraAttempt(null);
-      setCameraPhase('idle');
-      setCameraReady(false);
-      setPictureSize(null);
-      esperandoReinicioRef.current = false;
-      setError('No se pudo preparar la cámara.');
-      const message = await reportarError('camera_ready', cameraError, 'No se pudo preparar la cámara.');
-      if (!mountedRef.current || sessionRef.current !== session || cameraAttemptRef.current !== attempt + 1) return;
-      setError(message);
-    } finally {
-      if (consultandoTamanosRef.current === attempt) consultandoTamanosRef.current = null;
-    }
   };
 
   const reintentarCamara = () => {
-    cameraAttemptRef.current += 1;
+    const instance = cameraInstanceRef.current + 1;
+    cameraInstanceRef.current = instance;
     cameraRef.current = null;
-    consultandoTamanosRef.current = null;
-    esperandoReinicioRef.current = false;
-    setCameraAttempt(null);
-    setCameraPhase('idle');
     setCameraReady(false);
-    setPictureSize(null);
     setError('');
+    setCameraInstance(instance);
+    registrarHitoCamara('FOTO-CAMERA-MOUNTED');
   };
 
-  const manejarErrorMontaje = async (attempt, event) => {
-    if (attempt !== cameraAttemptRef.current || cameraAttempt !== attempt) return;
+  const manejarErrorMontaje = async (instance, event) => {
+    if (instance !== cameraInstanceRef.current || cameraInstance !== instance) return;
     const session = sessionRef.current;
-    cameraAttemptRef.current += 1;
+    cameraInstanceRef.current += 1;
     cameraRef.current = null;
-    consultandoTamanosRef.current = null;
-    esperandoReinicioRef.current = false;
-    setCameraAttempt(null);
-    setCameraPhase('idle');
+    setCameraInstance(null);
     setCameraReady(false);
-    setPictureSize(null);
     setError('No se pudo iniciar la cámara.');
     const message = await reportarError('camera_ready', event, 'No se pudo iniciar la cámara.');
-    if (mountedRef.current && sessionRef.current === session && cameraAttemptRef.current === attempt + 1) {
+    if (mountedRef.current && sessionRef.current === session && cameraInstanceRef.current === instance + 1) {
       setError(message);
     }
   };
 
   const tomarFoto = async () => {
-    if (!cameraReady || !pictureSize || capturandoRef.current || capturaOperacionRef.current || !cameraRef.current) return;
+    if (!cameraReady || capturandoRef.current || capturaOperacionRef.current || !cameraRef.current) return;
     capturandoRef.current = true;
     setCapturando(true);
     const session = sessionRef.current;
@@ -312,9 +238,9 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
         await FileSystem.deleteAsync(foto.uri, { idempotent: true }).catch(() => {});
         return;
       }
-      cameraAttemptRef.current += 1;
-      setCameraAttempt(null);
-      setCameraPhase('idle');
+      cameraInstanceRef.current += 1;
+      cameraRef.current = null;
+      setCameraInstance(null);
       setFotoCapturada(foto);
     } catch (cameraError) {
       operacion.invalidada = true;
@@ -362,12 +288,13 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     await limpiarCapturaTemporal();
     if (!mountedRef.current) return;
     setFotoCapturada(null);
-    cameraAttemptRef.current += 1;
-    setCameraAttempt(null);
-    setCameraPhase('idle');
+    const instance = cameraInstanceRef.current + 1;
+    cameraInstanceRef.current = instance;
+    cameraRef.current = null;
     setCameraReady(false);
-    setPictureSize(null);
     setError('');
+    setCameraInstance(instance);
+    registrarHitoCamara('FOTO-CAMERA-MOUNTED');
     procesandoRef.current = false;
     setProcesando(false);
   };
@@ -375,12 +302,9 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   const cancelar = async () => {
     if (procesandoRef.current) return;
     if (capturaOperacionRef.current) capturaOperacionRef.current.invalidada = true;
-    cameraAttemptRef.current += 1;
+    cameraInstanceRef.current += 1;
     cameraRef.current = null;
-    consultandoTamanosRef.current = null;
-    esperandoReinicioRef.current = false;
-    setCameraAttempt(null);
-    setCameraPhase('idle');
+    setCameraInstance(null);
     setModalShown(false);
     procesandoRef.current = true;
     if (mountedRef.current) setProcesando(true);
@@ -449,7 +373,7 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
               </TouchableOpacity>
             </View>
           </View>
-        ) : cameraAttempt === null ? (
+        ) : cameraInstance === null ? (
           <View style={styles.center}>
             {!error ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.error}>{error}</Text>}
             <Text style={styles.message}>{error ? 'La cámara no pudo iniciarse.' : 'Iniciando cámara...'}</Text>
@@ -465,14 +389,12 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
         ) : (
           <View style={styles.content}>
             <CameraView
-              key={`camera-${cameraAttempt}`}
               ref={cameraRef}
               style={styles.camera}
               facing="back"
               mode="picture"
-              pictureSize={pictureSize || undefined}
-              onCameraReady={() => cargarTamanos(cameraAttempt)}
-              onMountError={(event) => manejarErrorMontaje(cameraAttempt, event)}
+              onCameraReady={() => manejarCamaraLista(cameraInstance)}
+              onMountError={(event) => manejarErrorMontaje(cameraInstance, event)}
             />
             {!cameraReady ? (
               <View style={styles.initializingOverlay}>

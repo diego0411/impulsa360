@@ -35,6 +35,7 @@ import NotificacionesScreen from './components/NotificacionesScreen';
 import ControlActivadores from './components/ControlActivadores';
 import {
   obtenerFormulariosLocales,
+  obtenerFormularioPorId,
   eliminarFormularioLocal,
   actualizarFormularioLocal,
   marcarErrorSync,
@@ -43,8 +44,12 @@ import {
   ACTIVACIONES_BUCKET,
   asegurarFotoPendientePersistente,
   limpiarFotosPendientesHuerfanas,
-  subirImagenASupabase,
+  limpiarFotosHuerfanasSegura,
+  subirImagenExclusiva,
 } from './lib/upload';
+import { isEdicionActiva } from './lib/edicionActiva';
+import { flushTelemetry, initTelemetry, recordEvent, updateRunMarker } from './lib/telemetry';
+import { getPreviousExitReason, setExitSummary } from './lib/exitInfo';
 import {
   clearOfflinePin,
   hasOfflinePin,
@@ -58,9 +63,8 @@ const MIN_BRANDED_INTRO_MS = 3200;
 const SESSION_TIMEOUT_MS = 8000;
 const QUERY_TIMEOUT_MS = 10000;
 const SYNC_UPSERT_TIMEOUT_MS = 12000;
-const PHOTO_UPLOAD_TIMEOUT_MS = 45000;
-const SYNC_MAX_RETRIES = 3;
-const SYNC_RETRY_BACKOFF_MS = [2000, 5000, 10000];
+const SYNC_MAX_RETRIES = 2;
+const SYNC_RETRY_BACKOFF_MS = [2000, 5000];
 const APP_VERSION_CODE = String(
   Constants.nativeBuildVersion || Constants.expoConfig?.android?.versionCode || 'desconocida'
 );
@@ -266,6 +270,30 @@ const findHistoricalRemotePhoto = async ({ usuario, formulario, localId, recordI
 };
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
+// Capturador global mínimo de JS fatal: registra categoría y delega al
+// handler original sin cambiar comportamiento del runtime.
+try {
+  const errorUtils = globalThis?.ErrorUtils;
+  const previo = typeof errorUtils?.getGlobalHandler === 'function'
+    ? errorUtils.getGlobalHandler()
+    : null;
+  if (typeof errorUtils?.setGlobalHandler === 'function') {
+    errorUtils.setGlobalHandler((error, isFatal) => {
+      try {
+        const categoria = String(error?.name || 'Error').slice(0, 32);
+        recordEvent('error_boundary', { app_state: 'active', phase: isFatal ? 'js_fatal' : 'js_error', error_category: categoria }).catch(() => {});
+      } catch {
+        // nunca bloquear el handler original
+      }
+      if (typeof previo === 'function') {
+        previo(error, isFatal);
+      }
+    });
+  }
+} catch {
+  // Sin telemetría global si el runtime no lo permite.
+}
+
 class AppErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -279,6 +307,12 @@ class AppErrorBoundary extends React.Component {
   componentDidCatch(error, errorInfo) {
     if (typeof __DEV__ !== 'undefined' && __DEV__) {
       console.error('❌ Error en el arranque de la app:', error?.message || error, errorInfo);
+    }
+    try {
+      const nombre = String(error?.name || 'Error').slice(0, 32);
+      recordEvent('error_boundary', { app_state: 'active', phase: 'render', error_category: nombre }).catch(() => {});
+    } catch {
+      // telemetría nunca bloquea
     }
   }
 
@@ -310,8 +344,12 @@ function AppShell() {
   const [pinConfirm, setPinConfirm] = useState('');
   const [pinGuardando, setPinGuardando] = useState(false);
   const [sesionOnlineValida, setSesionOnlineValida] = useState(false);
+  const [isInternetReachable, setIsInternetReachable] = useState(null);
   const syncingRef = useRef(false);
   const lastSyncRef = useRef(0);
+  const syncGeneracionRef = useRef(0);
+  const syncDiferidoRef = useRef(false);
+  const lastLimpiezaRef = useRef(0);
   const splashHiddenRef = useRef(false);
   const validacionSesionRef = useRef(null);
   const revalidarSesionRef = useRef(false);
@@ -342,11 +380,18 @@ function AppShell() {
       }
       return { status: 'error', synced: 0, errors: ['Sesión requerida'] };
     }
-    if (!isConnected) {
+    const alcanceBloquea = isInternetReachable === false;
+    if (!isConnected || alcanceBloquea) {
       if (showAlerts) {
         Alert.alert('Sin conexión', 'Conéctate a internet para sincronizar.');
       }
       return { status: 'offline', synced: 0, errors: [] };
+    }
+    // No iniciar auto-sync pesado con edición activa no guardada. No cancela
+    // nada en curso; el guardado posterior o el siguiente foreground lo retoma.
+    if (!showAlerts && !force && isEdicionActiva()) {
+      syncDiferidoRef.current = true;
+      return { status: 'busy', synced: 0, errors: [] };
     }
     if (!sesionOnlineValida) {
       if (showAlerts) {
@@ -360,7 +405,15 @@ function AppShell() {
     lastSyncRef.current = now;
 
     syncingRef.current = true;
+    const generacionSync = syncGeneracionRef.current;
+    const ownerSync = usuario.id;
     syncDebug('inicio', { force, showAlerts });
+    recordEvent('sync_start', { app_state: 'active', phase: targetLocalId ? 'after_save' : 'auto', pending_count_bucket: undefined }).catch(() => {});
+    const syncVigente = () => (
+      syncGeneracionRef.current === generacionSync
+      && !logoutEnCursoRef.current
+      && usuarioRef.current?.id === ownerSync
+    );
     try {
       const todosFormularios = await obtenerFormulariosLocales();
       const pendientesLegacy = todosFormularios.filter((f) => !f?.usuario_id);
@@ -393,11 +446,13 @@ function AppShell() {
       });
       if (!formularios.length) {
         if (targetLocalId) {
+          // No confirmar como sincronizado un objetivo ausente: era P0 de
+          // falso éxito. Se reporta como pendiente para reintento visible.
           return {
-            status: 'synced',
-            synced: 1,
-            errors: [],
-            syncedLocalIds: [targetLocalId],
+            status: 'error',
+            synced: 0,
+            errors: ['Pendiente no encontrado localmente; se conserva para reintento.'],
+            syncedLocalIds: [],
             syncedRecordIds: [],
           };
         }
@@ -673,9 +728,14 @@ function AppShell() {
             try {
               const path = buildPhotoStoragePath(ownerId, recordId, key);
               let intentoFotoAt = photoAttemptAt;
-              const storagePath = await ejecutarConRetrySync(
-                async (attempt) => {
-                  intentoFotoAt = new Date().toISOString();
+              // UNA FOTO = UNA OPERACIÓN VIVA: se espera la resolución real
+              // de cada intento antes del siguiente; máximo 3 totales.
+              let storagePath = null;
+              let ultimoErrorFoto = null;
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                if (!syncVigente()) throw new Error('Sync invalidada por cambio de sesión.');
+                intentoFotoAt = new Date().toISOString();
+                if (syncVigente()) {
                   await actualizarEtapaFoto('FOTO-LOCAL-READ', 'running', {
                     error: null,
                     lastAttemptAt: intentoFotoAt,
@@ -683,44 +743,53 @@ function AppShell() {
                     lastAttemptField: key,
                     lastAttemptRetry: attempt,
                   });
-                  syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', {
-                    localId,
-                    recordId,
-                    path,
-                    attempt,
-                  });
-                  return withTimeout(
-                    subirImagenASupabase(uploadSourceUri, path, {
-                      onStage: (stage) => actualizarEtapaFoto(stage, 'running', {
-                        lastAttemptAt: intentoFotoAt,
-                        lastAttemptRetry: attempt,
-                      }),
-                    }),
-                    PHOTO_UPLOAD_TIMEOUT_MS,
-                    'La señal está muy débil para subir la foto. Se reintentará luego.'
-                  );
-                },
-                {
-                  onFailure: async (error, { attempt, willRetry }) => {
-                    const errorCode = error?.photoSyncCode || 'FOTO-STORAGE-NETWORK';
-                    const errorMsg = `No se pudo subir la foto (${key}): ${syncErrorMessage(error)}`;
-                    syncMetadata = {
-                      ...syncMetadata,
-                      status: 'pending',
-                      tries: Number(syncMetadata.tries || 0) + 1,
-                      error: errorMsg,
-                      lastAttemptAt: intentoFotoAt,
-                      lastAttemptVersionCode: APP_VERSION_CODE,
-                      lastAttemptStage: errorCode,
-                      lastAttemptCode: errorCode,
-                      lastAttemptResult: willRetry ? 'retrying' : 'error',
-                      lastAttemptField: key,
-                      lastAttemptRetry: attempt,
-                    };
-                    await actualizarFormularioLocal(localId, { _sync: syncMetadata });
-                  },
                 }
-              );
+                syncDebug(key === 'foto_cash_in' ? 'cash-in upload' : 'foto activacion upload', {
+                  localId,
+                  recordId,
+                  path,
+                  attempt,
+                });
+                recordEvent('sync_upload_start', { phase: 'upload', sync_stage: 'FOTO-STORAGE-NETWORK' }).catch(() => {});
+                try {
+                  storagePath = await subirImagenExclusiva(uploadSourceUri, path, {
+                    onStage: (stage) => actualizarEtapaFoto(stage, 'running', {
+                      lastAttemptAt: intentoFotoAt,
+                      lastAttemptRetry: attempt,
+                    }),
+                  });
+                  ultimoErrorFoto = null;
+                  recordEvent('sync_upload_ok', { phase: 'upload', sync_stage: 'FOTO-STORAGE-HTTP' }).catch(() => {});
+                  break;
+                } catch (error) {
+                  ultimoErrorFoto = error;
+                  recordEvent('sync_upload_error', { phase: 'upload', sync_stage: 'FOTO-STORAGE-NETWORK', error_category: 'photo_upload' }).catch(() => {});
+                  const transitorio = esErrorTransitorioSync(error);
+                  const puedeReintentar = transitorio && attempt < 3;
+                  const errorCode = error?.photoSyncCode || 'FOTO-STORAGE-NETWORK';
+                  const errorMsg = `No se pudo subir la foto (${key}): ${syncErrorMessage(error)}`;
+                  syncMetadata = {
+                    ...syncMetadata,
+                    status: 'pending',
+                    tries: Number(syncMetadata.tries || 0) + 1,
+                    error: errorMsg,
+                    lastAttemptAt: intentoFotoAt,
+                    lastAttemptVersionCode: APP_VERSION_CODE,
+                    lastAttemptStage: errorCode,
+                    lastAttemptCode: errorCode,
+                    lastAttemptResult: puedeReintentar ? 'retrying' : 'error',
+                    lastAttemptField: key,
+                    lastAttemptRetry: attempt,
+                  };
+                  if (syncVigente()) {
+                    await actualizarFormularioLocal(localId, { _sync: syncMetadata });
+                  }
+                  if (!puedeReintentar) break;
+                  if (!(await hayConexionParaRetry())) break;
+                  await esperarSyncRetry(SYNC_RETRY_BACKOFF_MS[attempt - 1] ?? 5000);
+                }
+              }
+              if (!storagePath && ultimoErrorFoto) throw ultimoErrorFoto;
               if (storagePath) {
                 formulario[key] = storagePath;
                 localPhotosForCleanup[key] = uploadSourceUri;
@@ -782,10 +851,16 @@ function AppShell() {
           estado_sync: 'online',
         };
 
+        // Guard de generación: nunca efectos destructivos tras logout/cambio.
+        if (!syncVigente()) {
+          errores.push(`ID local ${localId}: sync invalidada por cambio de sesión; se conserva pendiente.`);
+          continue;
+        }
         let upsertError = null;
         try {
           await ejecutarConRetrySync(
             async (attempt) => {
+              if (!syncVigente()) throw new Error('Sync invalidada por cambio de sesión.');
               const { error } = await withTimeout(
                 supabase.from('activaciones').upsert(datosConUsuario, { onConflict: 'id' }),
                 SYNC_UPSERT_TIMEOUT_MS,
@@ -796,6 +871,7 @@ function AppShell() {
             },
             {
               onFailure: async (error) => {
+                if (!syncVigente()) return;
                 const errorMsg = `Upsert activacion: ${syncErrorMessage(error)}`;
                 await marcarErrorSync(localId, errorMsg);
               },
@@ -806,6 +882,32 @@ function AppShell() {
         }
 
         if (!upsertError) {
+          if (!syncVigente()) {
+            errores.push(`ID local ${localId}: sesión cambió antes de confirmar; se conserva pendiente.`);
+            continue;
+          }
+          // Guard de reemplazo: si la foto cambió durante el upload, el
+          // resultado viejo NO puede borrar la foto nueva ni el pendiente.
+          const fotoFirmaSync = JSON.stringify({
+            foto_url: formulario.foto_url || null,
+            foto_cash_in: formulario.foto_cash_in || null,
+            localPhotos: localPhotosForCleanup,
+          });
+          const estadoActual = await obtenerFormularioPorId(localId).catch(() => null);
+          if (!estadoActual || estadoActual.usuario_id !== ownerSync) {
+            errores.push(`ID local ${localId}: owner cambió durante sync; se conserva pendiente.`);
+            continue;
+          }
+          const fotoFirmaActual = JSON.stringify({
+            foto_url: estadoActual.foto_url || null,
+            foto_cash_in: estadoActual.foto_cash_in || null,
+            localPhotos: estadoActual._sync?.localPhotos || {},
+          });
+          if (fotoFirmaActual !== fotoFirmaSync) {
+            await marcarErrorSync(localId, 'Foto actualizada durante la sincronización; se reintentará con la nueva evidencia.');
+            errores.push(`ID local ${localId}: foto reemplazada durante sync; se conserva para reintento.`);
+            continue;
+          }
           const cleanupUris = Object.values(localPhotosForCleanup)
             .filter((uri) => typeof uri === 'string' && /^file:\/\//i.test(uri));
           await Promise.all(cleanupUris.map((uri) => FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {})));
@@ -851,9 +953,26 @@ function AppShell() {
     } finally {
       contarFormulariosLocales();
       syncingRef.current = false;
+      recordEvent('sync_end', { app_state: 'active', phase: 'sync' }).catch(() => {});
+      flushTelemetry().catch(() => {});
+      // Limpieza bounded en momento seguro (post-sync, máx 1/hora).
+      try {
+        if (Date.now() - lastLimpiezaRef.current > 60 * 60 * 1000) {
+          lastLimpiezaRef.current = Date.now();
+          const pendientes = await obtenerFormulariosLocales().catch(() => []);
+          const refs = (Array.isArray(pendientes) ? pendientes : []).flatMap((item) => [
+            item?.foto_url,
+            item?.foto_cash_in,
+            ...Object.values(item?._sync?.localPhotos || {}),
+          ]);
+          limpiarFotosHuerfanasSegura({ referencedUris: refs }).catch(() => {});
+        }
+      } catch {
+        // best-effort
+      }
       syncDebug('lock liberado');
     }
-  }, [contarFormulariosLocales, isConnected, sesionOnlineValida, usuario]);
+  }, [contarFormulariosLocales, isConnected, isInternetReachable, sesionOnlineValida, usuario]);
 
   const refrescarConteoNoLeidas = useCallback(async ({ silent = true } = {}) => {
     if (!usuario?.id) {
@@ -876,6 +995,7 @@ function AppShell() {
   }, [isConnected, usuario?.id]);
 
   const limpiarAccesoLocal = useCallback(async () => {
+    syncGeneracionRef.current += 1;
     await secureLocalStorage.removeItem('usuario_autenticado_local').catch(() => {});
     setVistaActiva('formulario');
     setNotificacionesNoLeidas(0);
@@ -1076,16 +1196,19 @@ function AppShell() {
       .then((state) => {
         if (mounted) {
           setIsConnected(!!state?.isConnected);
+          setIsInternetReachable(state?.isInternetReachable ?? null);
         }
       })
       .catch(() => {
         if (mounted) {
           setIsConnected(false);
+          setIsInternetReachable(null);
         }
       });
 
     const unsubscribe = NetInfo.addEventListener((state) => {
       setIsConnected(!!state.isConnected);
+      setIsInternetReachable(state?.isInternetReachable ?? null);
     });
 
     return () => {
@@ -1128,12 +1251,13 @@ function AppShell() {
     return () => data?.subscription?.unsubscribe();
   }, [limpiarAccesoLocal, verificarSesion]);
 
-  // Auto-sync al volver a conexión o primer plano (sin alertas intrusivas)
+  // Auto-sync al volver a conexión o primer plano (sin alertas intrusivas).
+  // Con alcance conocido falso no se intenta; con edición activa se difiere.
   useEffect(() => {
-    if (isConnected && sesionOnlineValida) {
+    if (isConnected && isInternetReachable !== false && sesionOnlineValida) {
       sincronizarFormularios({ showAlerts: false });
     }
-  }, [isConnected, sesionOnlineValida, sincronizarFormularios]);
+  }, [isConnected, isInternetReachable, sesionOnlineValida, sincronizarFormularios]);
 
   useEffect(() => {
     if (usuario?.id && isConnected) {
@@ -1183,8 +1307,32 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
+    initTelemetry().catch(() => {});
+    getPreviousExitReason().then((exit) => {
+      if (exit?.supported && exit.reason && exit.reason !== 'OTHER' && exit.reason !== 'UNSUPPORTED') {
+        recordEvent('previous_run_unclean', { app_state: 'starting', phase: 'startup', native_exit_reason: exit.reason }).catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active' && isConnected) {
+      if (state === 'active') {
+        updateRunMarker({ last_state: 'active' }).catch(() => {});
+        recordEvent('app_foreground', { app_state: 'active', phase: 'lifecycle' }).catch(() => {});
+        setExitSummary('active').catch(() => {});
+      }
+      if ((state === 'background' || state === 'inactive')) {
+        updateRunMarker({ last_state: state, clean_background: state === 'background' }).catch(() => {});
+        recordEvent('app_background', { app_state: state, phase: 'lifecycle' }).catch(() => {});
+        setExitSummary(state).catch(() => {});
+        flushTelemetry().catch(() => {});
+      }
+      if (state === 'active' && isConnected && isInternetReachable !== false) {
+        // Retry diferido: solo en foreground y sin edición activa.
+        if (syncDiferidoRef.current && !isEdicionActiva()) {
+          syncDiferidoRef.current = false;
+        }
         verificarSesion().then((sesionValida) => {
           if (!sesionValida) return;
           sincronizarFormularios({ showAlerts: false });
@@ -1193,11 +1341,14 @@ function AppShell() {
       }
     });
     return () => sub.remove();
-  }, [isConnected, refrescarConteoNoLeidas, sincronizarFormularios, verificarSesion]);
+  }, [isConnected, isInternetReachable, refrescarConteoNoLeidas, sincronizarFormularios, verificarSesion]);
 
   const cerrarSesion = async () => {
     const usuarioIdLogout = usuarioRef.current?.id || null;
     logoutEnCursoRef.current = true;
+    syncGeneracionRef.current += 1;
+    recordEvent('logout', { app_state: 'active', phase: 'auth' }).catch(() => {});
+    flushTelemetry().catch(() => {});
     revalidarSesionRef.current = false;
     setSesionOnlineValida(false);
     setUsuario(null);
@@ -1249,6 +1400,8 @@ function AppShell() {
 
   const handleLogin = async (user, { autenticadoOnline = false } = {}) => {
     logoutEnCursoRef.current = false;
+    syncGeneracionRef.current += 1;
+    recordEvent('auth_change', { app_state: 'active', phase: 'auth' }).catch(() => {});
     if (autenticadoOnline) supabase.auth.startAutoRefresh().catch(() => {});
     setSesionOnlineValida(autenticadoOnline);
     setUsuario(user);
@@ -1550,12 +1703,6 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.background,
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: colors.background,
-  },
   errorContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -1711,12 +1858,6 @@ const styles = StyleSheet.create({
   pinBtnDisabled: {
     opacity: 0.6,
   },
-  actionsRow: {
-    marginTop: spacing.sm,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-  },
   tabsRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1765,21 +1906,6 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 10,
     fontWeight: '800',
-  },
-  actionBtnGhost: {
-    backgroundColor: 'rgba(255, 255, 255, 0.12)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.22)',
-    borderRadius: 14,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  actionBtnGhostText: {
-    color: '#E5EEF8',
-    fontSize: fontSizes.small,
-    fontWeight: '700',
   },
   body: {
     flex: 1,

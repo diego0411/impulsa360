@@ -25,7 +25,6 @@
     "android": {
       "permissions": [
         "CAMERA",
-        "READ_EXTERNAL_STORAGE",
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION"
       ],
@@ -34,7 +33,7 @@
         "backgroundColor": "#FFFFFF"
       },
       "package": "com.integrat360.impulsa360",
-      "versionCode": 58,
+      "versionCode": 60,
       "blockedPermissions": [
   "android.permission.RECORD_AUDIO",
   "android.permission.READ_MEDIA_IMAGES",

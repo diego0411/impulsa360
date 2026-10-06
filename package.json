@@ -1,6 +1,6 @@
 {
   "name": "impulsa360",
-  "version": "1.0.13",
+  "version": "1.0.28",
   "private": true,
   "license": "0BSD",
   "main": "index.js",
