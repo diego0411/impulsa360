@@ -27,6 +27,7 @@ import { tienePlazaValida } from './lib/plazas';
 import { obtenerPlazasTemporales } from './lib/plazasTemporales';
 import { withTimeout } from './lib/asyncTimeout';
 import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from './lib/elegibilidadReactivacion';
+import { resolverReglaFotografias } from './lib/reglasFotografias';
 import AuthScreen from './components/AuthScreen';
 import LaunchIntroScreen from './components/LaunchIntroScreen';
 import FormularioActivacion from './components/FormularioActivacion';
@@ -48,7 +49,7 @@ import {
   subirImagenExclusiva,
 } from './lib/upload';
 import { isEdicionActiva } from './lib/edicionActiva';
-import { flushTelemetry, initTelemetry, recordEvent, updateRunMarker } from './lib/telemetry';
+import { flushTelemetry, initTelemetry, recordEvent, updateRunMarker, getRunId, getPreviousRunMarker } from './lib/telemetry';
 import { getPreviousExitReason, setExitSummary } from './lib/exitInfo';
 import {
   clearOfflinePin,
@@ -149,8 +150,6 @@ const ejecutarConRetrySync = async (operation, { onFailure } = {}) => {
   }
 };
 const isLocalPhotoUri = (value) => typeof value === 'string' && /^(file|content):\/\//i.test(value);
-const esActivacionTranseunte = (tipoActivacion) =>
-  String(tipoActivacion || '').toLowerCase() === 'transeunte';
 const isRemotePhotoRef = (value) => (
   typeof value === 'string'
   && value.trim()
@@ -585,15 +584,16 @@ function AppShell() {
         };
         const effectiveFotoUrl = formulario.foto_url || localPhotosForCleanup.foto_url;
         const effectiveFotoCashIn = formulario.foto_cash_in || localPhotosForCleanup.foto_cash_in;
-        const esTranseunte = esActivacionTranseunte(formulario.tipo_activacion);
-        const requiereFotoPrincipal = !esTranseunte;
-        const requiereCashIn = !requiereValidacionReactivacion(formulario.tipo_activacion) && !esActivacionTranseunte(formulario.tipo_activacion);
+        // Matriz definitiva de fotografías (lib/reglasFotografias.js): misma regla que al guardar.
+        const reglaFotosSync = resolverReglaFotografias(formulario.tipo_grupo, formulario.tipo_activacion);
+        const requiereFotoPrincipal = reglaFotosSync.requiereEvidencia;
+        const requiereCashIn = reglaFotosSync.requiereCashIn;
 
         if ((requiereFotoPrincipal && !effectiveFotoUrl) || (requiereCashIn && !effectiveFotoCashIn)) {
           syncWarn('fotos obligatorias faltantes', { localId, recordId });
-          const errorMsg = esTranseunte
-            ? 'Falta la foto Cash-In obligatoria.'
-            : requiereCashIn ? 'Faltan las dos fotos obligatorias.' : 'Falta la foto de activación.';
+          const errorMsg = requiereFotoPrincipal && requiereCashIn
+            ? 'Faltan las dos fotos obligatorias.'
+            : requiereCashIn ? 'Falta la foto Cash-In obligatoria.' : 'Falta la foto de activación.';
           await marcarErrorSync(localId, errorMsg);
           errores.push(`ID local ${localId}: ${errorMsg}`);
           continue;
@@ -1307,12 +1307,39 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    initTelemetry().catch(() => {});
-    getPreviousExitReason().then((exit) => {
-      if (exit?.supported && exit.reason && exit.reason !== 'OTHER' && exit.reason !== 'UNSUPPORTED') {
-        recordEvent('previous_run_unclean', { app_state: 'starting', phase: 'startup', native_exit_reason: exit.reason }).catch(() => {});
-      }
-    }).catch(() => {});
+    // Detección de run previo en UN solo evento previous_run_unclean.
+    // El motivo nativo solo se atribuye si su timestamp es posterior al
+    // inicio del run previo (nunca un exit histórico/stale). Un cierre en
+    // app_background por sí solo NO se considera crash.
+    initTelemetry()
+      .catch(() => {})
+      .then(() => getPreviousExitReason().catch(() => null))
+      .then((exit) => {
+        try {
+          const previo = getPreviousRunMarker();
+          if (!previo?.run_id || previo.run_id === getRunId()) return;
+          if (previo.clean_background === true || previo.last_state === 'background') return;
+          const campos = {
+            app_state: 'starting',
+            phase: 'startup',
+            previous_last_state: String(previo.last_state || 'unknown').slice(0, 16),
+          };
+          const motivoValido = exit?.supported === true
+            && exit.reason
+            && exit.reason !== 'OTHER'
+            && exit.reason !== 'UNSUPPORTED';
+          const tsExit = Number(exit?.timestampMs || 0);
+          const tsPrevio = Date.parse(previo.started_at || '') || 0;
+          if (motivoValido && tsExit > 0 && tsPrevio > 0 && tsExit > tsPrevio) {
+            campos.native_exit_reason = exit.reason;
+            campos.exit_timestamp = exit.exitIso || new Date(tsExit).toISOString();
+          }
+          recordEvent('previous_run_unclean', campos).catch(() => {});
+        } catch {
+          // Nunca bloquear arranque.
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {

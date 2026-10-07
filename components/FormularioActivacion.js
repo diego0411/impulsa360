@@ -27,6 +27,7 @@ import { normalizarNombreVisible } from '../lib/identity';
 import { deduplicarPlazasPorEtiqueta, etiquetaPlaza, tienePlazaValida } from '../lib/plazas';
 import { withTimeout } from '../lib/asyncTimeout';
 import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from '../lib/elegibilidadReactivacion';
+import { resolverReglaFotografias } from '../lib/reglasFotografias';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
 import CameraEvidencia from './CameraEvidencia';
@@ -909,11 +910,12 @@ export default function FormularioActivacion({
   const requiereComercio = formulario.tipo_grupo === 'comercio';
   const requiereComercioGeneral =
     requiereComercio && baseActivacionPreview === 'comercio';
-  const esTranseunteSimple = esActivacionTranseunte(formulario.tipo_activacion);
-
+  // Matriz definitiva de fotografías (lib/reglasFotografias.js).
+  const reglaFotos = resolverReglaFotografias(formulario.tipo_grupo, formulario.tipo_activacion);
   const requiereFotos = true;
-  const requiereFotoPrincipal = !esTranseunteSimple;
-  const requiereCashIn = !requiereValidacionReactivacion(formulario.tipo_activacion) && !esTranseunteSimple;
+  const requiereFotoPrincipal = reglaFotos.requiereEvidencia;
+  const requiereCashIn = reglaFotos.requiereCashIn;
+  const sinFotosObligatorias = !reglaFotos.requiereEvidencia && !reglaFotos.requiereCashIn;
   const totalFotosRequeridas = Number(requiereFotoPrincipal) + Number(requiereCashIn);
   const plazasTemporales = useMemo(
     () => Array.isArray(usuario?.plazas_temporales) ? usuario.plazas_temporales : [],
@@ -1396,8 +1398,9 @@ export default function FormularioActivacion({
       return 'No se pudo obtener la fecha de activación.';
     }
 
-    if (!esTranseunte && !data.foto_url && !fotoPrincipal) return 'Debes cargar la foto de comprobación.';
-    if (!requiereValidacionReactivacion(data.tipo_activacion) && !esActivacionTranseunte(data.tipo_activacion) && !data.foto_cash_in && !fotoCashIn) return 'Debes cargar la foto del Cash-In.';
+    const reglaFotosValidar = resolverReglaFotografias(data.tipo_grupo, data.tipo_activacion);
+    if (reglaFotosValidar.requiereEvidencia && !data.foto_url && !fotoPrincipal) return 'Debes cargar la foto de comprobación.';
+    if (reglaFotosValidar.requiereCashIn && !data.foto_cash_in && !fotoCashIn) return 'Debes cargar la foto del Cash-In.';
 
     return null;
   };
@@ -1407,7 +1410,7 @@ export default function FormularioActivacion({
   const fotosCapturadas = Number(Boolean(fotoPrincipalUri)) + Number(Boolean(fotoCashInUri));
   const fotosObligatoriasCapturadas = Number(requiereFotoPrincipal && Boolean(fotoPrincipalUri))
     + Number(requiereCashIn && Boolean(fotoCashInUri));
-  const resumenFotos = esTranseunteSimple
+  const resumenFotos = sinFotosObligatorias
     ? `${fotosCapturadas} adjunta${fotosCapturadas === 1 ? '' : 's'} · Opcionales`
     : `${fotosObligatoriasCapturadas}/${totalFotosRequeridas}`;
   const gpsListo = tieneCoordenadasValidas(formulario);
@@ -1719,7 +1722,7 @@ export default function FormularioActivacion({
           </View>
           <View style={[styles.badge, styles.badgeAccent]}>
             <Text style={styles.badgeText}>
-              {esTranseunteSimple
+              {sinFotosObligatorias
                 ? 'Evidencias opcionales'
                 : `${totalFotosRequeridas} foto${totalFotosRequeridas === 1 ? '' : 's'} obligatoria${totalFotosRequeridas === 1 ? '' : 's'}`}
             </Text>
@@ -2021,7 +2024,7 @@ export default function FormularioActivacion({
       {requiereFotos ? (
         <View style={styles.card}>
           <Text style={styles.evidenceSectionTitle}>
-            {esTranseunteSimple
+            {sinFotosObligatorias
               ? `📸 Evidencias opcionales (${fotosCapturadas} adjunta${fotosCapturadas === 1 ? '' : 's'})`
               : `📸 Evidencias (${fotosObligatoriasCapturadas}/${totalFotosRequeridas})`}
           </Text>

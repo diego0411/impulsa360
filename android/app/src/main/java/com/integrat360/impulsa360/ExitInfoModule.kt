@@ -30,6 +30,9 @@ class ExitInfoModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
         val ok = Arguments.createMap()
         ok.putBoolean("supported", false)
         ok.putString("reason", "UNSUPPORTED")
+        ok.putDouble("timestamp", 0.0)
+        ok.putString("description", "")
+        ok.putInt("pid", 0)
         promise.resolve(ok)
         return
       }
@@ -44,17 +47,29 @@ class ExitInfoModule(reactContext: ReactApplicationContext) : ReactContextBaseJa
       if (first == null) {
         result.putBoolean("supported", true)
         result.putString("reason", "OTHER")
+        result.putDouble("timestamp", 0.0)
+        result.putString("description", "")
+        result.putInt("pid", 0)
         promise.resolve(result)
         return
       }
       result.putBoolean("supported", true)
       result.putString("reason", mapReason(first.reason))
+      // Correlación temporal: timestamp (epoch ms) del registro para
+      // atribuirlo solo al run que estaba vivo en ese momento.
+      result.putDouble("timestamp", first.timestamp.toDouble())
+      // description = process state summary (best-effort, sin datos sensibles).
+      result.putString("description", first.description ?: "")
+      result.putInt("pid", first.pid)
       promise.resolve(result)
     } catch (_: Exception) {
       try {
         val fallback = Arguments.createMap()
         fallback.putBoolean("supported", false)
         fallback.putString("reason", "UNSUPPORTED")
+        fallback.putDouble("timestamp", 0.0)
+        fallback.putString("description", "")
+        fallback.putInt("pid", 0)
         promise.resolve(fallback)
       } catch (_: Exception) {
         promise.reject("EXIT_INFO_ERROR", "No se pudo leer exit reason")
