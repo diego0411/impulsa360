@@ -12,6 +12,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import NetInfo from '@react-native-community/netinfo';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SplashScreen from 'expo-splash-screen';
 import Constants from 'expo-constants';
@@ -19,7 +20,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { clearLocalSupabaseSession, supabase } from './lib/supabase';
 import { HAS_SUPABASE_CONFIG, SUPABASE_CONFIG_ERROR } from './lib/config';
-import { secureLocalStorage } from './lib/secureLocalStorage';
+import { leerRegistroSeguro, secureLocalStorage } from './lib/secureLocalStorage';
 import { colors, spacing, fontSizes } from './styles/theme';
 import { normalizarNombreVisible } from './lib/identity';
 import { enmascararMarcaVisible } from './lib/brandMask';
@@ -27,6 +28,7 @@ import { tienePlazaValida } from './lib/plazas';
 import { obtenerPlazasTemporales } from './lib/plazasTemporales';
 import { withTimeout } from './lib/asyncTimeout';
 import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from './lib/elegibilidadReactivacion';
+import { fechaBolivia } from './lib/fechaBolivia';
 import { resolverReglaFotografias } from './lib/reglasFotografias';
 import AuthScreen from './components/AuthScreen';
 import LaunchIntroScreen from './components/LaunchIntroScreen';
@@ -35,7 +37,7 @@ import FormulariosPorImpulsador from './components/FormulariosPorImpulsador';
 import NotificacionesScreen from './components/NotificacionesScreen';
 import ControlActivadores from './components/ControlActivadores';
 import {
-  obtenerFormulariosLocales,
+  leerFormulariosLocalesSeguro,
   obtenerFormularioPorId,
   eliminarFormularioLocal,
   actualizarFormularioLocal,
@@ -44,8 +46,11 @@ import {
 import {
   ACTIVACIONES_BUCKET,
   asegurarFotoPendientePersistente,
+  detectarFormatoImagenLocal,
+  liberarFotoEnProceso,
   limpiarFotosPendientesHuerfanas,
   limpiarFotosHuerfanasSegura,
+  prepararImagenPersistente,
   subirImagenExclusiva,
 } from './lib/upload';
 import { isEdicionActiva } from './lib/edicionActiva';
@@ -53,12 +58,22 @@ import { flushTelemetry, initTelemetry, recordEvent, updateRunMarker, getRunId, 
 import { getPreviousExitReason, setExitSummary } from './lib/exitInfo';
 import {
   clearOfflinePin,
-  hasOfflinePin,
+  getPendingOfflinePinSave,
   saveOfflinePin,
   getOfflinePinStatus,
   pinPolicy,
 } from './lib/offlinePin';
 import { obtenerConteoNoLeidas } from './lib/notificaciones';
+import {
+  mensajeRolesNoActualizados,
+  registrarDiagnosticoRoles,
+  resolverEstadoRoles,
+} from './lib/rolesAdicionales';
+import {
+  asegurarSesionParaSync,
+  ejecutarOperacionSerializada,
+  resolverLecturaPendientes,
+} from './lib/offlineSafety';
 
 const MIN_BRANDED_INTRO_MS = 3200;
 const SESSION_TIMEOUT_MS = 8000;
@@ -69,6 +84,55 @@ const SYNC_RETRY_BACKOFF_MS = [2000, 5000];
 const APP_VERSION_CODE = String(
   Constants.nativeBuildVersion || Constants.expoConfig?.android?.versionCode || 'desconocida'
 );
+const BORRADOR_KEY_PREFIX = 'borrador_formulario_';
+const fotosDeRegistro = (registro = {}) => [
+  registro?.foto_url,
+  registro?.foto_cash_in,
+  ...Object.values(registro?._sync?.localPhotos || {}),
+].filter((uri) => typeof uri === 'string' && uri);
+
+const obtenerFotosProtegidasParaLimpieza = async () => {
+  const pendientes = await leerFormulariosLocalesSeguro();
+  if (pendientes.status !== 'ok' || !Array.isArray(pendientes.value)) {
+    return { safe: false, uris: [] };
+  }
+
+  let keys;
+  try {
+    keys = await AsyncStorage.getAllKeys();
+  } catch {
+    return { safe: false, uris: [] };
+  }
+
+  const uris = pendientes.value.flatMap(fotosDeRegistro);
+  for (const key of keys.filter((item) => item.startsWith(BORRADOR_KEY_PREFIX))) {
+    const propietarioId = key.slice(BORRADOR_KEY_PREFIX.length);
+    if (!propietarioId) return { safe: false, uris: [] };
+
+    const detalle = await leerRegistroSeguro(key);
+    if (detalle.status === 'absent') continue;
+    if (detalle.status !== 'ok') return { safe: false, uris: [] };
+
+    let borrador;
+    try {
+      borrador = detalle.value ? JSON.parse(detalle.value) : null;
+    } catch {
+      return { safe: false, uris: [] };
+    }
+    if (!borrador?.campos || !borrador?.fotos || borrador.usuario_id !== propietarioId) {
+      return { safe: false, uris: [] };
+    }
+    uris.push(
+      borrador.campos.foto_url,
+      borrador.campos.foto_cash_in,
+      borrador.fotos.fotoPrincipal,
+      borrador.fotos.fotoCashIn,
+      ...Object.values(borrador.fotos.fotosPersistentes || {}),
+      ...Object.values(borrador.fotos.fotosListas || {})
+    );
+  }
+  return { safe: true, uris: uris.filter((uri) => typeof uri === 'string' && uri) };
+};
 const perfilTieneAcceso = (perfil) => (
   !!perfil?.usuario_id
   && String(perfil?.estado || '').trim().toLowerCase() === 'activo'
@@ -333,7 +397,8 @@ function AppShell() {
   const [usuario, setUsuario] = useState(null);
   const [loading, setLoading] = useState(true);
   const [introDone, setIntroDone] = useState(false);
-  const [cantidadOffline, setCantidadOffline] = useState(0);
+  const [cantidadOffline, setCantidadOffline] = useState(null);
+  const [lecturaPendientesError, setLecturaPendientesError] = useState(false);
   const [isConnected, setIsConnected] = useState(null);
   const [vistaActiva, setVistaActiva] = useState('formulario');
   const [notificacionesNoLeidas, setNotificacionesNoLeidas] = useState(0);
@@ -342,8 +407,11 @@ function AppShell() {
   const [pinNuevo, setPinNuevo] = useState('');
   const [pinConfirm, setPinConfirm] = useState('');
   const [pinGuardando, setPinGuardando] = useState(false);
+  const [pinGuardandoLento, setPinGuardandoLento] = useState(false);
   const [sesionOnlineValida, setSesionOnlineValida] = useState(false);
   const [isInternetReachable, setIsInternetReachable] = useState(null);
+  const [rolesCargaError, setRolesCargaError] = useState('');
+  const [metricasVersion, setMetricasVersion] = useState(0);
   const syncingRef = useRef(false);
   const lastSyncRef = useRef(0);
   const syncGeneracionRef = useRef(0);
@@ -351,18 +419,49 @@ function AppShell() {
   const lastLimpiezaRef = useRef(0);
   const splashHiddenRef = useRef(false);
   const validacionSesionRef = useRef(null);
+  const verificarSesionParaSyncRef = useRef(null);
+  const revalidacionSyncRef = useRef(null);
   const revalidarSesionRef = useRef(false);
+  const rolesConsultaGeneracionRef = useRef(0);
+  const rolesReintentoRef = useRef(null);
   const logoutEnCursoRef = useRef(false);
+  const pinSaveInFlightRef = useRef(false);
+  const pinUiMountedRef = useRef(true);
   const restauracionInicialCompletaRef = useRef(false);
   const usuarioRef = useRef(usuario);
   const sesionOnlineValidaRef = useRef(sesionOnlineValida);
+  const internetReachableRef = useRef(isInternetReachable);
+  const formularioFlushRef = useRef(null);
+  const navegacionFormularioRef = useRef(false);
   usuarioRef.current = usuario;
   sesionOnlineValidaRef.current = sesionOnlineValida;
+  internetReachableRef.current = isInternetReachable;
 
-  const contarFormulariosLocales = useCallback(async () => {
-    const datos = await obtenerFormulariosLocales();
-    setCantidadOffline(usuario?.id ? datos.filter((item) => item?.usuario_id === usuario.id).length : 0);
+  useEffect(() => {
+    pinUiMountedRef.current = true;
+    return () => {
+      pinUiMountedRef.current = false;
+    };
+  }, []);
+
+  const contarFormulariosLocales = useCallback(async (ownerId = usuario?.id) => {
+    const lectura = resolverLecturaPendientes(
+      await leerFormulariosLocalesSeguro(),
+      ownerId,
+    );
+    if (!lectura.ok) {
+      setLecturaPendientesError(true);
+      return lectura;
+    }
+    setCantidadOffline(lectura.count);
+    setLecturaPendientesError(false);
+    return lectura;
   }, [usuario?.id]);
+
+  const revalidarSesionParaSync = useCallback(() => ejecutarOperacionSerializada(
+    revalidacionSyncRef,
+    () => validacionSesionRef.current || verificarSesionParaSyncRef.current?.() || false,
+  ), []);
 
   const sincronizarFormularios = useCallback(async ({ showAlerts = true, force = false, targetLocalId = null } = {}) => {
     if (syncingRef.current) {
@@ -392,12 +491,22 @@ function AppShell() {
       syncDiferidoRef.current = true;
       return { status: 'busy', synced: 0, errors: [] };
     }
-    if (!sesionOnlineValida) {
+    const ownerSolicitante = usuario.id;
+    const sesionAutorizada = await asegurarSesionParaSync({
+      sesionValida: sesionOnlineValidaRef.current,
+      manual: showAlerts || force,
+      revalidar: revalidarSesionParaSync,
+      ownerId: ownerSolicitante,
+      obtenerOwnerId: () => usuarioRef.current?.id,
+      logoutEnCurso: () => logoutEnCursoRef.current,
+    });
+    if (!sesionAutorizada) {
       if (showAlerts) {
-        Alert.alert('Sesión pendiente', 'Espera mientras se valida tu acceso antes de sincronizar.');
+        Alert.alert('Sesión pendiente', 'No se pudo revalidar tu sesión. Revisa la conexión e intenta nuevamente.');
       }
       return { status: 'unauthorized', synced: 0, errors: ['Sesión online no validada'] };
     }
+    if (syncingRef.current) return { status: 'busy', synced: 0, errors: [] };
 
     const now = Date.now();
     if (!showAlerts && !force && now - lastSyncRef.current < 10000) return { status: 'busy', synced: 0, errors: [] };
@@ -414,7 +523,18 @@ function AppShell() {
       && usuarioRef.current?.id === ownerSync
     );
     try {
-      const todosFormularios = await obtenerFormulariosLocales();
+      const lecturaPendientes = resolverLecturaPendientes(
+        await leerFormulariosLocalesSeguro(),
+        usuario.id,
+      );
+      if (!lecturaPendientes.ok) {
+        const mensaje = 'No se pudieron leer las activaciones pendientes. Se conservarán sin sincronizar.';
+        setLecturaPendientesError(true);
+        if (showAlerts) Alert.alert('Pendientes no disponibles', mensaje);
+        return { status: 'storage_error', synced: 0, errors: [mensaje] };
+      }
+      setLecturaPendientesError(false);
+      const todosFormularios = lecturaPendientes.allRows;
       const pendientesLegacy = todosFormularios.filter((f) => !f?.usuario_id);
       const pendientesOtroUsuario = todosFormularios.filter(
         (f) => f?.usuario_id && f.usuario_id !== usuario.id,
@@ -508,6 +628,8 @@ function AppShell() {
         'longitud',
         'reactivacion_comercio',
         'respaldo',
+        'creditos',
+        'remesas',
         'ciudad_activacion',
         'zona_activacion',
         'distrito_gps',
@@ -518,6 +640,10 @@ function AppShell() {
       ];
 
       for (const f of formularios) {
+        if (!syncVigente()) {
+          errores.push('La sesión cambió durante la sincronización; los pendientes se conservarán.');
+          break;
+        }
         // En tu storage nuevo puede existir _id_local; mantenemos compatibilidad
         const localId = f._id_local ?? f.id;
 
@@ -539,8 +665,25 @@ function AppShell() {
         }
         syncDebug('registro local', { localId, recordId });
 
-        // Asegura fecha
-        formulario.fecha_activacion ??= new Date().toISOString().split('T')[0];
+        // Los pendientes legados sin fecha conservan la fecha de su guardado
+        // local; los reintentos posteriores nunca la recalculan.
+        if (!formulario.fecha_activacion) {
+          const fechaGuardadoLocal = fechaBolivia(_created_at);
+          if (!fechaGuardadoLocal) {
+            const errorMsg = 'No se pudo determinar la fecha original de la activación pendiente.';
+            await marcarErrorSync(localId, errorMsg);
+            errores.push(`ID local ${localId}: ${errorMsg}`);
+            continue;
+          }
+          formulario.fecha_activacion = fechaGuardadoLocal;
+          const fechaPersistida = await actualizarFormularioLocal(localId, { fecha_activacion: fechaGuardadoLocal });
+          if (!fechaPersistida) {
+            const errorMsg = 'No se pudo persistir la fecha original de la activación pendiente.';
+            await marcarErrorSync(localId, errorMsg);
+            errores.push(`ID local ${localId}: ${errorMsg}`);
+            continue;
+          }
+        }
         formulario.estado_sync ??= 'offline_pending';
         // Limpia campos que no existan en la tabla
         delete formulario.fecha_hora;
@@ -724,6 +867,73 @@ function AppShell() {
                   localPhotos: localPhotosForCleanup,
                 },
               });
+            }
+            // Respaldos creados antes de esta corrección podían conservar el
+            // formato original bajo extensión .jpg. Nunca se envían como JPEG
+            // hasta convertirlos y dejar la nueva URI persistida.
+            const formatoFoto = await detectarFormatoImagenLocal(uploadSourceUri);
+            if (formatoFoto !== 'jpeg') {
+              const originalRecuperadoUri = uploadSourceUri;
+              let jpegNormalizadoUri = '';
+              try {
+                await actualizarEtapaFoto('FOTO-LOCAL-NORMALIZE', 'running', {
+                  error: null,
+                  lastAttemptAt: photoAttemptAt,
+                  lastAttemptCode: null,
+                  lastAttemptField: key,
+                });
+                jpegNormalizadoUri = await prepararImagenPersistente(originalRecuperadoUri, key, {
+                  protectResult: true,
+                });
+                const jpegInfo = await FileSystem.getInfoAsync(jpegNormalizadoUri, { size: true }).catch(() => null);
+                if (!jpegInfo?.exists || (typeof jpegInfo.size === 'number' && jpegInfo.size <= 0)) {
+                  throw new Error('La foto normalizada no quedó disponible localmente.');
+                }
+                formulario[key] = jpegNormalizadoUri;
+                localPhotosForCleanup[key] = jpegNormalizadoUri;
+                syncMetadata = { ...syncMetadata, localPhotos: localPhotosForCleanup };
+                const normalizacionPersistida = await actualizarFormularioLocal(localId, {
+                  [key]: jpegNormalizadoUri,
+                  _sync: syncMetadata,
+                });
+                if (!normalizacionPersistida) {
+                  throw new Error('No se pudo persistir la foto normalizada en la activación pendiente.');
+                }
+              } catch (error) {
+                formulario[key] = originalRecuperadoUri;
+                localPhotosForCleanup[key] = originalRecuperadoUri;
+                syncMetadata = { ...syncMetadata, localPhotos: localPhotosForCleanup };
+                if (jpegNormalizadoUri) {
+                  await FileSystem.deleteAsync(jpegNormalizadoUri, { idempotent: true }).catch(() => {});
+                }
+                const errorMsg = `No se pudo normalizar la foto (${key}) para sincronizarla como JPEG.`;
+                await marcarErrorSync(localId, errorMsg, {
+                  ...syncMetadata,
+                  localPhotos: localPhotosForCleanup,
+                  lastAttemptAt: photoAttemptAt,
+                  lastAttemptVersionCode: APP_VERSION_CODE,
+                  lastAttemptStage: 'FOTO-LOCAL-NORMALIZE',
+                  lastAttemptCode: 'FOTO-LOCAL-FORMAT',
+                  lastAttemptResult: 'error',
+                  lastAttemptField: key,
+                });
+                syncWarn('no se pudo normalizar respaldo de foto', {
+                  localId,
+                  recordId,
+                  key,
+                  format: formatoFoto,
+                  error: syncErrorInfo(error),
+                });
+                errores.push(`ID local ${localId}: ${errorMsg}`);
+                fotoUploadFailed = true;
+              } finally {
+                liberarFotoEnProceso(jpegNormalizadoUri);
+              }
+              if (fotoUploadFailed) {
+                continue;
+              }
+              await FileSystem.deleteAsync(originalRecuperadoUri, { idempotent: true }).catch(() => {});
+              uploadSourceUri = jpegNormalizadoUri;
             }
             try {
               const path = buildPhotoStoragePath(ownerId, recordId, key);
@@ -953,26 +1163,24 @@ function AppShell() {
     } finally {
       contarFormulariosLocales();
       syncingRef.current = false;
+      if (syncVigente()) setMetricasVersion((version) => version + 1);
       recordEvent('sync_end', { app_state: 'active', phase: 'sync' }).catch(() => {});
       flushTelemetry().catch(() => {});
       // Limpieza bounded en momento seguro (post-sync, máx 1/hora).
       try {
         if (Date.now() - lastLimpiezaRef.current > 60 * 60 * 1000) {
           lastLimpiezaRef.current = Date.now();
-          const pendientes = await obtenerFormulariosLocales().catch(() => []);
-          const refs = (Array.isArray(pendientes) ? pendientes : []).flatMap((item) => [
-            item?.foto_url,
-            item?.foto_cash_in,
-            ...Object.values(item?._sync?.localPhotos || {}),
-          ]);
-          limpiarFotosHuerfanasSegura({ referencedUris: refs }).catch(() => {});
+          const fotosProtegidas = await obtenerFotosProtegidasParaLimpieza();
+          if (fotosProtegidas.safe) {
+            limpiarFotosHuerfanasSegura({ referencedUris: fotosProtegidas.uris }).catch(() => {});
+          }
         }
       } catch {
         // best-effort
       }
       syncDebug('lock liberado');
     }
-  }, [contarFormulariosLocales, isConnected, isInternetReachable, sesionOnlineValida, usuario]);
+  }, [contarFormulariosLocales, isConnected, isInternetReachable, revalidarSesionParaSync, usuario]);
 
   const refrescarConteoNoLeidas = useCallback(async ({ silent = true } = {}) => {
     if (!usuario?.id) {
@@ -996,10 +1204,13 @@ function AppShell() {
 
   const limpiarAccesoLocal = useCallback(async () => {
     syncGeneracionRef.current += 1;
+    rolesConsultaGeneracionRef.current += 1;
+    rolesReintentoRef.current = null;
     await secureLocalStorage.removeItem('usuario_autenticado_local').catch(() => {});
     setVistaActiva('formulario');
     setNotificacionesNoLeidas(0);
     setSesionOnlineValida(false);
+    setRolesCargaError('');
     setUsuario(null);
   }, []);
 
@@ -1038,14 +1249,12 @@ function AppShell() {
             await limpiarAccesoLocal();
             return false;
           }
-          if (!logoutEnCursoRef.current && usuarioCache?.id && !usuarioRef.current?.id) setUsuario(usuarioCache);
           return false;
         }
 
         if (!session?.user?.id) {
           if (!isConnected && usuarioCache?.id) {
-            const pinConfigurado = await hasOfflinePin(usuarioCache.id).catch(() => false);
-            if (!logoutEnCursoRef.current) setUsuario(pinConfigurado ? null : usuarioCache);
+            if (!usuarioRef.current?.id) setUsuario(null);
             return false;
           }
           await limpiarAccesoLocal();
@@ -1056,10 +1265,7 @@ function AppShell() {
         const cacheMismoUsuario = usuarioCache?.id === sessionUserId ? usuarioCache : null;
         if (!isConnected) {
           if (usuarioRef.current?.id === sessionUserId) return false;
-          const pinConfigurado = cacheMismoUsuario
-            ? await hasOfflinePin(sessionUserId).catch(() => false)
-            : false;
-          if (!logoutEnCursoRef.current) setUsuario(pinConfigurado ? null : cacheMismoUsuario);
+          if (!usuarioRef.current?.id) setUsuario(null);
           return false;
         }
 
@@ -1078,7 +1284,6 @@ function AppShell() {
             await limpiarAccesoLocal();
             return false;
           }
-          if (!logoutEnCursoRef.current && cacheMismoUsuario && !usuarioRef.current?.id) setUsuario(cacheMismoUsuario);
           return false;
         }
 
@@ -1101,8 +1306,6 @@ function AppShell() {
           if (esPerfilAusente(errorPerfil)) {
             await supabase.auth.signOut().catch(() => {});
             await limpiarAccesoLocal();
-          } else if (cacheMismoUsuario && !usuarioRef.current?.id) {
-            if (!logoutEnCursoRef.current) setUsuario(cacheMismoUsuario);
           }
           return false;
         }
@@ -1122,38 +1325,73 @@ function AppShell() {
           usuarioId: user.id,
         });
 
+        const rolPrincipal = perfil.rol || perfil.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || 'activador';
+        const generacionRoles = ++rolesConsultaGeneracionRef.current;
+        const revisionCacheRoles = `${Date.now()}-${generacionRoles}`;
         let filasRoles = [];
+        let errorRoles = null;
         try {
-          const { data: rolesData } = await withTimeout(
+          const { data: rolesData, error: rolesQueryError } = await withTimeout(
             supabase.from('activador_roles').select('rol').eq('usuario_id', user.id),
             QUERY_TIMEOUT_MS,
             'La red tardó demasiado al cargar los roles.'
           );
-          if (Array.isArray(rolesData)) filasRoles = rolesData;
-        } catch {
-          // El perfil activo ya autorizó el acceso; se conserva el rol legacy.
+          if (rolesQueryError) throw rolesQueryError;
+          filasRoles = rolesData;
+          if (rolesConsultaGeneracionRef.current !== generacionRoles || logoutEnCursoRef.current) return false;
+        } catch (rolesError) {
+          if (rolesConsultaGeneracionRef.current !== generacionRoles || logoutEnCursoRef.current) return false;
+          errorRoles = rolesError;
         }
-        const rolesCrudos = [
-          perfil.rol || perfil.role,
-          ...filasRoles.map((fila) => fila?.rol),
-          ...(Array.isArray(cacheMismoUsuario?.roles) ? cacheMismoUsuario.roles : []),
-        ].filter((rol) => typeof rol === 'string' && rol.trim());
+        const estadoRoles = resolverEstadoRoles({
+          filas: filasRoles,
+          error: errorRoles,
+          cache: cacheMismoUsuario,
+          rolPrincipal,
+          revision: revisionCacheRoles,
+        });
+        if (errorRoles) {
+          setRolesCargaError(mensajeRolesNoActualizados(estadoRoles.usoCache));
+          registrarDiagnosticoRoles({
+            error: errorRoles,
+            cacheUsed: estadoRoles.usoCache,
+            connected: isConnected,
+            reachable: internetReachableRef.current,
+          });
+        }
         const usuarioFinal = {
           id: user.id,
           email: user.email,
           nombre: nombrePerfil || nombreCache || nombreMetadata || user.email,
           plaza: plazaPerfil || plazaCache || 'No especificada',
           plazas_temporales: plazasTemporales,
-          rol: perfil.rol || perfil.role || cacheMismoUsuario?.rol || cacheMismoUsuario?.role || 'activador',
-          roles: Array.from(new Set(rolesCrudos)),
+          rol: rolPrincipal,
+          ...estadoRoles.camposUsuario,
           puede_activar: perfil.puede_activar === true,
         };
 
-        if (logoutEnCursoRef.current) return false;
+        if (logoutEnCursoRef.current || rolesConsultaGeneracionRef.current !== generacionRoles) return false;
         await secureLocalStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
-        if (logoutEnCursoRef.current) {
-          await secureLocalStorage.removeItem('usuario_autenticado_local');
+        if (logoutEnCursoRef.current || rolesConsultaGeneracionRef.current !== generacionRoles) {
+          const cacheActual = await secureLocalStorage.getItem('usuario_autenticado_local').catch(() => null);
+          try {
+            const parsed = cacheActual ? JSON.parse(cacheActual) : null;
+            if (parsed?.id === user.id && parsed?.roles_cache_revision === revisionCacheRoles) {
+              await secureLocalStorage.removeItem('usuario_autenticado_local');
+            }
+          } catch {
+            // Una cache ajena o ilegible nunca se elimina desde una respuesta obsoleta.
+          }
           return false;
+        }
+        if (estadoRoles.actualizados) {
+          setRolesCargaError('');
+          registrarDiagnosticoRoles({
+            error: null,
+            cacheUsed: false,
+            connected: isConnected,
+            reachable: internetReachableRef.current,
+          });
         }
         setUsuario(usuarioFinal);
         setSesionOnlineValida(true);
@@ -1162,7 +1400,6 @@ function AppShell() {
         if (typeof __DEV__ !== 'undefined' && __DEV__) {
           console.warn('No se pudo validar la sesión; se conserva el estado local:', error?.message || error);
         }
-        if (!logoutEnCursoRef.current && usuarioCache?.id && !usuarioRef.current?.id) setUsuario(usuarioCache);
         return false;
       } finally {
         contarFormulariosLocales();
@@ -1182,6 +1419,52 @@ function AppShell() {
     validacionSesionRef.current = validacionSeguida;
     return validacionSeguida;
   }, [contarFormulariosLocales, isConnected, limpiarAccesoLocal]);
+  verificarSesionParaSyncRef.current = verificarSesion;
+
+  const registrarFlushBorrador = useCallback((flush) => {
+    formularioFlushRef.current = typeof flush === 'function' ? flush : null;
+  }, []);
+
+  const cambiarVista = useCallback(async (siguienteVista) => {
+    if (siguienteVista === vistaActiva || navegacionFormularioRef.current) return;
+    if (vistaActiva === 'formulario' && formularioFlushRef.current) {
+      navegacionFormularioRef.current = true;
+      try {
+        const persistido = await formularioFlushRef.current();
+        if (persistido === false) {
+          Alert.alert(
+            'Borrador no guardado',
+            'No se pudo actualizar el borrador local. Reintenta antes de salir del formulario.'
+          );
+          return;
+        }
+      } finally {
+        navegacionFormularioRef.current = false;
+      }
+    }
+    setVistaActiva(siguienteVista);
+  }, [vistaActiva]);
+
+  const reintentarCargaRoles = useCallback(() => {
+    if (rolesReintentoRef.current) return rolesReintentoRef.current;
+    const usuarioId = usuarioRef.current?.id;
+    if (!usuarioId || logoutEnCursoRef.current) return Promise.resolve(false);
+
+    const reintento = (async () => {
+      const validacionActiva = validacionSesionRef.current;
+      if (validacionActiva) await validacionActiva;
+      if (logoutEnCursoRef.current || usuarioRef.current?.id !== usuarioId) return false;
+      const sesionValida = await verificarSesion();
+      if (!logoutEnCursoRef.current && usuarioRef.current?.id === usuarioId) {
+        setMetricasVersion((version) => version + 1);
+      }
+      return sesionValida;
+    })().finally(() => {
+      if (rolesReintentoRef.current === reintento) rolesReintentoRef.current = null;
+    });
+    rolesReintentoRef.current = reintento;
+    return reintento;
+  }, [verificarSesion]);
 
   // Detectar cambios de conexión + estado inicial
   useEffect(() => {
@@ -1372,8 +1655,14 @@ function AppShell() {
 
   const cerrarSesion = async () => {
     const usuarioIdLogout = usuarioRef.current?.id || null;
+    const logoutStartedAt = Date.now();
+    // Invalida primero las operaciones de PIN de esta sesión. La limpieza se
+    // mantiene en cola, pero no retiene la transición visible de logout.
+    clearOfflinePin(usuarioIdLogout, { preserveUpdatedAfter: logoutStartedAt }).catch(() => {});
     logoutEnCursoRef.current = true;
     syncGeneracionRef.current += 1;
+    rolesConsultaGeneracionRef.current += 1;
+    rolesReintentoRef.current = null;
     recordEvent('logout', { app_state: 'active', phase: 'auth' }).catch(() => {});
     flushTelemetry().catch(() => {});
     revalidarSesionRef.current = false;
@@ -1403,20 +1692,16 @@ function AppShell() {
       }
       await Promise.allSettled([
         secureLocalStorage.removeItem('usuario_autenticado_local'),
-        clearOfflinePin(usuarioIdLogout),
       ]);
       if (!sesionLocalEliminada) {
         Alert.alert('Cierre local incompleto', 'No se pudo eliminar la sesión guardada. Reinicia la app e intenta cerrar sesión nuevamente.');
       }
     }
     try {
-      const pendientes = await obtenerFormulariosLocales();
-      const fotosReferenciadas = pendientes.flatMap((item) => [
-        item?.foto_url,
-        item?.foto_cash_in,
-        ...Object.values(item?._sync?.localPhotos || {}),
-      ]);
-      await limpiarFotosPendientesHuerfanas(fotosReferenciadas);
+      const fotosProtegidas = await obtenerFotosProtegidasParaLimpieza();
+      if (fotosProtegidas.safe) {
+        await limpiarFotosPendientesHuerfanas(fotosProtegidas.uris);
+      }
     } catch (e) {
       if (typeof __DEV__ !== 'undefined' && __DEV__) {
         console.warn('⚠️ No se pudieron limpiar fotos huérfanas:', e?.message || e);
@@ -1428,12 +1713,17 @@ function AppShell() {
   const handleLogin = async (user, { autenticadoOnline = false } = {}) => {
     logoutEnCursoRef.current = false;
     syncGeneracionRef.current += 1;
+    rolesConsultaGeneracionRef.current += 1;
+    rolesReintentoRef.current = null;
     recordEvent('auth_change', { app_state: 'active', phase: 'auth' }).catch(() => {});
     if (autenticadoOnline) supabase.auth.startAutoRefresh().catch(() => {});
     setSesionOnlineValida(autenticadoOnline);
+    setRolesCargaError(user?.roles_actualizados === false
+      ? mensajeRolesNoActualizados(user?.roles_fuente === 'cache')
+      : '');
     setUsuario(user);
     setVistaActiva('formulario');
-    contarFormulariosLocales();
+    contarFormulariosLocales(user?.id);
   };
 
   const normalizarPinLocal = (value) =>
@@ -1445,7 +1735,8 @@ function AppShell() {
       return;
     }
     try {
-      setPinConfigurado(await hasOfflinePin(usuario.id));
+      const status = await getOfflinePinStatus(usuario.id);
+      setPinConfigurado(status.configured && status.storageState === 'ok');
     } catch {
       setPinConfigurado(false);
     }
@@ -1455,14 +1746,74 @@ function AppShell() {
     refrescarEstadoPin();
   }, [refrescarEstadoPin]);
 
+  useEffect(() => {
+    const usuarioId = usuario?.id;
+    if (!usuarioId) return undefined;
+    const pending = getPendingOfflinePinSave(usuarioId);
+    if (!pending) return undefined;
+
+    let vigente = true;
+    let slowTimer = null;
+    pinSaveInFlightRef.current = true;
+    setPinGuardando(true);
+    const remainingSlowMs = Math.max(0, 10000 - (Date.now() - pending.startedAt));
+    setPinGuardandoLento(pending.slow || remainingSlowMs === 0);
+    if (!pending.slow && remainingSlowMs > 0) {
+      slowTimer = globalThis.setTimeout(() => {
+        if (vigente && !logoutEnCursoRef.current && usuarioRef.current?.id === usuarioId) {
+          setPinGuardandoLento(true);
+        }
+      }, remainingSlowMs);
+    }
+    pending.promise
+      .then(async () => {
+        const status = await getOfflinePinStatus(usuarioId);
+        if (!vigente || !pinUiMountedRef.current || logoutEnCursoRef.current || usuarioRef.current?.id !== usuarioId) return;
+        if (!status?.configured || status.storageState !== 'ok') {
+          throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
+        }
+        setPinConfigurado(true);
+        setPinModalVisible(false);
+        setPinNuevo('');
+        setPinConfirm('');
+        Alert.alert('PIN guardado', 'Tu PIN local quedó activo para desbloqueo sin internet.');
+      })
+      .catch((error) => {
+        if (vigente && pinUiMountedRef.current && !logoutEnCursoRef.current && usuarioRef.current?.id === usuarioId) {
+          Alert.alert('No se pudo guardar PIN', error?.message || 'Intenta de nuevo.');
+        }
+      })
+      .finally(() => {
+        if (slowTimer) globalThis.clearTimeout(slowTimer);
+        pinSaveInFlightRef.current = false;
+        if (pinUiMountedRef.current) {
+          setPinGuardando(false);
+          setPinGuardandoLento(false);
+        }
+      });
+
+    return () => {
+      vigente = false;
+      if (slowTimer) globalThis.clearTimeout(slowTimer);
+    };
+  }, [usuario?.id]);
+
   const abrirPinModal = () => {
-    setPinNuevo('');
-    setPinConfirm('');
+    if (!pinGuardando) {
+      setPinNuevo('');
+      setPinConfirm('');
+    }
     setPinModalVisible(true);
   };
 
+  const cerrarPinModal = () => {
+    setPinModalVisible(false);
+    setPinNuevo('');
+    setPinConfirm('');
+  };
+
   const guardarPinLocal = async () => {
-    if (pinGuardando) return;
+    if (pinGuardando || pinSaveInFlightRef.current) return;
     if (!usuario?.id) return;
 
     const pin = normalizarPinLocal(pinNuevo);
@@ -1476,16 +1827,27 @@ function AppShell() {
       return;
     }
 
+    const usuarioId = usuario.id;
+    let slowTimer = null;
+    pinSaveInFlightRef.current = true;
     setPinGuardando(true);
+    setPinGuardandoLento(false);
     try {
-      await saveOfflinePin({ userId: usuario.id, pin });
+      slowTimer = globalThis.setTimeout(() => {
+        if (pinUiMountedRef.current && !logoutEnCursoRef.current && usuarioRef.current?.id === usuarioId) {
+          setPinGuardandoLento(true);
+        }
+      }, 10000);
+      await saveOfflinePin({ userId: usuarioId, pin });
+      if (!pinUiMountedRef.current || logoutEnCursoRef.current || usuarioRef.current?.id !== usuarioId) return;
       let status;
       try {
-        status = await getOfflinePinStatus(usuario.id);
+        status = await getOfflinePinStatus(usuarioId);
       } catch (verifyError) {
         throw new Error(`El PIN se guardó, pero no pudo verificarse. ${verifyError?.message || 'Intenta nuevamente.'}`);
       }
-      if (!status?.configured) {
+      if (!pinUiMountedRef.current || logoutEnCursoRef.current || usuarioRef.current?.id !== usuarioId) return;
+      if (!status?.configured || status.storageState !== 'ok') {
         throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
       }
       setPinConfigurado(true);
@@ -1494,9 +1856,16 @@ function AppShell() {
       setPinConfirm('');
       Alert.alert('PIN guardado', 'Tu PIN local quedó activo para desbloqueo sin internet.');
     } catch (err) {
-      Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta de nuevo.');
+      if (pinUiMountedRef.current && !logoutEnCursoRef.current && usuarioRef.current?.id === usuarioId) {
+        Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta de nuevo.');
+      }
     } finally {
-      setPinGuardando(false);
+      if (slowTimer) globalThis.clearTimeout(slowTimer);
+      pinSaveInFlightRef.current = false;
+      if (pinUiMountedRef.current) {
+        setPinGuardando(false);
+        setPinGuardandoLento(false);
+      }
     }
   };
 
@@ -1543,7 +1912,9 @@ function AppShell() {
     'notificaciones',
   ];
   const vistaSegura = vistasPermitidas.includes(vistaActiva) ? vistaActiva : vistasPermitidas[0];
-  const offlineLabel = `${cantidadOffline} pendiente${cantidadOffline === 1 ? '' : 's'}`;
+  const offlineLabel = lecturaPendientesError || cantidadOffline === null
+    ? 'Pendientes sin verificar'
+    : `${cantidadOffline} pendiente${cantidadOffline === 1 ? '' : 's'}`;
   const vistaLabel = vistaSegura === 'activaciones'
     ? 'Vista historial'
     : vistaSegura === 'control'
@@ -1594,7 +1965,7 @@ function AppShell() {
         <View style={styles.tabsRow}>
           {puedeFormulario && <TouchableOpacity
             style={[styles.tabBtn, vistaSegura === 'formulario' ? styles.tabBtnActive : null]}
-            onPress={() => setVistaActiva('formulario')}
+            onPress={() => cambiarVista('formulario')}
           >
             <Text style={[styles.tabBtnText, vistaSegura === 'formulario' ? styles.tabBtnTextActive : null]}>
               Formulario
@@ -1603,7 +1974,7 @@ function AppShell() {
 
           {puedeControl && <TouchableOpacity
             style={[styles.tabBtn, vistaSegura === 'control' ? styles.tabBtnActive : null]}
-            onPress={() => setVistaActiva('control')}
+            onPress={() => cambiarVista('control')}
           >
             <Text style={[styles.tabBtnText, vistaSegura === 'control' ? styles.tabBtnTextActive : null]}>
               Métricas
@@ -1612,7 +1983,7 @@ function AppShell() {
 
           {puedeActivaciones && <TouchableOpacity
             style={[styles.tabBtn, vistaSegura === 'activaciones' ? styles.tabBtnActive : null]}
-            onPress={() => setVistaActiva('activaciones')}
+            onPress={() => cambiarVista('activaciones')}
           >
             <Text style={[styles.tabBtnText, vistaSegura === 'activaciones' ? styles.tabBtnTextActive : null]}>
               Activaciones
@@ -1621,7 +1992,7 @@ function AppShell() {
 
           <TouchableOpacity
             style={[styles.tabBtn, vistaSegura === 'notificaciones' ? styles.tabBtnActive : null]}
-            onPress={() => setVistaActiva('notificaciones')}
+            onPress={() => cambiarVista('notificaciones')}
           >
             <Text style={[styles.tabBtnText, vistaSegura === 'notificaciones' ? styles.tabBtnTextActive : null]}>
               Notificaciones
@@ -1640,9 +2011,20 @@ function AppShell() {
 
       <View style={styles.body}>
         {vistaSegura === 'activaciones' ? (
-          <FormulariosPorImpulsador usuario={usuario} onSincronizar={sincronizarFormularios} />
+          <FormulariosPorImpulsador
+            usuario={usuario}
+            isConnected={isConnected}
+            isInternetReachable={isInternetReachable}
+            onSincronizar={sincronizarFormularios}
+          />
         ) : vistaSegura === 'control' ? (
-          <ControlActivadores usuario={usuario} isConnected={isConnected} />
+          <ControlActivadores
+            usuario={usuario}
+            isConnected={isConnected}
+            rolesError={rolesCargaError}
+            metricasVersion={metricasVersion}
+            onActualizarRoles={reintentarCargaRoles}
+          />
         ) : vistaSegura === 'notificaciones' ? (
           <NotificacionesScreen
             usuarioId={usuario?.id}
@@ -1651,17 +2033,18 @@ function AppShell() {
           />
         ) : (
           <FormularioActivacion
-            cantidadOffline={cantidadOffline}
+            cantidadOffline={lecturaPendientesError ? null : cantidadOffline}
             contarFormulariosLocales={contarFormulariosLocales}
             isConnected={isConnected}
             onSincronizar={sincronizarFormularios}
-            onVerActivaciones={() => setVistaActiva('activaciones')}
+            onRegistrarFlushBorrador={registrarFlushBorrador}
+            onVerActivaciones={() => cambiarVista('activaciones')}
             usuario={usuario}
           />
         )}
       </View>
 
-      <Modal visible={pinModalVisible} transparent animationType="fade" onRequestClose={() => { if (!pinGuardando) setPinModalVisible(false); }}>
+      <Modal visible={pinModalVisible} transparent animationType="fade" onRequestClose={cerrarPinModal}>
         <View style={styles.pinModalBackdrop}>
           <View style={styles.pinModalCard}>
             <Text style={styles.pinModalTitle}>{pinConfigurado ? 'Cambiar PIN local' : 'Configurar PIN local'}</Text>
@@ -1690,12 +2073,11 @@ function AppShell() {
             />
             <View style={styles.pinModalActions}>
               <TouchableOpacity
-                style={[styles.pinBtnSecondary, pinGuardando && styles.pinBtnDisabled]}
-                onPress={() => { if (!pinGuardando) setPinModalVisible(false); }}
-                disabled={pinGuardando}
+                style={styles.pinBtnSecondary}
+                onPress={cerrarPinModal}
                 activeOpacity={0.85}
               >
-                <Text style={styles.pinBtnSecondaryText}>Cancelar</Text>
+                <Text style={styles.pinBtnSecondaryText}>{pinGuardando ? 'Cerrar' : 'Cancelar'}</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.pinBtnPrimary, pinGuardando && styles.pinBtnDisabled]}
@@ -1710,6 +2092,9 @@ function AppShell() {
                 )}
               </TouchableOpacity>
             </View>
+            {pinGuardandoLento ? (
+              <Text style={styles.pinProcessingText}>El PIN continúa procesándose de forma segura. Espera a que finalice.</Text>
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -1858,6 +2243,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'flex-end',
     marginTop: spacing.sm,
+  },
+  pinProcessingText: {
+    color: colors.muted,
+    fontSize: fontSizes.small,
+    marginTop: spacing.sm,
+    textAlign: 'center',
   },
   pinBtnPrimary: {
     backgroundColor: colors.primary,

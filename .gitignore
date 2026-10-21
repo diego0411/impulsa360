@@ -46,3 +46,11 @@ releases/
 # local emulator artifacts (no versionables)
 __azurite_db_blob*.json
 supabase/.temp/
+
+# local APK/AAB build artifacts (no versionables)
+*.apk
+*.aab
+
+# tooling / emulator dirs (no versionables)
+.qodo/
+__blobstorage__/

@@ -1,28 +1,32 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
   Modal,
-  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   TouchableOpacity,
   View,
   useWindowDimensions,
 } from 'react-native';
-import DateTimePicker from '@react-native-community/datetimepicker';
-import { Picker } from '@react-native-picker/picker';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
 import { resolverUrlDeFoto } from '../lib/upload';
 import { etiquetaPlaza } from '../lib/plazas';
-import { fechaLocalIso, obtenerQuincenaActual } from '../lib/quincena';
+import { fechaBolivia } from '../lib/fechaBolivia';
+import {
+  PERIODO_MES_ACTUAL,
+  crearOpcionesPeriodoMensual,
+  fechaEnPeriodoMensual,
+  resolverPeriodoMensual,
+} from '../lib/periodoMensual';
 import { withTimeout } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
+import { resolverConsultaDetalleMetricas } from '../lib/controlActivadoresScope';
 import { colors, fontSizes, radius, spacing } from '../styles/theme';
+import SelectorRN from './SelectorRN';
 
 const QUERY_TIMEOUT_MS = 12000;
 
@@ -46,6 +50,9 @@ const esRolAdministrador = (value) => {
   );
 };
 const esRolActivador = (value) => rolesNormalizados(value).includes('activador');
+const esRolLider = (value) => ['lider', 'leader', 'supervisor'].some(
+  (item) => rolesNormalizados(value).includes(item),
+);
 
 const TIPOS_ACTIVACION = [
   { key: 'comercio', label: 'Comercio' },
@@ -68,14 +75,6 @@ const claveDetalleFiltrada = (equipoId, activadorId, desde, hasta) => [
 const nombreVisible = (value, fallback) => normalizarNombreVisible(value || '') || fallback;
 const fechaVisible = (item) => String(item?.fecha_activacion || item?.created_at || '').slice(0, 10) || 'Sin fecha';
 const clienteVisible = (item) => [item?.nombres_cliente, item?.apellidos_cliente].filter(Boolean).join(' ').trim();
-const fechaPicker = (value) => (value ? new Date(`${value}T12:00:00`) : new Date());
-const fechaIso = (date) => date.toISOString().slice(0, 10);
-const fechaLegible = (value) => {
-  if (!value) return 'Todas';
-  const [year, month, day] = String(value).split('-');
-  if (!year || !month || !day) return value;
-  return `${day}/${month}/${year}`;
-};
 const esReactivacionTipo = (tipo) => /reactivacion/i.test(String(tipo || ''));
 const esReimpresionTipo = (tipo) => String(tipo || '').toLowerCase() === 'reimpresion_qr';
 const porcentaje = (cantidad, total) => (total > 0 ? `${Math.round((cantidad / total) * 100)}%` : '0%');
@@ -106,9 +105,31 @@ const resumirActivadores = (activadores) => (activadores || []).reduce((resumen,
   activadores: resumen.activadores + 1,
   hoy: resumen.hoy + Number(activador?.hoy || 0),
   semana: resumen.semana + Number(activador?.semana || 0),
-  mes: resumen.mes + Number(activador?.mes || 0),
+  mes: resumen.mes + Number(activador?.total || 0),
   total: resumen.total + Number(activador?.total || 0),
 }), { activadores: 0, hoy: 0, semana: 0, mes: 0, total: 0 });
+
+const inicioSemanaBolivia = (hoy = fechaBolivia()) => {
+  const base = new Date(`${hoy}T12:00:00Z`);
+  if (Number.isNaN(base.getTime())) return '';
+  base.setUTCDate(base.getUTCDate() - ((base.getUTCDay() + 6) % 7));
+  return base.toISOString().slice(0, 10);
+};
+
+const resumirActivaciones = (activaciones = [], hoy = fechaBolivia(), periodo) => {
+  const lista = Array.isArray(activaciones) ? activaciones : [];
+  const inicioSemana = inicioSemanaBolivia(hoy);
+  return {
+    activadores: new Set(lista.map((item) => item?.usuario_id).filter(Boolean)).size,
+    hoy: lista.filter((item) => fechaVisible(item) === hoy).length,
+    semana: lista.filter((item) => {
+      const fecha = fechaVisible(item);
+      return !!fecha && fecha >= inicioSemana && fecha <= hoy;
+    }).length,
+    mes: lista.filter((item) => fechaEnPeriodoMensual(fechaVisible(item), periodo)).length,
+    total: lista.length,
+  };
+};
 
 const agruparJerarquia = (rows) => {
   const lideres = new Map();
@@ -161,7 +182,13 @@ const agruparJerarquia = (rows) => {
     .sort((a, b) => a.nombre.localeCompare(b.nombre));
 };
 
-export default function ControlActivadores({ usuario, isConnected }) {
+export default function ControlActivadores({
+  usuario,
+  isConnected,
+  rolesError = '',
+  metricasVersion = 0,
+  onActualizarRoles,
+}) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -170,30 +197,89 @@ export default function ControlActivadores({ usuario, isConnected }) {
   const [detalleLoading, setDetalleLoading] = useState({});
   const [detalleErrores, setDetalleErrores] = useState({});
   const [vistaDetalle, setVistaDetalle] = useState(false);
-  const [filtros, setFiltros] = useState({ desde: '', hasta: '', activador: '', tipo: '' });
-  const [filtrosAplicados, setFiltrosAplicados] = useState({ desde: '', hasta: '' });
-  const [filtrosError, setFiltrosError] = useState('');
-  const [selectorFecha, setSelectorFecha] = useState(null);
+  const [filtros, setFiltros] = useState({ activador: '', tipo: '' });
+  const [filtrosAplicados, setFiltrosAplicados] = useState({ tipo: '' });
+  const [periodoSeleccionado, setPeriodoSeleccionado] = useState(PERIODO_MES_ACTUAL);
   const [activadorSeleccionado, setActivadorSeleccionado] = useState(null);
   const [activacionSeleccionada, setActivacionSeleccionada] = useState(null);
   const [foto, setFoto] = useState(null);
   const [fotoLoading, setFotoLoading] = useState(false);
   const [fotoError, setFotoError] = useState('');
   const [resumenTiposGlobal, setResumenTiposGlobal] = useState(resumenTiposVacio);
+  const [resumenTiposError, setResumenTiposError] = useState('');
+  const [resumenGlobalFiltrado, setResumenGlobalFiltrado] = useState(null);
+  const [modoMetricas, setModoMetricas] = useState('equipo');
+  const [recargaPendiente, setRecargaPendiente] = useState(0);
+  const [rolesRefreshing, setRolesRefreshing] = useState(false);
+  const cargaEnCursoRef = useRef(false);
+  const recargaPendienteRef = useRef(false);
+  const actualizacionManualRef = useRef(null);
+  const consultaGeneracionRef = useRef(0);
+  const montadoRef = useRef(true);
+  const consultaClaveRef = useRef('');
   const { height } = useWindowDimensions();
   const rolesUsuario = [usuario?.rol, usuario?.role, usuario?.roles];
   const administrador = esRolAdministrador(rolesUsuario);
-  const activadorSolo = !administrador && esRolActivador(rolesUsuario);
+  const activador = esRolActivador(rolesUsuario);
+  const lider = esRolLider(rolesUsuario);
+  const activadorSolo = !administrador && !lider && activador;
+  const multirrolActivadorLider = !administrador && activador && lider;
+  const vistaPersonal = activadorSolo || (multirrolActivadorLider && modoMetricas === 'personal');
   const usuarioId = usuario?.id;
-  const hoyLocal = fechaLocalIso(new Date());
-  const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
-  const filtrosConsulta = useMemo(() => (
-    administrador
-      ? filtrosAplicados
-      : rangoQuincena
-  ), [administrador, filtrosAplicados, rangoQuincena]);
+  const rolesClave = rolesUsuario.flatMap(rolesNormalizados).sort().join(',');
+  const hoyBolivia = fechaBolivia();
+  const filtrosConsulta = useMemo(
+    () => resolverPeriodoMensual(periodoSeleccionado, hoyBolivia),
+    [hoyBolivia, periodoSeleccionado],
+  );
+  const opcionesPeriodo = useMemo(
+    () => crearOpcionesPeriodoMensual(hoyBolivia),
+    [hoyBolivia],
+  );
+  const tipoConsulta = filtrosAplicados.tipo;
 
-  const cargarResumenTiposGlobal = useCallback(async (rowsData = []) => {
+  const invalidarConsultas = useCallback(() => {
+    consultaGeneracionRef.current += 1;
+    return consultaGeneracionRef.current;
+  }, []);
+  const consultaVigente = useCallback((generacion) => (
+    montadoRef.current && consultaGeneracionRef.current === generacion
+  ), []);
+
+  useEffect(() => {
+    montadoRef.current = true;
+    return () => {
+      montadoRef.current = false;
+      invalidarConsultas();
+      recargaPendienteRef.current = false;
+      actualizacionManualRef.current = null;
+    };
+  }, [invalidarConsultas]);
+
+  const claveConsulta = [
+    usuarioId,
+    usuario?.estado || '',
+    rolesClave,
+    vistaPersonal ? 'personal' : 'equipo',
+    filtrosConsulta.desde,
+    filtrosConsulta.hasta,
+    tipoConsulta,
+    metricasVersion,
+    isConnected ? 'online' : 'offline',
+  ].join('|');
+
+  useLayoutEffect(() => {
+    if (consultaClaveRef.current === claveConsulta) return;
+    consultaClaveRef.current = claveConsulta;
+    invalidarConsultas();
+    setLoading(true);
+    setDetalles({});
+    setDetalleLoading({});
+    setDetalleErrores({});
+  }, [claveConsulta, invalidarConsultas]);
+
+  const cargarResumenTiposGlobal = useCallback(async (rowsData = [], generacion) => {
+    const vigente = () => consultaVigente(generacion);
     const pares = new Map();
     (Array.isArray(rowsData) ? rowsData : []).forEach((row) => {
       if (!row?.equipo_id || !row?.activador_id) return;
@@ -204,12 +290,16 @@ export default function ControlActivadores({ usuario, isConnected }) {
     });
 
     if (pares.size === 0) {
+      if (!vigente()) return { status: 'stale', rows: rowsData };
       setResumenTiposGlobal(resumenTiposVacio);
-      return;
+      setResumenTiposError('');
+      setResumenGlobalFiltrado(tipoConsulta ? resumenTiposVacio : null);
+      return { status: 'ok', rows: rowsData };
     }
 
     try {
-      const resultados = await Promise.all([...pares.values()].map(({ equipoId, activadorId }) =>
+      const paresDetalle = [...pares.values()];
+      const resultados = await Promise.all(paresDetalle.map(({ equipoId, activadorId }) =>
         withTimeout(
           supabase.rpc('control_activaciones_detalle', {
             p_activador_id: activadorId,
@@ -221,30 +311,77 @@ export default function ControlActivadores({ usuario, isConnected }) {
           'La señal está muy débil para cargar métricas.'
         )
       ));
-      const activaciones = resultados.flatMap(({ data, error: queryError }) => {
-        if (queryError || !Array.isArray(data)) return [];
-        return data;
-      });
-      setResumenTiposGlobal(calcularResumenTipos(activaciones));
-    } catch {
+      if (!vigente()) return { status: 'stale', rows: rowsData };
+      const resultadoInvalido = resultados.find(({ error: queryError, data }) => queryError || !Array.isArray(data));
+      if (resultadoInvalido) {
+        throw resultadoInvalido.error || new Error('La respuesta de detalle no contiene activaciones válidas.');
+      }
+      const activacionesPorIntegrante = resultados.map(({ data }, index) => ({
+        ...paresDetalle[index],
+        activaciones: tipoConsulta
+          ? data.filter((item) => item?.tipo_activacion === tipoConsulta)
+          : data,
+      }));
+      const activaciones = activacionesPorIntegrante.flatMap(({ activaciones: lista }) => lista);
+      const activacionesFiltradas = tipoConsulta
+        ? activaciones.filter((item) => item?.tipo_activacion === tipoConsulta)
+        : activaciones;
+      const metricasPorIntegrante = new Map(
+        activacionesPorIntegrante.map(({ equipoId, activadorId, activaciones: lista }) => [
+          `${equipoId}:${activadorId}`,
+          resumirActivaciones(lista, hoyBolivia, filtrosConsulta),
+        ])
+      );
+      const rowsFiltradas = tipoConsulta
+        ? rowsData.map((row) => {
+          const resumen = metricasPorIntegrante.get(`${row?.equipo_id}:${row?.activador_id}`);
+          return resumen ? { ...row, hoy: resumen.hoy, semana: resumen.semana, mes: resumen.mes, total: resumen.total } : row;
+        })
+        : rowsData;
+      setResumenTiposGlobal(calcularResumenTipos(activacionesFiltradas));
+      setResumenTiposError('');
+      setResumenGlobalFiltrado(tipoConsulta ? resumirActivaciones(activacionesFiltradas, hoyBolivia, filtrosConsulta) : null);
+      return { status: 'ok', rows: rowsFiltradas };
+    } catch (e) {
+      if (!vigente()) return { status: 'stale', rows: rowsData };
       setResumenTiposGlobal(resumenTiposVacio);
+      setResumenGlobalFiltrado(null);
+      setResumenTiposError(e?.message || 'No se pudo cargar el resumen por tipo.');
+      return { status: 'error', rows: rowsData };
     }
-  }, [filtrosConsulta.desde, filtrosConsulta.hasta]);
+  }, [consultaVigente, filtrosConsulta, hoyBolivia, tipoConsulta]);
 
   const cargar = useCallback(async ({ manual = false } = {}) => {
+    if (cargaEnCursoRef.current) {
+      recargaPendienteRef.current = true;
+      return;
+    }
+    cargaEnCursoRef.current = true;
+    const generacion = consultaGeneracionRef.current;
+    const vigente = () => consultaVigente(generacion);
     if (!isConnected) {
-      setError('Conéctate a internet para actualizar Control Activadores.');
-      setLoading(false);
-      setRefreshing(false);
+      if (vigente()) {
+        setError('Conéctate a internet para actualizar Control Activadores.');
+        setLoading(false);
+        setRefreshing(false);
+      }
+      cargaEnCursoRef.current = false;
       return;
     }
 
-    if (manual) setRefreshing(true);
-    else setLoading(true);
-    setError('');
+    if (vigente()) {
+      if (manual) setRefreshing(true);
+      else setLoading(true);
+      setError('');
+      if (manual) {
+        setDetalles({});
+        setDetalleLoading({});
+        setDetalleErrores({});
+      }
+    }
 
     try {
-      if (activadorSolo) {
+      if (vistaPersonal) {
         let query = supabase
           .from('activaciones')
           .select('*')
@@ -260,14 +397,14 @@ export default function ControlActivadores({ usuario, isConnected }) {
           'La señal está muy débil para cargar métricas.'
         );
         if (queryError) throw queryError;
+        if (!vigente()) return;
 
-        const activaciones = Array.isArray(data) ? data : [];
+        const activacionesBase = Array.isArray(data) ? data : [];
+        const activaciones = tipoConsulta
+          ? activacionesBase.filter((item) => item?.tipo_activacion === tipoConsulta)
+          : activacionesBase;
         const activadorNombre = nombreVisible(usuario?.nombre || usuario?.email, 'Mis métricas');
-        const hoy = new Date().toISOString().slice(0, 10);
-        const inicioSemana = new Date();
-        inicioSemana.setDate(inicioSemana.getDate() - inicioSemana.getDay() + 1);
-        inicioSemana.setHours(0, 0, 0, 0);
-        const mes = hoy.slice(0, 7);
+        const resumenPropio = resumirActivaciones(activaciones, hoyBolivia, filtrosConsulta);
         const rowPropia = {
           lider_id: usuarioId,
           lider_nombre: activadorNombre,
@@ -276,18 +413,15 @@ export default function ControlActivadores({ usuario, isConnected }) {
           equipo_nombre: 'Mis activaciones',
           activador_id: usuarioId,
           activador_nombre: activadorNombre,
-          hoy: activaciones.filter((item) => fechaVisible(item) === hoy).length,
-          semana: activaciones.filter((item) => {
-            const fecha = new Date(`${fechaVisible(item)}T00:00:00`);
-            return fecha >= inicioSemana;
-          }).length,
-          mes: activaciones.filter((item) => fechaVisible(item).slice(0, 7) === mes).length,
-          total: activaciones.length,
+          ...resumenPropio,
         };
         const detailKey = claveDetalleFiltrada('propio', usuarioId, filtrosConsulta.desde, filtrosConsulta.hasta);
+        if (!vigente()) return;
         setRows([rowPropia]);
         setDetalles({ [detailKey]: activaciones });
         setResumenTiposGlobal(calcularResumenTipos(activaciones));
+        setResumenTiposError('');
+        setResumenGlobalFiltrado(null);
         if (manual) setDetalleErrores({});
         return;
       }
@@ -301,32 +435,54 @@ export default function ControlActivadores({ usuario, isConnected }) {
         'La señal está muy débil para cargar métricas.'
       );
       if (queryError) throw queryError;
+      if (!vigente()) return;
       const rowsData = Array.isArray(data) ? data : [];
-      setRows(rowsData);
-      cargarResumenTiposGlobal(rowsData);
-      if (manual) {
-        setDetalles({});
-        setDetalleErrores({});
-      }
+      const resumen = await cargarResumenTiposGlobal(rowsData, generacion);
+      if (!vigente() || resumen.status === 'stale') return;
+      setRows(resumen.rows);
     } catch (e) {
-      setError(e?.message || 'No se pudo cargar la jerarquía de activadores.');
-      if (!manual) setRows([]);
+      if (vigente()) {
+        setError(e?.message || 'No se pudo cargar la jerarquía de activadores.');
+        if (!manual) setRows([]);
+      }
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      cargaEnCursoRef.current = false;
+      if (vigente()) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+      if (recargaPendienteRef.current) {
+        recargaPendienteRef.current = false;
+        if (montadoRef.current) setRecargaPendiente((actual) => actual + 1);
+      }
     }
-  }, [activadorSolo, cargarResumenTiposGlobal, filtrosConsulta.desde, filtrosConsulta.hasta, isConnected, usuario?.email, usuario?.nombre, usuarioId]);
+  }, [cargarResumenTiposGlobal, consultaVigente, filtrosConsulta, hoyBolivia, isConnected, tipoConsulta, usuario?.email, usuario?.nombre, usuarioId, vistaPersonal]);
 
   useEffect(() => {
     cargar();
-  }, [cargar]);
+  }, [cargar, metricasVersion, recargaPendiente]);
+
+  const actualizarControl = useCallback(() => {
+    if (actualizacionManualRef.current) return actualizacionManualRef.current;
+    if (typeof onActualizarRoles !== 'function') return cargar({ manual: true });
+
+    invalidarConsultas();
+    setRolesRefreshing(true);
+    const actualizacion = Promise.resolve().then(onActualizarRoles).finally(() => {
+      if (actualizacionManualRef.current === actualizacion) actualizacionManualRef.current = null;
+      if (montadoRef.current) setRolesRefreshing(false);
+    });
+    actualizacionManualRef.current = actualizacion;
+    return actualizacion;
+  }, [cargar, invalidarConsultas, onActualizarRoles]);
 
   const jerarquia = useMemo(() => agruparJerarquia(rows), [rows]);
   const activadoresGlobales = useMemo(
     () => jerarquia.flatMap((lider) => lider.equipos.flatMap((equipo) => equipo.activadores)),
     [jerarquia],
   );
-  const resumenGlobal = useMemo(() => resumirActivadores(activadoresGlobales), [activadoresGlobales]);
+  const resumenGlobalBase = useMemo(() => resumirActivadores(activadoresGlobales), [activadoresGlobales]);
+  const resumenGlobal = tipoConsulta ? resumenGlobalFiltrado : resumenGlobalBase;
   const integrantes = useMemo(
     () => jerarquia.flatMap((lider) => lider.equipos.flatMap((equipo) => equipo.activadores.map((activador) => ({
       ...activador,
@@ -339,48 +495,66 @@ export default function ControlActivadores({ usuario, isConnected }) {
     [jerarquia],
   );
   const integrantesFiltrados = useMemo(() => {
-    if (activadorSolo) return integrantes.filter((item) => item.id === usuarioId);
+    if (vistaPersonal) return integrantes.filter((item) => item.id === usuarioId);
     if (!filtros.activador) return integrantes;
     return integrantes.filter((item) => item.id === filtros.activador);
-  }, [activadorSolo, filtros.activador, integrantes, usuarioId]);
+  }, [filtros.activador, integrantes, usuarioId, vistaPersonal]);
 
   const cargarActivaciones = useCallback(async (equipoId, activadorId) => {
     const key = claveDetalleFiltrada(equipoId, activadorId, filtrosConsulta.desde, filtrosConsulta.hasta);
     if (Object.prototype.hasOwnProperty.call(detalles, key) || detalleLoading[key]) return;
+    const generacion = consultaGeneracionRef.current;
+    const vigente = () => consultaVigente(generacion);
 
+    if (!vigente()) return;
     setDetalleLoading((actual) => ({ ...actual, [key]: true }));
     setDetalleErrores((actual) => ({ ...actual, [key]: '' }));
     try {
-      const { data, error: queryError } = await withTimeout(
-        supabase.rpc('control_activaciones_detalle', {
-          p_activador_id: activadorId,
-          p_equipo_id: equipoId,
+      const consulta = resolverConsultaDetalleMetricas({ vistaPersonal, usuarioId, equipoId, activadorId });
+      let solicitud;
+      if (consulta.tipo === 'personal') {
+        solicitud = supabase
+          .from('activaciones')
+          .select('*')
+          .eq('usuario_id', consulta.usuarioId)
+          .order('fecha_activacion', { ascending: false });
+        if (filtrosConsulta.desde) solicitud = solicitud.gte('fecha_activacion', filtrosConsulta.desde);
+        if (filtrosConsulta.hasta) solicitud = solicitud.lte('fecha_activacion', filtrosConsulta.hasta);
+      } else {
+        solicitud = supabase.rpc('control_activaciones_detalle', {
+          p_activador_id: consulta.activadorId,
+          p_equipo_id: consulta.equipoId,
           p_desde: filtrosConsulta.desde || null,
           p_hasta: filtrosConsulta.hasta || null,
-        }),
+        });
+      }
+      const { data, error: queryError } = await withTimeout(
+        solicitud,
         QUERY_TIMEOUT_MS,
         'La señal está muy débil para cargar el detalle.'
       );
       if (queryError) throw queryError;
+      if (!vigente()) return;
       setDetalles((actual) => ({ ...actual, [key]: Array.isArray(data) ? data : [] }));
     } catch (e) {
+      if (!vigente()) return;
       setDetalleErrores((actual) => ({
         ...actual,
         [key]: e?.message || 'No se pudieron cargar las activaciones.',
       }));
     } finally {
-      setDetalleLoading((actual) => ({ ...actual, [key]: false }));
+      if (vigente()) setDetalleLoading((actual) => ({ ...actual, [key]: false }));
     }
-  }, [detalleLoading, detalles, filtrosConsulta.desde, filtrosConsulta.hasta]);
+  }, [consultaVigente, detalleLoading, detalles, filtrosConsulta.desde, filtrosConsulta.hasta, usuarioId, vistaPersonal]);
 
   const seleccionarActivador = useCallback((activador) => {
-    if (activadorSolo && activador?.id !== usuarioId) return;
+    if (vistaPersonal && activador?.id !== usuarioId) return;
     setActivadorSeleccionado(activador);
     cargarActivaciones(activador.equipoId, activador.id);
-  }, [activadorSolo, cargarActivaciones, usuarioId]);
+  }, [cargarActivaciones, usuarioId, vistaPersonal]);
 
   const seleccionarFiltroActivador = useCallback((activadorId) => {
-    if (activadorSolo) return;
+    if (vistaPersonal) return;
     setFiltros((actual) => ({ ...actual, activador: activadorId }));
     setActivacionSeleccionada(null);
     if (!activadorId) {
@@ -389,65 +563,43 @@ export default function ControlActivadores({ usuario, isConnected }) {
     }
     const activador = integrantes.find((item) => item.id === activadorId);
     if (activador) seleccionarActivador(activador);
-  }, [activadorSolo, integrantes, seleccionarActivador]);
-
-  const cambiarFecha = useCallback((campo, event, date) => {
-    if (Platform.OS !== 'ios') setSelectorFecha(null);
-    if (event?.type === 'dismissed' || !date) return;
-    setFiltros((actual) => ({ ...actual, [campo]: fechaIso(date) }));
-    setFiltrosError('');
-  }, []);
+  }, [integrantes, seleccionarActivador, vistaPersonal]);
 
   const aplicarFiltros = useCallback(() => {
-    const desde = filtros.desde.trim();
-    const hasta = filtros.hasta.trim();
-    if (desde && hasta && desde > hasta) {
-      setFiltrosError('La fecha Desde no puede ser mayor que Hasta.');
-      return;
-    }
-    setFiltrosError('');
+    invalidarConsultas();
+    setLoading(true);
     setDetalles({});
+    setDetalleLoading({});
     setDetalleErrores({});
     setActivacionSeleccionada(null);
-    setFiltrosAplicados({ desde, hasta });
-  }, [filtros.desde, filtros.hasta]);
+    setFiltrosAplicados({ tipo: filtros.tipo });
+  }, [filtros.tipo, invalidarConsultas]);
 
-  const renderControlFecha = (campo, label) => (
-    <View style={styles.filterInput}>
-      <Text style={styles.filterLabel}>{label}</Text>
-      {Platform.OS === 'web' ? (
-        <View style={styles.webDateWrapper}>
-          <Text style={styles.dateButtonText}>{fechaLegible(filtros[campo])}</Text>
-          <TextInput
-            accessibilityLabel={label}
-            value={filtros[campo]}
-            onChangeText={(value) => {
-              setFiltros((actual) => ({ ...actual, [campo]: value }));
-              setFiltrosError('');
-            }}
-            style={styles.webDateInput}
-            type="date"
-          />
-        </View>
-      ) : (
-        <TouchableOpacity style={styles.dateButton} onPress={() => setSelectorFecha(campo)}>
-          <Text style={styles.dateButtonText}>{fechaLegible(filtros[campo])}</Text>
-        </TouchableOpacity>
-      )}
-      {!!filtros[campo] && (
-        <TouchableOpacity
-          style={styles.clearDateButton}
-          onPress={() => {
-            setFiltros((actual) => ({ ...actual, [campo]: '' }));
-            setFiltrosError('');
-            if (selectorFecha === campo) setSelectorFecha(null);
-          }}
-        >
-          <Text style={styles.clearDateText}>Limpiar</Text>
-        </TouchableOpacity>
-      )}
-    </View>
-  );
+  const seleccionarPeriodo = useCallback((periodo) => {
+    if (periodo === periodoSeleccionado) return;
+    invalidarConsultas();
+    setLoading(true);
+    setPeriodoSeleccionado(periodo);
+    setVistaDetalle(false);
+    setActivadorSeleccionado(null);
+    setActivacionSeleccionada(null);
+    setDetalles({});
+    setDetalleLoading({});
+    setDetalleErrores({});
+  }, [invalidarConsultas, periodoSeleccionado]);
+
+  const seleccionarModoMetricas = useCallback((modo) => {
+    if (modo === modoMetricas) return;
+    invalidarConsultas();
+    setLoading(true);
+    setModoMetricas(modo);
+    setVistaDetalle(false);
+    setActivadorSeleccionado(null);
+    setActivacionSeleccionada(null);
+    setDetalles({});
+    setDetalleLoading({});
+    setDetalleErrores({});
+  }, [invalidarConsultas, modoMetricas]);
 
   useEffect(() => {
     if (!activadorSeleccionado) return;
@@ -489,13 +641,13 @@ export default function ControlActivadores({ usuario, isConnected }) {
     <>
       <View style={styles.globalGrid}>
         {[
-          ['Activadores', resumenGlobal.activadores],
-          ['Hoy', resumenGlobal.hoy],
-          ['Semana', resumenGlobal.semana],
-          ['Mes', resumenGlobal.mes],
-          ['Total', resumenGlobal.total],
-          ['Reactivación', `${resumenTiposGlobal.reactivaciones} · ${porcentaje(resumenTiposGlobal.reactivaciones, resumenTiposGlobal.total)}`],
-          ['Reimpresión', `${resumenTiposGlobal.reimpresiones} · ${porcentaje(resumenTiposGlobal.reimpresiones, resumenTiposGlobal.total)}`],
+          ['Activadores', resumenGlobal?.activadores ?? 'N/D'],
+          ['Hoy', resumenGlobal?.hoy ?? 'N/D'],
+          ['Semana', resumenGlobal?.semana ?? 'N/D'],
+          ['Mes', resumenGlobal?.mes ?? 'N/D'],
+          ['Total', resumenGlobal?.total ?? 'N/D'],
+          ['Reactivación', resumenTiposError ? 'N/D' : `${resumenTiposGlobal.reactivaciones} · ${porcentaje(resumenTiposGlobal.reactivaciones, resumenTiposGlobal.total)}`],
+          ['Reimpresión', resumenTiposError ? 'N/D' : `${resumenTiposGlobal.reimpresiones} · ${porcentaje(resumenTiposGlobal.reimpresiones, resumenTiposGlobal.total)}`],
         ].map(([label, value]) => (
           <View key={label} style={styles.globalMetric}>
             <Text style={[styles.globalValue, typeof value === 'string' && styles.globalValueCompact]}>{value}</Text>
@@ -503,7 +655,11 @@ export default function ControlActivadores({ usuario, isConnected }) {
           </View>
         ))}
       </View>
-      {activadorSolo && resumenTiposGlobal.tipos.length > 0 && (
+      {!!resumenTiposError && <Text style={styles.inlineError}>{resumenTiposError}</Text>}
+      {!resumenTiposError && resumenGlobal?.total === 0 && (
+        <Text style={styles.emptyInline}>No hay activaciones en {filtrosConsulta.etiqueta}.</Text>
+      )}
+      {vistaPersonal && resumenTiposGlobal.tipos.length > 0 && (
         <View style={styles.typeSummary}>
           <Text style={styles.membersTitle}>Tipos de activación</Text>
           {resumenTiposGlobal.tipos.map((item) => (
@@ -525,23 +681,11 @@ export default function ControlActivadores({ usuario, isConnected }) {
       filtrosConsulta.desde,
       filtrosConsulta.hasta,
     );
-    const tipoFiltro = filtros.tipo;
+    const tipoFiltro = tipoConsulta;
     const activaciones = (detalles[key] || []).filter(
       (item) => !tipoFiltro || item?.tipo_activacion === tipoFiltro,
     );
-    const resumenFiltrado = {
-      hoy: activaciones.filter((item) => fechaVisible(item) === new Date().toISOString().slice(0, 10)).length,
-      semana: activaciones.filter((item) => {
-        const fecha = new Date(`${fechaVisible(item)}T00:00:00`);
-        const hoy = new Date();
-        const inicioSemana = new Date(hoy);
-        inicioSemana.setDate(hoy.getDate() - hoy.getDay() + 1);
-        inicioSemana.setHours(0, 0, 0, 0);
-        return fecha >= inicioSemana && fecha <= hoy;
-      }).length,
-      mes: activaciones.filter((item) => fechaVisible(item).slice(0, 7) === new Date().toISOString().slice(0, 7)).length,
-      total: activaciones.length,
-    };
+    const resumenFiltrado = resumirActivaciones(activaciones, hoyBolivia, filtrosConsulta);
     return (
       <View style={styles.selectedCard}>
         <Text style={styles.selectedName}>{enmascararMarcaVisible(activadorSeleccionado.nombre, usuario)}</Text>
@@ -562,7 +706,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
           ) : detalleErrores[key] ? (
                   <Text style={styles.inlineError}>{enmascararMarcaVisible(detalleErrores[key], usuario)}</Text>
           ) : activaciones.length === 0 ? (
-            <Text style={styles.emptyInline}>No hay activaciones atribuibles a este equipo.</Text>
+            <Text style={styles.emptyInline}>No hay activaciones en {filtrosConsulta.etiqueta}.</Text>
           ) : activaciones.map(renderActivacion)}
         </View>
       </View>
@@ -584,20 +728,54 @@ export default function ControlActivadores({ usuario, isConnected }) {
         <View style={styles.flexOne}>
           <Text style={styles.title}>{vistaDetalle ? 'Ver Detalle' : 'Métricas Generales'}</Text>
           <Text style={styles.subtitle}>
-            {activadorSolo ? 'Solo tus activaciones' : administrador ? 'Todos los equipos autorizados' : 'Tus equipos autorizados'}
+            {vistaPersonal ? 'Solo tus activaciones' : administrador ? 'Todos los equipos autorizados' : 'Tus equipos autorizados'} · {filtrosConsulta.etiqueta}
           </Text>
         </View>
-        <TouchableOpacity style={styles.refreshButton} onPress={() => cargar({ manual: true })} disabled={refreshing}>
-          <Text style={styles.refreshText}>{refreshing ? 'Actualizando…' : 'Actualizar'}</Text>
+        <TouchableOpacity style={styles.refreshButton} onPress={actualizarControl} disabled={refreshing || rolesRefreshing}>
+          <Text style={styles.refreshText}>{refreshing || rolesRefreshing ? 'Actualizando…' : 'Actualizar'}</Text>
         </TouchableOpacity>
       </View>
       {!!error && <View style={styles.errorCard}><Text style={styles.errorText}>{enmascararMarcaVisible(error, usuario)}</Text></View>}
+      {!!rolesError && <View style={styles.errorCard}><Text style={styles.errorText}>{rolesError}</Text></View>}
       <ScrollView
         contentContainerStyle={styles.list}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => cargar({ manual: true })} tintColor={colors.primary} />}
+        refreshControl={<RefreshControl refreshing={refreshing || rolesRefreshing} onRefresh={actualizarControl} tintColor={colors.primary} />}
       >
+        {multirrolActivadorLider && (
+          <View style={styles.modeControl}>
+            <TouchableOpacity
+              style={[styles.modeButton, modoMetricas === 'personal' && styles.modeButtonActive]}
+              onPress={() => seleccionarModoMetricas('personal')}
+              accessibilityRole="button"
+              accessibilityState={{ selected: modoMetricas === 'personal' }}
+            >
+              <Text style={[styles.modeButtonText, modoMetricas === 'personal' && styles.modeButtonTextActive]}>Personales</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.modeButton, modoMetricas === 'equipo' && styles.modeButtonActive]}
+              onPress={() => seleccionarModoMetricas('equipo')}
+              accessibilityRole="button"
+              accessibilityState={{ selected: modoMetricas === 'equipo' }}
+            >
+              <Text style={[styles.modeButtonText, modoMetricas === 'equipo' && styles.modeButtonTextActive]}>Equipo</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+        <View style={styles.periodCard}>
+          <Text style={styles.filterLabel}>Período de métricas</Text>
+          <View style={styles.pickerShell}>
+            <SelectorRN
+              selectedValue={periodoSeleccionado}
+              onValueChange={seleccionarPeriodo}
+              style={styles.picker}
+              accessibilityLabel={`Período de métricas: ${filtrosConsulta.etiqueta}`}
+              options={opcionesPeriodo}
+            />
+          </View>
+          <Text style={styles.periodLabel}>{filtrosConsulta.etiqueta}</Text>
+        </View>
         {jerarquia.length === 0 ? (
-          <View style={styles.emptyCard}><Text style={styles.message}>No hay equipos vigentes para mostrar.</Text></View>
+          <View style={styles.emptyCard}><Text style={styles.message}>No hay equipos o activaciones disponibles en {filtrosConsulta.etiqueta}.</Text></View>
         ) : vistaDetalle ? (
           <>
             <TouchableOpacity
@@ -611,49 +789,37 @@ export default function ControlActivadores({ usuario, isConnected }) {
             </TouchableOpacity>
             <View style={styles.filtersCard}>
               <Text style={styles.membersTitle}>Filtros</Text>
-              <View style={styles.filtersRow}>
-                {renderControlFecha('desde', 'Desde')}
-                {renderControlFecha('hasta', 'Hasta')}
-              </View>
-              {Platform.OS !== 'web' && selectorFecha && (
-                <DateTimePicker
-                  value={fechaPicker(filtros[selectorFecha])}
-                  mode="date"
-                  display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                  onChange={(event, date) => cambiarFecha(selectorFecha, event, date)}
-                />
-              )}
-              {!activadorSolo && (
+              {!vistaPersonal && (
                 <>
                   <Text style={styles.filterLabel}>Activador</Text>
                   <View style={styles.pickerShell}>
-                    <Picker
+                    <SelectorRN
                       selectedValue={filtros.activador}
                       onValueChange={seleccionarFiltroActivador}
                       style={styles.picker}
-                    >
-                      <Picker.Item label="Todos" value="" />
-                      {integrantes.map((item) => (
-                        <Picker.Item key={`${item.equipoId}:${item.id}`} label={enmascararMarcaVisible(item.nombre, usuario)} value={item.id} />
-                      ))}
-                    </Picker>
+                      options={[
+                        { label: 'Todos', value: '' },
+                        ...integrantes.map((item) => ({
+                          label: enmascararMarcaVisible(item.nombre, usuario),
+                          value: item.id,
+                        })),
+                      ]}
+                    />
                   </View>
                 </>
               )}
               <Text style={styles.filterLabel}>Tipo de activación</Text>
               <View style={styles.pickerShell}>
-                <Picker
+                <SelectorRN
                   selectedValue={filtros.tipo}
                   onValueChange={(tipo) => setFiltros((actual) => ({ ...actual, tipo }))}
                   style={styles.picker}
-                >
-                  <Picker.Item label="Todos" value="" />
-                  {TIPOS_ACTIVACION.map((item) => (
-                    <Picker.Item key={item.key} label={item.label} value={item.key} />
-                  ))}
-                </Picker>
+                  options={[
+                    { label: 'Todos', value: '' },
+                    ...TIPOS_ACTIVACION.map((item) => ({ label: item.label, value: item.key })),
+                  ]}
+                />
               </View>
-              {!!filtrosError && <Text style={styles.inlineError}>{filtrosError}</Text>}
               <TouchableOpacity style={styles.applyButton} onPress={aplicarFiltros}>
                 <Text style={styles.applyButtonText}>Aplicar filtros</Text>
               </TouchableOpacity>
@@ -676,7 +842,7 @@ export default function ControlActivadores({ usuario, isConnected }) {
                         {enmascararMarcaVisible(`${item.equipoNumero ? `Equipo ${item.equipoNumero} · ` : ''}${item.equipoNombre}${administrador ? ` · ${item.liderNombre}` : ''}`, usuario)}
                       </Text>
                     </View>
-                    <Text style={styles.memberTotal}>{item.total}</Text>
+                    <Text style={styles.memberTotal}>{tipoConsulta && resumenTiposError ? 'N/D' : item.total}</Text>
                   </TouchableOpacity>
                 );
               })}
@@ -764,6 +930,13 @@ const styles = StyleSheet.create({
   subtitle: { color: colors.textMuted, fontSize: fontSizes.small, marginTop: 3 },
   refreshButton: { backgroundColor: colors.primary, borderRadius: radius.md, paddingHorizontal: spacing.md, paddingVertical: spacing.sm },
   refreshText: { color: '#fff', fontWeight: '700', fontSize: 12 },
+  modeControl: { flexDirection: 'row', alignSelf: 'flex-start', marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder, borderRadius: radius.md, overflow: 'hidden' },
+  modeButton: { paddingHorizontal: spacing.md, paddingVertical: spacing.sm, backgroundColor: colors.surface },
+  modeButtonActive: { backgroundColor: colors.primary },
+  modeButtonText: { color: colors.text, fontWeight: '700', fontSize: fontSizes.small },
+  modeButtonTextActive: { color: '#fff' },
+  periodCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
+  periodLabel: { color: colors.text, fontSize: fontSizes.small, fontWeight: '800', textAlign: 'center' },
   errorCard: { borderColor: colors.danger, borderWidth: 1, borderRadius: radius.md, padding: spacing.sm, marginBottom: spacing.md, backgroundColor: colors.surface },
   errorText: { color: colors.danger },
   list: { paddingBottom: 100 },
@@ -784,15 +957,7 @@ const styles = StyleSheet.create({
   backButtonText: { color: colors.primary, fontWeight: '800' },
   membersCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
   filtersCard: { backgroundColor: colors.surface, borderRadius: radius.lg, padding: spacing.md, marginBottom: spacing.md, borderWidth: 1, borderColor: colors.cardBorder },
-  filtersRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  filterInput: { flex: 1, minWidth: 140 },
   filterLabel: { color: colors.textMuted, fontSize: 12, fontWeight: '800', marginBottom: spacing.xs },
-  dateButton: { minHeight: 44, backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, justifyContent: 'center', paddingHorizontal: spacing.md, marginBottom: spacing.md },
-  dateButtonText: { color: colors.text, fontWeight: '700' },
-  webDateWrapper: { minHeight: 44, backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, justifyContent: 'center', paddingHorizontal: spacing.md, marginBottom: spacing.md, overflow: 'hidden' },
-  webDateInput: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, opacity: 0, cursor: 'pointer' },
-  clearDateButton: { alignSelf: 'flex-start', paddingVertical: spacing.xs, marginBottom: spacing.sm },
-  clearDateText: { color: colors.primary, fontWeight: '800', fontSize: 12 },
   pickerShell: { backgroundColor: colors.surfaceAlt, borderRadius: radius.md, borderWidth: 1, borderColor: colors.cardBorder, marginBottom: spacing.md, overflow: 'hidden' },
   picker: { color: colors.text },
   applyButton: { backgroundColor: colors.primary, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: 'center' },

@@ -22,11 +22,16 @@ import { enmascararMarcaVisible } from '../lib/brandMask';
 import { secureLocalStorage } from '../lib/secureLocalStorage';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 import {
+  getPendingOfflinePinSave,
   getOfflinePinStatus,
   pinPolicy,
   saveOfflinePin,
   verifyOfflinePin,
 } from '../lib/offlinePin';
+import {
+  registrarDiagnosticoRoles,
+  resolverEstadoRoles,
+} from '../lib/rolesAdicionales';
 
 const formatSecondsToMinSec = (seconds = 0) => {
   const safeSeconds = Math.max(0, Number(seconds) || 0);
@@ -56,17 +61,31 @@ export default function AuthScreen({ onLogin }) {
   const [cachedUser, setCachedUser] = useState(null);
   const [offlineReady, setOfflineReady] = useState(false);
   const [offlinePinConfigured, setOfflinePinConfigured] = useState(false);
+  const [offlinePinStorageState, setOfflinePinStorageState] = useState('loading');
   const [offlinePinAttemptsLeft, setOfflinePinAttemptsLeft] = useState(pinPolicy.maxFailedAttempts);
   const [offlinePinLockSeconds, setOfflinePinLockSeconds] = useState(0);
   const [offlinePinInput, setOfflinePinInput] = useState('');
+  const [offlinePinVerificationSlow, setOfflinePinVerificationSlow] = useState(false);
 
   const [pinSetupUser, setPinSetupUser] = useState(null);
   const [pinSetupValue, setPinSetupValue] = useState('');
   const [pinSetupConfirm, setPinSetupConfirm] = useState('');
+  const [pinSetupProcessingSlow, setPinSetupProcessingSlow] = useState(false);
 
   const heroAnim = useRef(new Animated.Value(0)).current;
   const cardAnim = useRef(new Animated.Value(0)).current;
   const mountedRef = useRef(true);
+  const offlineHydrationRef = useRef(0);
+  const authAttemptRef = useRef(0);
+  const offlinePinVerificationSequenceRef = useRef(0);
+  const offlinePinVerificationRef = useRef(null);
+  const pinSaveInFlightRef = useRef(false);
+  const pinSetupUserRef = useRef(pinSetupUser);
+  pinSetupUserRef.current = pinSetupUser;
+  const cachedUserRef = useRef(cachedUser);
+  cachedUserRef.current = cachedUser;
+  const isConnectedRef = useRef(isConnected);
+  isConnectedRef.current = isConnected;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -85,15 +104,20 @@ export default function AuthScreen({ onLogin }) {
 
     return () => {
       mountedRef.current = false;
+      authAttemptRef.current += 1;
+      offlinePinVerificationRef.current = null;
     };
   }, [cardAnim, heroAnim]);
 
   const hydrateOfflineState = useCallback(async ({ knownIsConnected } = {}) => {
+    const hydrationId = offlineHydrationRef.current + 1;
+    offlineHydrationRef.current = hydrationId;
+    const isCurrentHydration = () => mountedRef.current && offlineHydrationRef.current === hydrationId;
     const netOnline =
       typeof knownIsConnected === 'boolean'
         ? knownIsConnected
         : !!(await NetInfo.fetch())?.isConnected;
-    if (!mountedRef.current) return;
+    if (!isCurrentHydration()) return;
     setIsConnected(netOnline);
 
     let usuarioLocal = null;
@@ -106,7 +130,7 @@ export default function AuthScreen({ onLogin }) {
     } catch {
       // ignorar cache inválido
     }
-    if (!mountedRef.current) return;
+    if (!isCurrentHydration()) return;
     setCachedUser(usuarioLocal);
 
     if (usuarioLocal?.id) {
@@ -114,20 +138,27 @@ export default function AuthScreen({ onLogin }) {
       try {
         pinStatus = await getOfflinePinStatus(usuarioLocal.id);
       } catch {
-        pinStatus = { configured: false, remainingSeconds: 0, attemptsLeft: pinPolicy.maxFailedAttempts };
+        pinStatus = {
+          configured: false,
+          storageState: 'unavailable',
+          remainingSeconds: 0,
+          attemptsLeft: pinPolicy.maxFailedAttempts,
+        };
       }
-      if (!mountedRef.current) return;
-      setOfflinePinConfigured(pinStatus.configured);
+      if (!isCurrentHydration()) return;
+      setOfflinePinConfigured(pinStatus.configured && pinStatus.storageState === 'ok');
+      setOfflinePinStorageState(pinStatus.storageState || 'unavailable');
       setOfflinePinLockSeconds(pinStatus.remainingSeconds || 0);
       setOfflinePinAttemptsLeft(pinStatus.attemptsLeft ?? pinPolicy.maxFailedAttempts);
     } else {
-      if (!mountedRef.current) return;
+      if (!isCurrentHydration()) return;
       setOfflinePinConfigured(false);
+      setOfflinePinStorageState('absent');
       setOfflinePinLockSeconds(0);
       setOfflinePinAttemptsLeft(pinPolicy.maxFailedAttempts);
     }
 
-    if (!mountedRef.current) return;
+    if (!isCurrentHydration()) return;
     setOfflineReady(true);
   }, []);
 
@@ -166,8 +197,64 @@ export default function AuthScreen({ onLogin }) {
     onLogin(usuarioFinal, { autenticadoOnline });
   }, [onLogin]);
 
+  const confirmarPinConfigurado = useCallback(async (usuarioFinal) => {
+    let status;
+    try {
+      status = await getOfflinePinStatus(usuarioFinal.id);
+    } catch (error) {
+      throw new Error(`El PIN se guardó, pero no pudo verificarse. ${error?.message || 'Intenta nuevamente.'}`);
+    }
+    if (!status?.configured || status.storageState !== 'ok') {
+      throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
+    }
+    await hydrateOfflineState({ knownIsConnected: true });
+    if (!mountedRef.current || pinSetupUserRef.current?.id !== usuarioFinal.id) return;
+    continuarConUsuario(usuarioFinal, { autenticadoOnline: true });
+  }, [continuarConUsuario, hydrateOfflineState]);
+
+  useEffect(() => {
+    const usuarioSetup = pinSetupUser;
+    if (!usuarioSetup?.id) return undefined;
+    const pending = getPendingOfflinePinSave(usuarioSetup.id);
+    if (!pending) return undefined;
+
+    let vigente = true;
+    let slowTimer = null;
+    pinSaveInFlightRef.current = true;
+    setSubmitting(true);
+    const remainingSlowMs = Math.max(0, 10000 - (Date.now() - pending.startedAt));
+    setPinSetupProcessingSlow(pending.slow || remainingSlowMs === 0);
+    if (!pending.slow && remainingSlowMs > 0) {
+      slowTimer = globalThis.setTimeout(() => {
+        if (vigente && mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+          setPinSetupProcessingSlow(true);
+        }
+      }, remainingSlowMs);
+    }
+    pending.promise
+      .then(() => confirmarPinConfigurado(usuarioSetup))
+      .catch((error) => {
+        if (vigente && mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+          Alert.alert('No se pudo guardar PIN', error?.message || 'Intenta nuevamente.');
+        }
+      })
+      .finally(() => {
+        if (slowTimer) globalThis.clearTimeout(slowTimer);
+        pinSaveInFlightRef.current = false;
+        if (vigente && mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+          setSubmitting(false);
+          setPinSetupProcessingSlow(false);
+        }
+      });
+
+    return () => {
+      vigente = false;
+      if (slowTimer) globalThis.clearTimeout(slowTimer);
+    };
+  }, [confirmarPinConfigurado, pinSetupUser]);
+
   const manejarIngresoOfflineConPin = async () => {
-    if (submitting) return;
+    if (submitting || offlinePinVerificationRef.current) return;
 
     if (!cachedUser?.id) {
       Alert.alert('Sin sesión local', 'Primero inicia sesión una vez con internet.');
@@ -180,12 +267,31 @@ export default function AuthScreen({ onLogin }) {
       return;
     }
 
+    const userId = cachedUser.id;
+    const verificationId = offlinePinVerificationSequenceRef.current + 1;
+    offlinePinVerificationSequenceRef.current = verificationId;
+    offlinePinVerificationRef.current = { id: verificationId, userId };
+    const isCurrentVerification = () => (
+      mountedRef.current
+      && offlinePinVerificationRef.current?.id === verificationId
+      && cachedUserRef.current?.id === userId
+      && isConnectedRef.current === false
+    );
+
     setSubmitting(true);
+    setOfflinePinVerificationSlow(false);
     try {
-      const result = await verifyOfflinePin({ userId: cachedUser.id, pin });
+      const result = await verifyOfflinePin({
+        userId,
+        pin,
+        onSlow: () => {
+          if (isCurrentVerification()) setOfflinePinVerificationSlow(true);
+        },
+      });
+      if (!isCurrentVerification()) return;
 
       if (result.ok) {
-        continuarConUsuario(cachedUser);
+        continuarConUsuario(cachedUserRef.current);
         return;
       }
 
@@ -201,19 +307,37 @@ export default function AuthScreen({ onLogin }) {
       } else if (result.reason === 'not_configured') {
         setOfflinePinConfigured(false);
         Alert.alert('PIN no configurado', 'Conéctate a internet e inicia sesión para configurar tu PIN local.');
+      } else if (result.reason === 'corrupt') {
+        setOfflinePinStorageState('corrupt');
+        Alert.alert('PIN no disponible', 'El registro local del PIN no es válido. Conéctate a internet para recuperarlo sin sobrescribirlo.');
+      } else if (result.reason === 'in_progress') {
+        Alert.alert('Validando PIN', 'La validación anterior continúa procesándose. Espera a que finalice.');
       } else {
+        setOfflinePinStorageState('unavailable');
         Alert.alert('No se pudo validar PIN', 'Verifica tus datos e intenta de nuevo.');
       }
     } catch (err) {
-      Alert.alert('Error', err?.message || 'No se pudo validar el PIN.');
+      if (isCurrentVerification()) {
+        Alert.alert('Error', err?.message || 'No se pudo validar el PIN.');
+      }
     } finally {
-      setSubmitting(false);
-      await hydrateOfflineState({ knownIsConnected: false });
+      const ownsVerificationSlot = offlinePinVerificationRef.current?.id === verificationId;
+      const shouldRefresh = isCurrentVerification();
+      if (ownsVerificationSlot) {
+        offlinePinVerificationRef.current = null;
+      }
+      if (mountedRef.current && ownsVerificationSlot) {
+        setSubmitting(false);
+        setOfflinePinVerificationSlow(false);
+      }
+      if (shouldRefresh) {
+        await hydrateOfflineState({ knownIsConnected: false });
+      }
     }
   };
 
   const guardarPinYContinuar = async () => {
-    if (submitting) return;
+    if (submitting || pinSaveInFlightRef.current) return;
     if (!pinSetupUser?.id) return;
 
     const pin = normalizePinInput(pinSetupValue);
@@ -229,24 +353,31 @@ export default function AuthScreen({ onLogin }) {
       return;
     }
 
+    const usuarioSetup = pinSetupUser;
+    let slowTimer = null;
+    pinSaveInFlightRef.current = true;
     setSubmitting(true);
+    setPinSetupProcessingSlow(false);
     try {
-      await saveOfflinePin({ userId: pinSetupUser.id, pin });
-      let status;
-      try {
-        status = await getOfflinePinStatus(pinSetupUser.id);
-      } catch (verifyError) {
-        throw new Error(`El PIN se guardó, pero no pudo verificarse. ${verifyError?.message || 'Intenta nuevamente.'}`);
-      }
-      if (!status?.configured) {
-        throw new Error('El PIN se guardó, pero no pudo verificarse. Intenta nuevamente.');
-      }
-      await hydrateOfflineState({ knownIsConnected: true });
-      continuarConUsuario(pinSetupUser, { autenticadoOnline: true });
+      slowTimer = globalThis.setTimeout(() => {
+        if (mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+          setPinSetupProcessingSlow(true);
+        }
+      }, 10000);
+      await saveOfflinePin({ userId: usuarioSetup.id, pin });
+      if (!mountedRef.current || pinSetupUserRef.current?.id !== usuarioSetup.id) return;
+      await confirmarPinConfigurado(usuarioSetup);
     } catch (err) {
-      Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta nuevamente.');
+      if (mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+        Alert.alert('No se pudo guardar PIN', err?.message || 'Intenta nuevamente.');
+      }
     } finally {
-      setSubmitting(false);
+      if (slowTimer) globalThis.clearTimeout(slowTimer);
+      if (mountedRef.current && pinSetupUserRef.current?.id === usuarioSetup.id) {
+        setSubmitting(false);
+        setPinSetupProcessingSlow(false);
+      }
+      pinSaveInFlightRef.current = false;
     }
   };
 
@@ -269,10 +400,14 @@ export default function AuthScreen({ onLogin }) {
 
   const manejarAutenticacion = async () => {
     if (submitting) return;
+    const authAttempt = authAttemptRef.current + 1;
+    authAttemptRef.current = authAttempt;
+    const intentoVigente = () => mountedRef.current && authAttemptRef.current === authAttempt;
 
     const emailNormalizado = email.trim().toLowerCase();
     const passwordNormalizado = password;
     const netState = await NetInfo.fetch();
+    if (!intentoVigente()) return;
 
     if (!netState.isConnected) {
       Alert.alert('Sin conexión', 'Necesitas conexión a internet para autenticarte.');
@@ -294,6 +429,7 @@ export default function AuthScreen({ onLogin }) {
         AUTH_TIMEOUT_MS,
         'La señal está muy débil. Intenta de nuevo o usa modo offline si ya tienes PIN.'
       );
+      if (!intentoVigente()) return;
 
       if (error) {
         Alert.alert('Error', enmascararMarcaVisible(error.message, pinSetupUser || cachedUser));
@@ -305,6 +441,7 @@ export default function AuthScreen({ onLogin }) {
         Alert.alert('Error', 'No se pudo recuperar la sesión del usuario.');
         return;
       }
+      if (!intentoVigente()) return;
 
       let usuarioCache = null;
       try {
@@ -316,10 +453,25 @@ export default function AuthScreen({ onLogin }) {
       } catch {
         // ignorar cache inválido
       }
+      if (!intentoVigente()) return;
+
+      const rolesPromise = (async () => {
+        try {
+          const { data: rolesData, error: rolesError } = await withTimeout(
+            supabase.from('activador_roles').select('rol').eq('usuario_id', usuario.id),
+            QUERY_TIMEOUT_MS,
+            'La señal está muy débil al cargar los roles.'
+          );
+          if (rolesError) throw rolesError;
+          return { filas: rolesData, error: null };
+        } catch (error) {
+          return { filas: [], error };
+        }
+      })();
 
       // Consultas independientes en paralelo: perfil (autorización), roles
       // (multirrol) y plazas (formulario). Ninguna bloquea a otra.
-      const [perfilResult, filasRoles, plazasTemporales] = await Promise.all([
+      const [perfilResult, rolesResult, plazasTemporales] = await Promise.all([
         withTimeout(
           supabase
             .from('activadores')
@@ -329,13 +481,10 @@ export default function AuthScreen({ onLogin }) {
           QUERY_TIMEOUT_MS,
           'La señal está muy débil al cargar el perfil.'
         ),
-        withTimeout(
-          supabase.from('activador_roles').select('rol').eq('usuario_id', usuario.id),
-          QUERY_TIMEOUT_MS,
-          'La señal está muy débil al cargar los roles.'
-        ).then(({ data: rolesData }) => (Array.isArray(rolesData) ? rolesData : [])).catch(() => []),
+        rolesPromise,
         obtenerPlazasTemporales({ activadorId: usuario.id, usuarioId: usuario.id }),
       ]);
+      if (!intentoVigente()) return;
       const perfil = perfilResult?.data;
       const errorPerfil = perfilResult?.error;
       if (errorPerfil) {
@@ -351,11 +500,23 @@ export default function AuthScreen({ onLogin }) {
         Alert.alert('Acceso no autorizado', 'Tu perfil está inactivo o no tiene acceso a la aplicación.');
         return;
       }
-      const rolesCrudos = [
-        perfil?.rol || perfil?.role,
-        ...filasRoles.map((fila) => fila?.rol),
-        ...(Array.isArray(usuarioCache?.roles) ? usuarioCache.roles : []),
-      ].filter((rol) => typeof rol === 'string' && rol.trim());
+      const rolPrincipal = perfil?.rol || perfil?.role || usuarioCache?.rol || usuarioCache?.role || usuario.user_metadata?.rol || usuario.user_metadata?.role || 'activador';
+      const revisionCacheRoles = `auth-${Date.now()}-${authAttempt}`;
+      const estadoRoles = resolverEstadoRoles({
+        filas: rolesResult.filas,
+        error: rolesResult.error,
+        cache: usuarioCache,
+        rolPrincipal,
+        revision: revisionCacheRoles,
+      });
+      if (rolesResult.error) {
+        registrarDiagnosticoRoles({
+          error: rolesResult.error,
+          cacheUsed: estadoRoles.usoCache,
+          connected: !!netState.isConnected,
+          reachable: netState.isInternetReachable,
+        });
+      }
 
       const nombrePerfil = normalizarNombreVisible(perfil?.nombre || '');
       const nombreCache = normalizarNombreVisible(usuarioCache?.nombre || '');
@@ -369,15 +530,37 @@ export default function AuthScreen({ onLogin }) {
         nombre: nombrePerfil || nombreCache || nombreMetadata || usuario.email,
         plaza: plazaPerfil || plazaCache || 'No especificada',
         plazas_temporales: plazasTemporales,
-        rol: perfil?.rol || perfil?.role || usuarioCache?.rol || usuarioCache?.role || usuario.user_metadata?.rol || usuario.user_metadata?.role || 'activador',
-        roles: Array.from(new Set(rolesCrudos)),
+        rol: rolPrincipal,
+        ...estadoRoles.camposUsuario,
         puede_activar: perfil?.puede_activar === true || usuarioCache?.puede_activar === true,
       };
 
+      if (!intentoVigente()) return;
       await secureLocalStorage.setItem('usuario_autenticado_local', JSON.stringify(usuarioFinal));
+      if (!intentoVigente()) {
+        const cacheActual = await secureLocalStorage.getItem('usuario_autenticado_local').catch(() => null);
+        try {
+          const parsed = cacheActual ? JSON.parse(cacheActual) : null;
+          if (parsed?.id === usuario.id && parsed?.roles_cache_revision === revisionCacheRoles) {
+            await secureLocalStorage.removeItem('usuario_autenticado_local');
+          }
+        } catch {
+          // Una cache ajena o ilegible nunca se elimina desde un intento obsoleto.
+        }
+        return;
+      }
+      if (estadoRoles.actualizados) {
+        registrarDiagnosticoRoles({
+          error: null,
+          cacheUsed: false,
+          connected: !!netState.isConnected,
+          reachable: netState.isInternetReachable,
+        });
+      }
       const pinStatus = await getOfflinePinStatus(usuarioFinal.id);
+      if (!intentoVigente()) return;
 
-      if (!pinStatus.configured) {
+      if (pinStatus.storageState === 'absent') {
         setPinSetupUser(usuarioFinal);
         setPinSetupValue('');
         setPinSetupConfirm('');
@@ -385,14 +568,20 @@ export default function AuthScreen({ onLogin }) {
         return;
       }
 
+      if (pinStatus.storageState !== 'ok') {
+        Alert.alert('PIN local no disponible', 'No se pudo leer el PIN local. Podrás continuar con internet, pero no se habilitará el acceso offline hasta recuperarlo.');
+      }
+
       continuarConUsuario(usuarioFinal, { autenticadoOnline: true });
     } catch (err) {
-      Alert.alert(isTimeoutError(err) ? 'Conexión lenta' : 'Error crítico', enmascararMarcaVisible(err?.message || 'Ocurrió un error inesperado.', pinSetupUser || cachedUser));
-      if (isDev) {
+      if (intentoVigente()) {
+        Alert.alert(isTimeoutError(err) ? 'Conexión lenta' : 'Error crítico', enmascararMarcaVisible(err?.message || 'Ocurrió un error inesperado.', pinSetupUser || cachedUser));
+      }
+      if (isDev && intentoVigente()) {
         console.error('Error en autenticación:', err);
       }
     } finally {
-      if (mountedRef.current) {
+      if (intentoVigente()) {
         setSubmitting(false);
       }
     }
@@ -401,7 +590,10 @@ export default function AuthScreen({ onLogin }) {
   const lockActive = offlinePinLockSeconds > 0;
   const mostrarSetupPin = !!pinSetupUser?.id;
   const mostrarOfflineConPin = !mostrarSetupPin && offlineReady && !isConnected && !!cachedUser?.id && offlinePinConfigured;
-  const mostrarOfflineSinPin = !mostrarSetupPin && offlineReady && !isConnected && !!cachedUser?.id && !offlinePinConfigured;
+  const mostrarOfflinePinError = !mostrarSetupPin && offlineReady && !isConnected && !!cachedUser?.id
+    && (offlinePinStorageState === 'unavailable' || offlinePinStorageState === 'corrupt');
+  const mostrarOfflineSinPin = !mostrarSetupPin && offlineReady && !isConnected && !!cachedUser?.id
+    && !offlinePinConfigured && offlinePinStorageState === 'absent';
   const mostrarOfflineSinSesion = !mostrarSetupPin && offlineReady && !isConnected && !cachedUser?.id;
 
   const chipLabel = isConnected ? 'En línea' : 'Sin internet';
@@ -515,6 +707,7 @@ export default function AuthScreen({ onLogin }) {
               keyboardType="number-pad"
               secureTextEntry
               maxLength={pinPolicy.maxLength}
+              editable={!submitting}
             />
 
             <Text style={styles.fieldLabel}>Confirmar PIN</Text>
@@ -527,6 +720,7 @@ export default function AuthScreen({ onLogin }) {
               keyboardType="number-pad"
               secureTextEntry
               maxLength={pinPolicy.maxLength}
+              editable={!submitting}
             />
 
             <TouchableOpacity
@@ -541,6 +735,10 @@ export default function AuthScreen({ onLogin }) {
                 <Text style={styles.botonTexto}>Guardar PIN y continuar</Text>
               )}
             </TouchableOpacity>
+
+            {pinSetupProcessingSlow ? (
+              <Text style={styles.helperMuted}>El PIN continúa procesándose de forma segura. Espera a que finalice.</Text>
+            ) : null}
 
             <TouchableOpacity
               onPress={omitirPinPorAhora}
@@ -579,7 +777,11 @@ export default function AuthScreen({ onLogin }) {
               </Text>
             ) : (
               <Text style={styles.helperMuted}>
-                Intentos restantes: {offlinePinAttemptsLeft}
+                {submitting
+                  ? (offlinePinVerificationSlow
+                    ? 'La validación continúa procesándose de forma segura. Espera a que finalice.'
+                    : 'Validando PIN…')
+                  : `Intentos restantes: ${offlinePinAttemptsLeft}`}
               </Text>
             )}
 
@@ -594,6 +796,24 @@ export default function AuthScreen({ onLogin }) {
               ) : (
                 <Text style={styles.botonTexto}>Desbloquear</Text>
               )}
+            </TouchableOpacity>
+          </>
+        ) : mostrarOfflinePinError ? (
+          <>
+            <Text style={styles.cardTitle}>PIN local no disponible</Text>
+            <Text style={styles.cardSub}>
+              {offlinePinStorageState === 'corrupt'
+                ? 'El registro local del PIN no es válido. Conéctate a internet antes de reconfigurarlo.'
+                : 'No se pudo leer el almacenamiento seguro. Cierra otras acciones y vuelve a intentarlo.'}
+            </Text>
+            <Text style={styles.userPreview}>Usuario: {usuarioCacheVisible}</Text>
+            <TouchableOpacity
+              onPress={() => hydrateOfflineState({ knownIsConnected: false })}
+              style={styles.secondaryBtn}
+              disabled={submitting}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.secondaryBtnText}>Reintentar</Text>
             </TouchableOpacity>
           </>
         ) : mostrarOfflineSinPin ? (

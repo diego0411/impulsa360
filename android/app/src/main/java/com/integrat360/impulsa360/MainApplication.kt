@@ -25,6 +25,7 @@ class MainApplication : Application(), ReactApplication {
             val packages = PackageList(this).packages
             // Módulo mínimo read-only de ApplicationExitInfo (sin SDK externo).
             packages.add(ExitInfoPackage())
+            packages.add(ImageDownsamplerPackage())
             return packages
           }
 

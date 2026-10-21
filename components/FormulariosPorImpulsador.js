@@ -1,31 +1,49 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   View, Text, FlatList, ActivityIndicator, StyleSheet, RefreshControl, Alert,
-  AppState, Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions
+  AppState, Modal, TouchableOpacity, Image, ScrollView, useWindowDimensions,
+  Platform
 } from 'react-native';
-import NetInfo from '@react-native-community/netinfo';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../lib/supabase';
 import { prepararImagenPersistente, resolverUrlDeFoto } from '../lib/upload';
-import { actualizarFormularioLocal, obtenerFormulariosLocales } from '../lib/storage';
-import { mismoNombreActivador, normalizarNombreVisible } from '../lib/identity';
+import { evaluarDimensionesCaptura } from '../lib/cameraPhotoSafety';
+import {
+  LADO_REDUCCION_GALERIA,
+  puedeReducirImagenGaleria,
+  reducirImagenGaleria,
+} from '../lib/galleryImageDownsampler';
+import { actualizarFormularioLocal, leerFormulariosLocalesSeguro, obtenerFormularioPorId } from '../lib/storage';
 import { etiquetaPlaza } from '../lib/plazas';
-import { fechaEnRango, fechaLocalIso, obtenerQuincenaActual } from '../lib/quincena';
+import { fechaBolivia } from '../lib/fechaBolivia';
+import {
+  PERIODO_MES_ACTUAL,
+  crearOpcionesPeriodoMensual,
+  resolverPeriodoMensual,
+} from '../lib/periodoMensual';
 import { withTimeout } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { enmascararDatoCliente } from '../lib/customerMask';
 import { colors, spacing, fontSizes, radius } from '../styles/theme';
 import CameraEvidencia from './CameraEvidencia';
+import SelectorRN from './SelectorRN';
 import { registrarErrorFoto } from '../lib/photoDiagnostics';
+import {
+  claveFormulario,
+  combinarHistorialLocalRemoto,
+  combinarFormulariosSinDuplicados,
+  crearControlConsultaUnica,
+  persistirReemplazoFoto,
+  puedeConsultarHistorialRemoto,
+} from '../lib/historialActivaciones';
+import { resolverLecturaPendientes } from '../lib/offlineSafety';
 
 const PAGE_SIZE = 20;
 const QUERY_TIMEOUT_MS = 10000;
 const GALLERY_TIMEOUT_MS = 30000;
 const PHOTO_FILE_TIMEOUT_MS = 12000;
 const esFotoLocal = (value) => /^(file|content):\/\//i.test(String(value || ''));
-const esPendienteSync = (item) => item?._origen === 'local' || item?.estado_sync === 'offline_pending' || item?._sync?.status === 'pending';
-const fechaRealActivacion = (item) => item?.fecha_activacion || item?._created_at || item?.created_at || item?.creado_en;
 const normalizarRol = (value) => String(value || '')
   .toLowerCase()
   .normalize('NFD')
@@ -43,19 +61,6 @@ const rolesDeUsuario = (usuario) => (
     .map((rol) => (typeof rol === 'string' ? rol : rol?.rol || rol?.role))
     .filter(Boolean)
 );
-const combinarRemotosSinDuplicados = (anteriores = [], nuevos = []) => {
-  const resultado = [];
-  const ids = new Set();
-  [...anteriores, ...nuevos].forEach((item) => {
-    const id = String(item?.id || item?._id_local || '');
-    if (id && ids.has(id)) return;
-    if (id) ids.add(id);
-    resultado.push(item);
-  });
-  return resultado;
-};
-const claveFormulario = (item) => String(item?.id || item?._id_local || '');
-
 const resolverFotoDetalle = async (value) => {
   if (!value) return { uri: '', perdida: false };
   if (!esFotoLocal(value)) {
@@ -66,7 +71,12 @@ const resolverFotoDetalle = async (value) => {
   return { uri: info?.exists ? value : '', perdida: !info?.exists };
 };
 
-export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
+export default function FormulariosPorImpulsador({
+  usuario,
+  isConnected,
+  isInternetReachable,
+  onSincronizar,
+}) {
   const usuarioId = usuario?.id;
   const [formulariosRemotos, setFormulariosRemotos] = useState([]);
   const [formulariosLocales, setFormulariosLocales] = useState([]);
@@ -76,7 +86,9 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [lastError, setLastError] = useState(null);
+  const [lecturaLocalError, setLecturaLocalError] = useState(null);
   const [cargaRemotaCompletada, setCargaRemotaCompletada] = useState(false);
+  const [periodoSeleccionado, setPeriodoSeleccionado] = useState(PERIODO_MES_ACTUAL);
 
   // Detalle
   const [detalleVisible, setDetalleVisible] = useState(false);
@@ -93,20 +105,33 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
   const galeriaOperacionRef = useRef(null);
   const requestIdRef = useRef(0);
   const localRequestIdRef = useRef(0);
-  const refreshEnCursoRef = useRef(null);
-  const refreshOwnerRef = useRef(null);
-  const refreshPendienteRef = useRef(false);
+  const consultaControlRef = useRef(null);
+  if (!consultaControlRef.current) consultaControlRef.current = crearControlConsultaUnica();
+  const refreshPendienteRef = useRef(null);
+  const refrescarHistorialActualRef = useRef(null);
+  const remotoBloqueadoRef = useRef(false);
   const appStateRef = useRef(AppState.currentState);
-  const conexionDisponibleRef = useRef(null);
+  const remotoDisponible = puedeConsultarHistorialRemoto({ isConnected, isInternetReachable });
+  const remotoDisponibleRef = useRef(remotoDisponible);
+  const conexionDisponibleRef = useRef(remotoDisponible);
   const mountedRef = useRef(true);
   const ownerActualRef = useRef(usuarioId || null);
+  const usuarioActualRef = useRef(usuario);
   const localesActualesRef = useRef({ ownerId: usuarioId || null, rows: [] });
   const localesAusentesConfirmacionesRef = useRef(new Map());
   ownerActualRef.current = usuarioId || null;
-  const hoyLocal = fechaLocalIso(new Date());
-  const rangoQuincena = useMemo(() => obtenerQuincenaActual(new Date(`${hoyLocal}T12:00:00`)), [hoyLocal]);
+  usuarioActualRef.current = usuario;
+  remotoDisponibleRef.current = remotoDisponible;
+  const hoyBolivia = fechaBolivia();
+  const periodoConsulta = useMemo(
+    () => resolverPeriodoMensual(periodoSeleccionado, hoyBolivia),
+    [hoyBolivia, periodoSeleccionado],
+  );
+  const opcionesPeriodo = useMemo(
+    () => crearOpcionesPeriodoMensual(hoyBolivia),
+    [hoyBolivia],
+  );
 
-  const usuarioNombre = normalizarNombreVisible(usuario?.nombre || '');
   const administrador = rolesDeUsuario(usuario).some(esRolAdministrador);
   const { height } = useWindowDimensions();
   const modalMaxHeight = Math.min(height * 0.85, 640);
@@ -117,42 +142,45 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     const ownerId = usuarioId;
     const requestId = ++localRequestIdRef.current;
     try {
-      const locales = await obtenerFormulariosLocales();
+      const lectura = resolverLecturaPendientes(
+        await leerFormulariosLocalesSeguro(),
+        ownerId,
+      );
       if (
         !mountedRef.current
         || ownerActualRef.current !== ownerId
         || requestId !== localRequestIdRef.current
       ) return;
-      const filtrados = (locales || []).filter((f) => f?.usuario_id === ownerId);
+      if (!lectura.ok) {
+        setLecturaLocalError('No se pudieron verificar las activaciones pendientes locales.');
+        return;
+      }
+      setLecturaLocalError(null);
+      const filtrados = lectura.rows;
       localesActualesRef.current = { ownerId, rows: filtrados };
-      setFormulariosLocales((prev) => combinarRemotosSinDuplicados(filtrados, prev));
+      setFormulariosLocales((prev) => combinarFormulariosSinDuplicados(filtrados, prev));
     } catch (err) {
       console.warn('⚠️ No se pudieron cargar formularios locales:', err?.message || err);
       // Un fallo transitorio no reemplaza pendientes válidos ya visibles.
+      if (
+        mountedRef.current
+        && ownerActualRef.current === ownerId
+        && requestId === localRequestIdRef.current
+      ) {
+        setLecturaLocalError('No se pudieron verificar las activaciones pendientes locales.');
+      }
     }
   }, [usuarioId]);
 
   const formularios = useMemo(() => {
-    const remotos = Array.isArray(formulariosRemotos) ? formulariosRemotos : [];
-    const remotosById = new Set(remotos.map((f) => String(f?.id || '')));
-
-    const localesPendientes = (formulariosLocales || [])
-      .filter((f) => {
-        if (!administrador && !fechaEnRango(fechaRealActivacion(f), rangoQuincena)) return false;
-        if (!esPendienteSync(f) && !administrador) return false;
-        const id = String(f?.id || '');
-        if (!id) return true;
-        return !remotosById.has(id);
-      })
-      .map((f) => ({ ...f, _origen: 'local' }));
-
-    const merged = [...localesPendientes, ...remotos];
-    return merged.sort((a, b) => {
-      const av = String(fechaRealActivacion(a) || '');
-      const bv = String(fechaRealActivacion(b) || '');
-      return bv.localeCompare(av);
+    return combinarHistorialLocalRemoto({
+      locales: formulariosLocales,
+      remotos: formulariosRemotos,
+      ownerId: usuarioId,
+      periodo: periodoConsulta,
+      administrador,
     });
-  }, [administrador, formulariosLocales, formulariosRemotos, rangoQuincena]);
+  }, [administrador, formulariosLocales, formulariosRemotos, periodoConsulta, usuarioId]);
 
   const fetchPage = useCallback(async ({ reset = false, silent = false } = {}) => {
     if (!usuarioId || ownerActualRef.current !== usuarioId) return;
@@ -177,12 +205,9 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
           .select('*')
           .eq('usuario_id', ownerId)
           .order('fecha_activacion', { ascending: false })
+          .gte('fecha_activacion', periodoConsulta.desde)
+          .lt('fecha_activacion', periodoConsulta.hastaExclusivo)
           .range(from, Math.max(from, to));
-      if (!administrador) {
-        query = query
-          .gte('fecha_activacion', rangoQuincena.desde)
-          .lt('fecha_activacion', rangoQuincena.hastaExclusivo);
-      }
 
       const { data, error } = await withTimeout(
         query,
@@ -194,36 +219,17 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         console.error('❌ Supabase select error:', error);
         if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
         setLastError(error.message || String(error));
-        if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${error.message || ''}`, usuario));
+        remotoBloqueadoRef.current = true;
+        setHasMore(false);
+        if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${error.message || ''}`, usuarioActualRef.current));
         return;
       }
 
-      let rows = data || [];
-      // Compatibilidad con registros antiguos sin usuario_id enlazado.
-      if (reset && rows.length === 0 && usuarioNombre) {
-        let legacyQuery = supabase
-            .from('activaciones')
-            .select('*')
-            .ilike('impulsador', usuarioNombre)
-            .order('fecha_activacion', { ascending: false })
-            .range(0, PAGE_SIZE - 1);
-        if (!administrador) {
-          legacyQuery = legacyQuery
-            .gte('fecha_activacion', rangoQuincena.desde)
-            .lt('fecha_activacion', rangoQuincena.hastaExclusivo);
-        }
-        const { data: legacyRows, error: legacyError } = await withTimeout(
-          legacyQuery,
-          QUERY_TIMEOUT_MS,
-          'La señal está muy débil para cargar activaciones.'
-        );
-        if (!legacyError && Array.isArray(legacyRows) && legacyRows.length > 0) {
-          rows = legacyRows.filter((item) => mismoNombreActivador(item?.impulsador, usuarioNombre));
-        }
-      }
+      // Un nombre visible no acredita propiedad de registros legacy sin usuario_id.
+      const rows = data || [];
 
       if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
-      setFormulariosRemotos((prev) => (reset ? combinarRemotosSinDuplicados([], rows) : combinarRemotosSinDuplicados(prev, rows)));
+      setFormulariosRemotos((prev) => (reset ? combinarFormulariosSinDuplicados([], rows) : combinarFormulariosSinDuplicados(prev, rows)));
       if (reset && localesActualesRef.current.ownerId === ownerId) {
         const localesActuales = localesActualesRef.current.rows;
         const idsActuales = new Set(localesActuales.map(claveFormulario).filter(Boolean));
@@ -239,10 +245,11 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
             localesAusentesConfirmacionesRef.current.set(id, confirmaciones + 1);
             return confirmaciones === 0;
           });
-          return combinarRemotosSinDuplicados(localesActuales, retenidos);
+          return combinarFormulariosSinDuplicados(localesActuales, retenidos);
         });
       }
       setCargaRemotaCompletada(true);
+      remotoBloqueadoRef.current = false;
 
       const noMore = !rows || rows.length < PAGE_SIZE;
       setHasMore(!noMore);
@@ -251,47 +258,84 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       console.error('❌ FetchPage error:', err);
       if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
       setLastError(err?.message || String(err));
-      if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${err?.message || ''}`, usuario));
+      remotoBloqueadoRef.current = true;
+      setHasMore(false);
+      if (reset && !silent) Alert.alert('Error', enmascararMarcaVisible(`No se pudieron actualizar los formularios.\n${err?.message || ''}`, usuarioActualRef.current));
     } finally {
       if (!mountedRef.current || ownerActualRef.current !== ownerId || requestId !== requestIdRef.current) return;
       setCargando(false);
       setRefreshing(false);
       setLoadingMore(false);
     }
-  }, [administrador, rangoQuincena, usuario, usuarioId, usuarioNombre]);
+  }, [periodoConsulta.desde, periodoConsulta.hastaExclusivo, usuarioId]);
 
-  const refrescarHistorial = useCallback(({ silent = true } = {}) => {
-    const ownerId = usuarioId;
-    if (!ownerId || ownerActualRef.current !== ownerId) return Promise.resolve();
-    if (refreshEnCursoRef.current && refreshOwnerRef.current === ownerId) {
-      refreshPendienteRef.current = true;
-      return refreshEnCursoRef.current;
+  const ejecutarConsulta = useCallback((operacion, pendienteSiOcupada = null) => {
+    const resultado = consultaControlRef.current.ejecutar(operacion);
+    if (!resultado.iniciada) {
+      if (pendienteSiOcupada) {
+        const anterior = refreshPendienteRef.current;
+        refreshPendienteRef.current = {
+          silent: anterior ? anterior.silent && pendienteSiOcupada.silent : pendienteSiOcupada.silent,
+          desbloquearRemoto: Boolean(anterior?.desbloquearRemoto || pendienteSiOcupada.desbloquearRemoto),
+        };
+      }
+      return resultado.promesa;
     }
-
-    const run = cargarLocales().then(() => {
-      if (ownerActualRef.current !== ownerId) return;
-      return fetchPage({ reset: true, silent });
-    });
-    const tracked = run.finally(() => {
-      if (refreshEnCursoRef.current !== tracked || refreshOwnerRef.current !== ownerId) return;
-      refreshEnCursoRef.current = null;
-      refreshOwnerRef.current = null;
-      if (refreshPendienteRef.current && mountedRef.current && ownerActualRef.current === ownerId) {
-        refreshPendienteRef.current = false;
-        globalThis.setTimeout(() => refrescarHistorial({ silent: true }), 0);
+    return resultado.promesa.finally(() => {
+      const pendiente = refreshPendienteRef.current;
+      refreshPendienteRef.current = null;
+      if (pendiente && mountedRef.current) {
+        globalThis.setTimeout(() => refrescarHistorialActualRef.current?.(pendiente), 0);
       }
     });
-    refreshEnCursoRef.current = tracked;
-    refreshOwnerRef.current = ownerId;
-    return tracked;
-  }, [cargarLocales, fetchPage, usuarioId]);
+  }, []);
+
+  const refrescarHistorial = useCallback(({ silent = true, desbloquearRemoto = false } = {}) => {
+    const ownerId = usuarioId;
+    if (!ownerId || ownerActualRef.current !== ownerId) return Promise.resolve();
+    return ejecutarConsulta(async () => {
+      await cargarLocales();
+      if (!mountedRef.current || ownerActualRef.current !== ownerId) return;
+      if (!remotoDisponibleRef.current) {
+        setHasMore(false);
+        setCargando(false);
+        setRefreshing(false);
+        setLoadingMore(false);
+        return;
+      }
+      if (remotoBloqueadoRef.current && !desbloquearRemoto) {
+        setHasMore(false);
+        setCargando(false);
+        setRefreshing(false);
+        setLoadingMore(false);
+        return;
+      }
+      if (desbloquearRemoto) remotoBloqueadoRef.current = false;
+      await fetchPage({ reset: true, silent });
+    }, { silent, desbloquearRemoto });
+  }, [cargarLocales, ejecutarConsulta, fetchPage, usuarioId]);
+  refrescarHistorialActualRef.current = refrescarHistorial;
+
+  const seleccionarPeriodo = useCallback((periodo) => {
+    if (periodo === periodoSeleccionado) return;
+    requestIdRef.current += 1;
+    remotoBloqueadoRef.current = false;
+    pageRef.current = 0;
+    setPeriodoSeleccionado(periodo);
+    setFormulariosRemotos([]);
+    setLastError(null);
+    setLecturaLocalError(null);
+    setCargaRemotaCompletada(false);
+    setHasMore(remotoDisponibleRef.current);
+    setLoadingMore(false);
+    setRefreshing(false);
+    setCargando(Boolean(usuarioId));
+  }, [periodoSeleccionado, usuarioId]);
 
   useEffect(() => {
     requestIdRef.current += 1;
     localRequestIdRef.current += 1;
-    refreshEnCursoRef.current = null;
-    refreshOwnerRef.current = null;
-    refreshPendienteRef.current = false;
+    remotoBloqueadoRef.current = false;
     if (galeriaOperacionRef.current) galeriaOperacionRef.current.invalidada = true;
     galeriaOperacionRef.current = null;
     localesActualesRef.current = { ownerId: usuarioId || null, rows: [] };
@@ -300,9 +344,10 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     setFormulariosRemotos([]);
     setFormulariosLocales([]);
     setLastError(null);
+    setLecturaLocalError(null);
     setCargaRemotaCompletada(false);
     setCargando(Boolean(usuarioId));
-    setHasMore(true);
+    setHasMore(remotoDisponibleRef.current);
     setLoadingMore(false);
     setRefreshing(false);
     setDetalleVisible(false);
@@ -318,13 +363,13 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
   useEffect(() => {
     if (usuarioId) {
-      refrescarHistorial({ silent: false });
+      refrescarHistorial({ silent: false, desbloquearRemoto: true });
     }
   }, [usuarioId, refrescarHistorial]);
 
   // Realtime por usuario
   useEffect(() => {
-    if (!usuarioId) return;
+    if (!usuarioId || !remotoDisponible) return;
 
     if (channelRef.current) {
       supabase.removeChannel(channelRef.current);
@@ -350,7 +395,7 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         channelRef.current = null;
       }
     };
-  }, [usuarioId, refrescarHistorial]);
+  }, [remotoDisponible, usuarioId, refrescarHistorial]);
 
   useEffect(() => {
     const appStateSub = AppState.addEventListener('change', (nextState) => {
@@ -360,17 +405,24 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         refrescarHistorial({ silent: true });
       }
     });
-    const netInfoSub = NetInfo.addEventListener((state) => {
-      const disponible = !!state?.isConnected && state?.isInternetReachable !== false;
-      const anterior = conexionDisponibleRef.current;
-      conexionDisponibleRef.current = disponible;
-      if (anterior === false && disponible) refrescarHistorial({ silent: true });
-    });
     return () => {
       appStateSub.remove();
-      netInfoSub();
     };
   }, [refrescarHistorial]);
+
+  useEffect(() => {
+    const anterior = conexionDisponibleRef.current;
+    conexionDisponibleRef.current = remotoDisponible;
+    if (!remotoDisponible) {
+      setHasMore(false);
+      setLoadingMore(false);
+      return;
+    }
+    if (anterior === false) {
+      remotoBloqueadoRef.current = false;
+      refrescarHistorial({ silent: true, desbloquearRemoto: true });
+    }
+  }, [refrescarHistorial, remotoDisponible]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -378,22 +430,29 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       mountedRef.current = false;
       requestIdRef.current += 1;
       localRequestIdRef.current += 1;
-      refreshEnCursoRef.current = null;
-      refreshOwnerRef.current = null;
-      refreshPendienteRef.current = false;
+      refreshPendienteRef.current = null;
     };
   }, []);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
-    refrescarHistorial({ silent: true });
+    refrescarHistorial({ silent: true, desbloquearRemoto: true });
   }, [refrescarHistorial]);
 
   const onEndReached = useCallback(() => {
-    if (!refreshEnCursoRef.current && !loadingMore && hasMore && !cargando) {
-      fetchPage({ reset: false });
-    }
-  }, [loadingMore, hasMore, cargando, fetchPage]);
+    if (
+      consultaControlRef.current.enCurso()
+      || remotoBloqueadoRef.current
+      || !remotoDisponibleRef.current
+      || loadingMore
+      || !hasMore
+      || cargando
+    ) return;
+    ejecutarConsulta(() => fetchPage({ reset: false }));
+  }, [loadingMore, hasMore, cargando, ejecutarConsulta, fetchPage]);
+
+  const historialError = lecturaLocalError || lastError;
+  const sinConexion = isConnected === false || isInternetReachable === false;
 
   // ------ Detalle ------
   const abrirDetalle = async (item) => {
@@ -466,18 +525,19 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     setFotosPerdidas({});
   };
 
-  const guardarFotoReparada = async (fieldName, uri) => {
+  const guardarFotoReparada = async (fieldName, uri, dimensions = {}, options = {}) => {
     if (!detalle?._id_local && !detalle?.id) return;
-    const destino = await prepararImagenPersistente(uri, fieldName);
+    const destino = await prepararImagenPersistente(uri, fieldName, {
+      width: dimensions.width,
+      height: dimensions.height,
+      skipManipulation: options.skipManipulation === true,
+      allowLargeSourceBytes: options.allowLargeSourceBytes === true,
+    });
     const idLocal = detalle._id_local || detalle.id;
     const localPhotos = {
       ...(detalle._sync?.localPhotos || {}),
       [fieldName]: destino,
     };
-    const anterior = detalle[fieldName];
-    if (/^file:\/\//i.test(String(anterior || '')) && anterior !== destino) {
-      await FileSystem.deleteAsync(anterior, { idempotent: true }).catch(() => {});
-    }
     const patch = {
       [fieldName]: destino,
       estado_sync: 'offline_pending',
@@ -488,7 +548,16 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         localPhotos,
       },
     };
-    await actualizarFormularioLocal(idLocal, patch);
+    await persistirReemplazoFoto({
+      destino,
+      fieldName,
+      patch,
+      verificarArchivo: (fotoUri) => FileSystem.getInfoAsync(fotoUri, { size: true }),
+      persistir: (fotoPatch) => actualizarFormularioLocal(idLocal, fotoPatch),
+      releer: () => obtenerFormularioPorId(idLocal),
+    });
+    // La URI anterior se conserva aquí. La limpieza global es la única que
+    // puede borrarla tras comprobar referencias en pendientes y borradores.
     const actualizado = { ...detalle, ...patch };
     setDetalle(actualizado);
     if (fieldName === 'foto_cash_in') {
@@ -507,20 +576,19 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     if (sincronizada) {
       Alert.alert('Activación sincronizada', 'La activación pendiente se sincronizó correctamente.');
       cerrarDetalle();
-      await cargarLocales();
-      await fetchPage({ reset: true });
+      await refrescarHistorial({ silent: true, desbloquearRemoto: true });
     } else {
       const detalleError = result?.errors?.[0] ? `\n\n${result.errors[0]}` : '';
       Alert.alert('Guardado local', enmascararMarcaVisible(`La foto se actualizó, pero la activación sigue pendiente de sincronización.${detalleError}`, usuario));
     }
   };
 
-  const usarFotoReparada = async (uri) => {
+  const usarFotoReparada = async (uri, dimensions) => {
     const fieldName = camaraReparacion;
     setCamaraReparacion(null);
     if (!fieldName) return;
     try {
-      await guardarFotoReparada(fieldName, uri);
+      await guardarFotoReparada(fieldName, uri, dimensions);
     } catch (error) {
       console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
       const message = error?.photoCode
@@ -534,23 +602,21 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
 
   const seleccionarFotoReparada = async (fieldName) => {
     if (galeriaOperacionRef.current) {
-      Alert.alert('Galería ocupada', 'Espera a que termine la selección anterior o cierra el selector abierto.');
+      Alert.alert('Foto en proceso', 'Espera a que termine la selección o el procesamiento anterior.');
       return;
     }
     let selectorFinalizado = false;
-    let operacionGaleria = null;
+    let uriReducida = '';
+    const operacionGaleria = { invalidada: false };
+    galeriaOperacionRef.current = operacionGaleria;
     try {
       // Photo Picker del sistema: sin solicitud de permiso previa.
       const promesaNativa = ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
-        quality: 0.5,
+        quality: Platform.OS === 'android' ? 1 : 0.5,
         allowsEditing: false,
       });
-      operacionGaleria = { invalidada: false };
-      galeriaOperacionRef.current = operacionGaleria;
-      promesaNativa.catch(() => {}).finally(() => {
-        if (galeriaOperacionRef.current === operacionGaleria) galeriaOperacionRef.current = null;
-      });
+      promesaNativa.catch(() => {});
       const result = await withTimeout(
         promesaNativa,
         GALLERY_TIMEOUT_MS,
@@ -559,7 +625,8 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
       selectorFinalizado = true;
       if (operacionGaleria.invalidada) return;
       if (result.canceled) return;
-      const uri = result.assets?.[0]?.uri;
+      const asset = result.assets?.[0];
+      const uri = asset?.uri;
       if (!uri) {
         Alert.alert('Error', 'La ruta de imagen no es válida.');
         return;
@@ -578,21 +645,121 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         Alert.alert('Error', 'No se pudo leer la imagen seleccionada.');
         return;
       }
-      const size = typeof result.assets?.[0]?.fileSize === 'number'
-        ? result.assets[0].fileSize
+      const size = typeof asset?.fileSize === 'number'
+        ? asset.fileSize
         : infoArchivo?.size;
       if (typeof size === 'number' && size <= 0) {
         Alert.alert('Error', 'La imagen seleccionada está vacía.');
         return;
       }
-      if (typeof size === 'number' && size / 1024 / 1024 > 6) {
+      const evaluacionDimensiones = evaluarDimensionesCaptura({
+        width: asset.width,
+        height: asset.height,
+      });
+      const resolucionExcesiva = evaluacionDimensiones.reason === 'too_large';
+      const reducibleEnAndroid = resolucionExcesiva && puedeReducirImagenGaleria();
+      const origenGrandeAndroid = Platform.OS === 'android' && !resolucionExcesiva;
+      if (
+        typeof size === 'number'
+        && size / 1024 / 1024 > 6
+        && !reducibleEnAndroid
+        && !origenGrandeAndroid
+      ) {
         Alert.alert('❌ Imagen demasiado grande', 'Selecciona una imagen más liviana (≤ 6 MB).');
         return;
       }
-      await guardarFotoReparada(fieldName, uri);
+      if (reducibleEnAndroid) {
+        const reduccion = await reducirImagenGaleria(uri, {
+          maxSide: LADO_REDUCCION_GALERIA,
+          quality: 0.5,
+        });
+        uriReducida = reduccion.uri;
+        await guardarFotoReparada(fieldName, uriReducida, reduccion, { skipManipulation: true });
+      } else {
+        await guardarFotoReparada(fieldName, uri, {
+          width: asset.width,
+          height: asset.height,
+          allowLargeSourceBytes: origenGrandeAndroid,
+        });
+      }
     } catch (error) {
       console.error('❌ No se pudo reparar la foto pendiente:', error?.message || error);
       if (!selectorFinalizado && operacionGaleria) operacionGaleria.invalidada = true;
+      const selectorSigueActivo = !selectorFinalizado;
+      const botonesReintentar = selectorSigueActivo
+        ? [{ text: 'Cerrar', style: 'cancel' }]
+        : [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Reintentar', onPress: () => seleccionarFotoReparada(fieldName) },
+        ];
+      const botonesElegirOtra = selectorSigueActivo
+        ? [{ text: 'Cerrar', style: 'cancel' }]
+        : [
+          { text: 'Cancelar', style: 'cancel' },
+          { text: 'Elegir otra', onPress: () => seleccionarFotoReparada(fieldName) },
+        ];
+
+      if (error?.photoReason === 'too_large') {
+        Alert.alert(
+          '❌ Imagen demasiado grande',
+          'La foto supera 12 MP y no puede reducirse de forma segura en este dispositivo. Selecciona otra foto de menor resolución.',
+          botonesElegirOtra
+        );
+        return;
+      }
+      if (error?.photoReason === 'downsample_timeout') {
+        Alert.alert(
+          'Tiempo de reducción agotado',
+          error?.cancelConfirmed === false
+            ? 'La reducción tardó demasiado y su cancelación aún puede estar finalizando. Espera unos segundos antes de reintentar.'
+            : 'La reducción de la foto tardó demasiado y se canceló. Puedes intentarlo de nuevo.',
+          botonesReintentar
+        );
+        return;
+      }
+      if (error?.photoReason === 'downsample_read') {
+        Alert.alert(
+          'No se pudo leer la foto',
+          'El archivo puede haber sido movido, estar dañado o tener un formato no compatible. Elige otra foto o inténtalo de nuevo.',
+          botonesElegirOtra
+        );
+        return;
+      }
+      if (error?.photoReason === 'downsample_process') {
+        Alert.alert(
+          'No se pudo procesar la foto',
+          'Ocurrió un error al reducir la imagen en este dispositivo. Puedes intentarlo de nuevo.',
+          botonesReintentar
+        );
+        return;
+      }
+      if (error?.photoReason === 'downsample_busy') {
+        Alert.alert(
+          'Foto en proceso',
+          'Ya hay una reducción de imagen en curso. Espera a que termine antes de intentarlo de nuevo.',
+          [{ text: 'Cerrar', style: 'cancel' }]
+        );
+        return;
+      }
+      if (error?.photoReason === 'downsample_cancelled') {
+        Alert.alert(
+          'Reducción cancelada',
+          'La reducción de la foto se canceló. Puedes intentarlo de nuevo.',
+          botonesReintentar
+        );
+        return;
+      }
+      if (
+        error?.photoReason === 'downsample_unsupported'
+        || error?.photoReason === 'downsample_argument'
+      ) {
+        Alert.alert(
+          'No se pudo reducir la foto',
+          enmascararMarcaVisible(error?.message || 'No se pudo preparar la reducción de la imagen.', usuario),
+          [{ text: 'Cerrar', style: 'cancel' }]
+        );
+        return;
+      }
       if (error?.photoCode) {
         Alert.alert('Error de foto', enmascararMarcaVisible(`No se pudo actualizar la foto pendiente. (${error.photoCode})`, usuario));
         return;
@@ -602,26 +769,34 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         return;
       }
       const code = await registrarErrorFoto('gallery', error);
-      const operacionSigueActiva = galeriaOperacionRef.current === operacionGaleria;
       Alert.alert(
         'Error de galería',
         enmascararMarcaVisible(
-          operacionSigueActiva
+          selectorSigueActivo
             ? `No se pudo abrir la galería. (${code}) Cierra el selector y vuelve a intentarlo.`
             : `No se pudo abrir la galería. (${code})`,
           usuario
         ),
-        operacionSigueActiva
+        selectorSigueActivo
           ? [{ text: 'Cerrar', style: 'cancel' }]
           : [
             { text: 'Cerrar', style: 'cancel' },
             { text: 'Reintentar', onPress: () => seleccionarFotoReparada(fieldName) },
           ]
       );
+    } finally {
+      if (galeriaOperacionRef.current === operacionGaleria) galeriaOperacionRef.current = null;
+      if (uriReducida) {
+        await FileSystem.deleteAsync(uriReducida, { idempotent: true }).catch(() => {});
+      }
     }
   };
 
   const repararFotoPendiente = (fieldName) => {
+    if (galeriaOperacionRef.current) {
+      Alert.alert('Foto en proceso', 'Espera a que termine la selección o el procesamiento anterior.');
+      return;
+    }
     if (fieldName === 'foto_cash_in') {
       Alert.alert('Evidencia Cash-In', 'Selecciona el origen de la imagen.', [
         { text: 'Cancelar', style: 'cancel' },
@@ -696,12 +871,27 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
     <View style={styles.container}>
       <View style={styles.headerCard}>
         <Text style={styles.titulo}>Mis activaciones</Text>
-        <Text style={styles.subtitulo}>{formularios.length} registro(s) cargados</Text>
+        <Text style={styles.subtitulo}>
+          {lecturaLocalError ? 'Registros locales sin verificar' : `${formularios.length} registro(s)`} · {periodoConsulta.etiqueta}
+        </Text>
+      </View>
+
+      <View style={styles.periodCard}>
+        <Text style={styles.periodTitle}>Período del historial</Text>
+        <View style={styles.pickerShell}>
+          <SelectorRN
+            selectedValue={periodoSeleccionado}
+            onValueChange={seleccionarPeriodo}
+            accessibilityLabel={`Período del historial: ${periodoConsulta.etiqueta}`}
+            options={opcionesPeriodo}
+          />
+        </View>
+        <Text style={styles.periodLabel}>{periodoConsulta.etiqueta}</Text>
       </View>
 
       {cargando && formularios.length === 0 ? (
         <ActivityIndicator size="large" color={colors.primary} />
-      ) : formularios.length === 0 && lastError && !cargaRemotaCompletada ? (
+      ) : formularios.length === 0 && historialError && (lecturaLocalError || !cargaRemotaCompletada) ? (
         <View style={styles.historyErrorBox}>
           <Text style={styles.emptyText}>No se pudo cargar el historial.</Text>
           <TouchableOpacity style={styles.historyRetryButton} onPress={onRefresh}>
@@ -710,14 +900,20 @@ export default function FormulariosPorImpulsador({ usuario, onSincronizar }) {
         </View>
       ) : formularios.length === 0 ? (
         <View>
-          <Text style={styles.emptyText}>No hay formularios registrados.</Text>
-          {lastError ? (
+          <Text style={styles.emptyText}>No hay activaciones en {periodoConsulta.etiqueta}.</Text>
+          {sinConexion ? (
+            <Text style={styles.historyWarning}>Sin conexión. No hay activaciones pendientes locales en este período.</Text>
+          ) : historialError ? (
             <Text style={styles.historyWarning}>No se pudo actualizar el historial.</Text>
           ) : null}
         </View>
       ) : (
         <>
-          {lastError ? (
+          {lecturaLocalError ? (
+            <Text style={styles.historyWarning}>No se pudieron verificar las activaciones pendientes locales.</Text>
+          ) : sinConexion ? (
+            <Text style={styles.historyWarning}>Sin conexión. Mostrando los datos disponibles en el dispositivo.</Text>
+          ) : lastError ? (
             <Text style={styles.historyWarning}>No se pudo actualizar. Mostrando los últimos datos disponibles.</Text>
           ) : null}
           <FlatList
@@ -918,6 +1114,33 @@ const styles = StyleSheet.create({
     marginTop: 4,
     color: '#CDDBEA',
     fontSize: fontSizes.small,
+  },
+  periodCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    borderColor: colors.cardBorder,
+    borderWidth: 1,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  periodTitle: {
+    color: colors.textMuted,
+    fontSize: 12,
+    fontWeight: '800',
+    marginBottom: spacing.xs,
+  },
+  pickerShell: {
+    backgroundColor: colors.surfaceAlt,
+    borderRadius: radius.md,
+    borderColor: colors.cardBorder,
+    borderWidth: 1,
+    overflow: 'hidden',
+  },
+  periodLabel: {
+    color: colors.text,
+    fontSize: fontSizes.small,
+    fontWeight: '800',
+    textAlign: 'center',
   },
   item: {
     backgroundColor: colors.surface,
