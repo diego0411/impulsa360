@@ -3,6 +3,8 @@ package com.integrat360.impulsa360
 import android.graphics.Bitmap
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import com.bumptech.glide.Glide
 import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.bumptech.glide.load.resource.bitmap.DownsampleStrategy
@@ -17,23 +19,35 @@ import com.facebook.react.bridge.ReactMethod
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
+  private enum class Phase { LOADING, PROCESSING, FINISHED }
+
   private class Operation(
     val id: String,
     val output: File,
     val promise: Promise
   ) {
     val settled = AtomicBoolean(false)
+    val cancelRequested = AtomicBoolean(false)
+    val targetCleared = AtomicBoolean(false)
+    val outputDeleted = AtomicBoolean(false)
+    var phase = Phase.LOADING
     var target: CustomTarget<Bitmap>? = null
+    var cancelPromise: Promise? = null
   }
 
-  // Glide.clear cancela la entrega y libera el target en el hilo principal. No
-  // interrumpe necesariamente un decoder que ya esta en curso, por eso no se
-  // admite otra operacion hasta que la anterior haya sido completada o
-  // cancelada. activeOperation solo se usa en el hilo principal.
+  // Glide y activeOperation pertenecen al hilo principal. El executor solo
+  // comprime/escribe; el target se retiene hasta que ese trabajo finaliza.
   private var activeOperation: Operation? = null
+  private val destroyed = AtomicBoolean(false)
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private val compressionExecutor = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "impulsa-image-downsampler").apply { isDaemon = true }
+  }
 
   override fun getName(): String = "ImpulsaImageDownsampler"
 
@@ -49,7 +63,11 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
       || maxSide > 4096
       || !quality.isFinite()
     ) {
-      promise.reject("E_DOWNSAMPLE_ARGUMENT", "URI, operacion o parametros de reduccion invalidos.")
+      runOnUiThread {
+        if (!destroyed.get()) {
+          promise.reject("E_DOWNSAMPLE_ARGUMENT", "URI, operacion o parametros de reduccion invalidos.")
+        }
+      }
       return
     }
 
@@ -64,7 +82,9 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
   fun cancel(operationId: String?, promise: Promise) {
     val id = operationId?.trim().orEmpty()
     if (id.isEmpty()) {
-      promise.resolve(false)
+      runOnUiThread {
+        if (!destroyed.get()) promise.resolve(false)
+      }
       return
     }
     reactApplicationContext.runOnUiQueueThread {
@@ -73,22 +93,23 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
         promise.resolve(false)
         return@runOnUiQueueThread
       }
-      if (!operation.settled.compareAndSet(false, true)) {
+      if (operation.settled.get() || !operation.cancelRequested.compareAndSet(false, true)) {
         promise.resolve(false)
         return@runOnUiQueueThread
       }
-      // Glide no interrumpe de forma cooperativa un decoder ya iniciado: clear
-      // impide la entrega y libera el target. Si clear falla se informa false,
-      // pero la operacion queda settled para que una entrega tardia no use el bitmap.
-      val cleared = clearTarget(operation.target)
-      operation.output.delete()
-      releaseOperation(operation)
-      operation.promise.reject("E_DOWNSAMPLE_CANCELLED", "La reduccion de la imagen fue cancelada.")
-      promise.resolve(cleared)
+      if (operation.phase == Phase.PROCESSING) {
+        // Bitmap.compress no es cancelable de forma segura. El target y la
+        // exclusión se conservan hasta que el worker termine y limpie la salida.
+        operation.cancelPromise = promise
+        return@runOnUiQueueThread
+      }
+      finishLoadingCancellation(operation, promise)
     }
   }
 
   private fun startDownsample(source: String, side: Int, qualityInt: Int, operationId: String, promise: Promise) {
+    assertUiThread()
+    if (destroyed.get()) return
     if (activeOperation != null) {
       promise.reject("E_DOWNSAMPLE_BUSY", "Ya hay una reduccion de imagen en curso.")
       return
@@ -107,35 +128,50 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
 
     val target = object : CustomTarget<Bitmap>(side, side) {
       override fun onResourceReady(resource: Bitmap, transition: Transition<in Bitmap>?) {
-        if (!operation.settled.compareAndSet(false, true)) return
+        assertUiThread()
+        if (operation.settled.get() || operation.phase != Phase.LOADING || activeOperation !== operation) return
+        if (destroyed.get() || operation.cancelRequested.get()) {
+          finishLoadingCancellation(operation, operation.cancelPromise)
+          return
+        }
+        operation.phase = Phase.PROCESSING
+        val width = resource.width
+        val height = resource.height
         try {
-          FileOutputStream(output).use { stream ->
-            if (!resource.compress(Bitmap.CompressFormat.JPEG, qualityInt, stream)) {
-              throw IllegalStateException("No se pudo comprimir la imagen.")
+          compressionExecutor.execute {
+            var processError: Throwable? = null
+            try {
+              check(Looper.myLooper() != Looper.getMainLooper()) {
+                "La compresion JPEG no puede ejecutarse en el hilo principal."
+              }
+              FileOutputStream(output).use { stream ->
+                if (!resource.compress(Bitmap.CompressFormat.JPEG, qualityInt, stream)) {
+                  throw IllegalStateException("No se pudo comprimir la imagen.")
+                }
+              }
+            } catch (error: Throwable) {
+              processError = error
+            }
+            mainHandler.post {
+              finishProcessing(operation, width, height, processError)
             }
           }
-          val result = Arguments.createMap()
-          result.putString("uri", Uri.fromFile(output).toString())
-          result.putInt("width", resource.width)
-          result.putInt("height", resource.height)
-          releaseOperation(operation)
-          promise.resolve(result)
-        } catch (error: Throwable) {
-          output.delete()
-          releaseOperation(operation)
-          promise.reject("E_DOWNSAMPLE_PROCESS", "No se pudo procesar la imagen reducida.", error)
-        } finally {
-          clearTarget(this)
+        } catch (error: RejectedExecutionException) {
+          finishProcessing(operation, width, height, error)
         }
       }
 
       override fun onLoadFailed(errorDrawable: Drawable?) {
         super.onLoadFailed(errorDrawable)
+        assertUiThread()
         if (!operation.settled.compareAndSet(false, true)) return
-        clearTarget(this)
-        output.delete()
+        operation.phase = Phase.FINISHED
+        clearOperationTarget(operation)
+        deleteOutput(operation)
         releaseOperation(operation)
-        promise.reject("E_DOWNSAMPLE_READ", "No se pudo leer o decodificar la imagen seleccionada.")
+        if (!destroyed.get()) {
+          promise.reject("E_DOWNSAMPLE_READ", "No se pudo leer o decodificar la imagen seleccionada.")
+        }
       }
 
       override fun onLoadCleared(placeholder: Drawable?) {
@@ -151,19 +187,79 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
         .into(target)
     } catch (error: Throwable) {
       if (operation.settled.compareAndSet(false, true)) {
-        clearTarget(target)
-        output.delete()
+        operation.phase = Phase.FINISHED
+        clearOperationTarget(operation)
+        deleteOutput(operation)
         releaseOperation(operation)
-        promise.reject("E_DOWNSAMPLE_READ", "No se pudo leer o decodificar la imagen seleccionada.", error)
+        if (!destroyed.get()) {
+          promise.reject("E_DOWNSAMPLE_READ", "No se pudo leer o decodificar la imagen seleccionada.", error)
+        }
       }
     }
   }
 
+  private fun finishLoadingCancellation(operation: Operation, cancelPromise: Promise?) {
+    assertUiThread()
+    if (!operation.settled.compareAndSet(false, true)) {
+      if (!destroyed.get()) cancelPromise?.resolve(false)
+      return
+    }
+    operation.phase = Phase.FINISHED
+    val cleared = clearOperationTarget(operation)
+    deleteOutput(operation)
+    releaseOperation(operation)
+    if (!destroyed.get()) {
+      operation.promise.reject("E_DOWNSAMPLE_CANCELLED", "La reduccion de la imagen fue cancelada.")
+      cancelPromise?.resolve(cleared)
+    }
+  }
+
+  private fun finishProcessing(operation: Operation, width: Int, height: Int, error: Throwable?) {
+    assertUiThread()
+    if (!operation.settled.compareAndSet(false, true)) return
+    operation.phase = Phase.FINISHED
+    val cancelled = operation.cancelRequested.get() || destroyed.get()
+    if (cancelled || error != null) deleteOutput(operation)
+    val cleared = clearOperationTarget(operation)
+    releaseOperation(operation)
+
+    if (destroyed.get()) return
+    if (cancelled) {
+      operation.promise.reject("E_DOWNSAMPLE_CANCELLED", "La reduccion de la imagen fue cancelada.")
+      operation.cancelPromise?.resolve(cleared)
+      return
+    }
+    if (error != null) {
+      operation.promise.reject("E_DOWNSAMPLE_PROCESS", "No se pudo procesar la imagen reducida.", error)
+      return
+    }
+
+    val result = Arguments.createMap()
+    result.putString("uri", Uri.fromFile(operation.output).toString())
+    result.putInt("width", width)
+    result.putInt("height", height)
+    operation.promise.resolve(result)
+  }
+
   private fun releaseOperation(operation: Operation) {
+    assertUiThread()
     if (activeOperation === operation) activeOperation = null
   }
 
+  private fun clearOperationTarget(operation: Operation): Boolean {
+    assertUiThread()
+    if (!operation.targetCleared.compareAndSet(false, true)) return true
+    val target = operation.target
+    operation.target = null
+    return clearTarget(target)
+  }
+
+  private fun deleteOutput(operation: Operation) {
+    if (operation.outputDeleted.compareAndSet(false, true)) operation.output.delete()
+  }
+
   private fun clearTarget(target: CustomTarget<Bitmap>?): Boolean {
+    assertUiThread()
     if (target == null) return true
     return try {
       Glide.with(reactApplicationContext).clear(target)
@@ -171,5 +267,29 @@ class ImageDownsamplerModule(reactContext: ReactApplicationContext) : ReactConte
     } catch (_: Throwable) {
       false
     }
+  }
+
+  private fun runOnUiThread(block: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
+  }
+
+  private fun assertUiThread() {
+    check(Looper.myLooper() == Looper.getMainLooper()) {
+      "La gestion de Glide debe ejecutarse en el hilo principal."
+    }
+  }
+
+  override fun invalidate() {
+    if (!destroyed.compareAndSet(false, true)) return
+    compressionExecutor.shutdown()
+    runOnUiThread {
+      val operation = activeOperation ?: return@runOnUiThread
+      when (operation.phase) {
+        Phase.LOADING -> finishLoadingCancellation(operation, null)
+        Phase.PROCESSING -> operation.cancelRequested.set(true)
+        Phase.FINISHED -> Unit
+      }
+    }
+    super.invalidate()
   }
 }

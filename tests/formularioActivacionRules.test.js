@@ -168,7 +168,7 @@ test('las 12 reglas fotográficas vigentes producen únicamente los botones obli
     ['tienda_barrio', 'no_habilitado', true, false],
     ['tienda_barrio', 'reactivacion', true, true],
     ['tienda_barrio', 'config_cuenta', true, true],
-    ['tienda_barrio', 'reimpresion_qr', true, false],
+    ['tienda_barrio', 'reimpresion_qr', true, true],
     ['transeunte', 'transeunte', false, true],
     ['transeunte', 'reactivacion_transeunte', false, true],
   ];

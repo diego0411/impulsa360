@@ -74,6 +74,9 @@ import {
   ejecutarOperacionSerializada,
   resolverLecturaPendientes,
 } from './lib/offlineSafety';
+import { encontrarFotoHistoricaSegura } from './lib/historicalPhotoSelection';
+import { asegurarUuidActivacionPersistido } from './lib/activationUuid';
+import { construirPayloadSincronizacionActivacion } from './lib/activationRecord';
 
 const MIN_BRANDED_INTRO_MS = 3200;
 const SESSION_TIMEOUT_MS = 8000;
@@ -219,33 +222,6 @@ const isRemotePhotoRef = (value) => (
   && value.trim()
   && !isLocalPhotoUri(value)
 );
-const normalizeOptionalDbValue = (value) => {
-  if (typeof value === 'string' && value.trim() === '') return null;
-  return value;
-};
-const sanitizeActivationPayload = (payload = {}) => {
-  const clean = { ...payload };
-  const tipo = clean.tipo_activacion;
-  const base = clean.base_activacion;
-  const isTiendaBarrio = base === 'tienda_barrio';
-  const isComercio = base === 'comercio';
-
-  if (!isTiendaBarrio) {
-    clean.tipo_tienda = null;
-    clean.tamano_tienda = null;
-  }
-  if (!isComercio) {
-    clean.tipo_comercio = null;
-    clean.rubro_comercio = null;
-    clean.rubro_comercio_otro = null;
-    clean.comercio_fuera_mercado = null;
-  }
-  if (tipo !== 'reactivacion_comercio' && tipo !== 'reactivacion_transeunte' && tipo !== 'reactivacion') {
-    clean.reactivacion_comercio = false;
-  }
-
-  return clean;
-};
 const buildPhotoStoragePath = (usuarioId, recordId, key) => {
   const fileName = key === 'foto_cash_in' ? 'cash-in.jpg' : 'principal.jpg';
   return `activaciones/${usuarioId}/${recordId}/${fileName}`;
@@ -314,22 +290,12 @@ const findHistoricalRemotePhoto = async ({ usuario, formulario, localId, recordI
     }
   }
 
-  const candidates = uniqueStrings([...directCandidates, ...listCandidates]);
-  const preferred = candidates.sort((a, b) => {
-    const nameA = a.toLowerCase();
-    const nameB = b.toLowerCase();
-    const score = (name) => {
-      if (key === 'foto_cash_in' && /cash[-_]?in|foto_cash_in/.test(name)) return 0;
-      if (key === 'foto_url' && /principal|foto_url|\/[^/]+\.jpg$/.test(name)) return 0;
-      return 1;
-    };
-    return score(nameA) - score(nameB);
+  return encontrarFotoHistoricaSegura({
+    candidates: uniqueStrings([...directCandidates, ...listCandidates]),
+    key,
+    recordIds,
+    existe: existeFotoRemota,
   });
-
-  for (const candidate of preferred) {
-    if (await existeFotoRemota(candidate)) return candidate;
-  }
-  return '';
 };
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -594,51 +560,6 @@ function AppShell() {
       const errores = [];
       const syncedLocalIds = [];
       const syncedRecordIds = [];
-      const allowedFields = [
-        'id',
-        'nombres_cliente',
-        'apellidos_cliente',
-        'ci_cliente',
-        'telefono_cliente',
-        'email_cliente',
-        'descargo_app',
-        'registro',
-        'cash_in',
-        'cash_out',
-        'p2p',
-        'qr_fisico',
-        'hubo_error',
-        'descripcion_error',
-        'tipo_error',
-        'foto_cash_in',
-        'tipo_tienda',
-        'rubro_comercio',
-        'rubro_comercio_otro',
-        'comercio_fuera_mercado',
-        'es_plaza_temporal',
-        'plaza_temporal',
-        'tipo_activacion',
-        'base_activacion',
-        'es_reactivacion',
-        'tamano_tienda',
-        'tipo_comercio',
-        'foto_url',
-        'fecha_activacion',
-        'latitud',
-        'longitud',
-        'reactivacion_comercio',
-        'respaldo',
-        'creditos',
-        'remesas',
-        'ciudad_activacion',
-        'zona_activacion',
-        'distrito_gps',
-        'region_gps',
-        'plaza',
-        'estado_sync',
-        'dispositivo',
-      ];
-
       for (const f of formularios) {
         if (!syncVigente()) {
           errores.push('La sesión cambió durante la sincronización; los pendientes se conservarán.');
@@ -655,14 +576,29 @@ function AppShell() {
           continue;
         }
 
-        // Asegura id UUID estable
-        const recordId = (formulario.id && typeof formulario.id === 'string' && formulario.id.length > 20)
-          ? formulario.id
-          : uuidv4();
-        if (!formulario.id || formulario.id !== recordId) {
-          formulario.id = recordId;
-          await actualizarFormularioLocal(localId, { id: recordId });
+        // El ID remoto debe quedar confirmado localmente antes de cualquier
+        // RPC, upload o upsert. Un ID explícito inválido nunca se regenera.
+        const uuidResult = await asegurarUuidActivacionPersistido({
+          id: formulario.id,
+          idLocal: _id_local,
+          generarUuid: uuidv4,
+          persistir: (id) => actualizarFormularioLocal(localId, { id }),
+          leerPersistido: () => obtenerFormularioPorId(localId),
+        });
+        if (!uuidResult.ok) {
+          const errorMsg = uuidResult.reason === 'invalid_id'
+            ? 'ID de activación inválido. El pendiente se conserva para reparación sin modificar sus fotografías.'
+            : uuidResult.reason === 'missing_local_identity'
+              ? 'La activación pendiente no tiene identidad local segura y se conserva sin sincronizar.'
+              : 'No se pudo persistir y confirmar el UUID de la activación pendiente.';
+          if (localId !== null && localId !== undefined) {
+            await marcarErrorSync(localId, errorMsg).catch(() => false);
+          }
+          errores.push(`ID local ${localId ?? 'desconocido'}: ${errorMsg}`);
+          continue;
         }
+        const recordId = uuidResult.recordId;
+        formulario.id = recordId;
         syncDebug('registro local', { localId, recordId });
 
         // Los pendientes legados sin fecha conservan la fecha de su guardado
@@ -1042,11 +978,7 @@ function AppShell() {
         }
 
         // Solo enviamos columnas permitidas para evitar errores de esquema
-        let payload = allowedFields.reduce((acc, key) => {
-          if (formulario[key] !== undefined) acc[key] = normalizeOptionalDbValue(formulario[key]);
-          return acc;
-        }, {});
-        payload = sanitizeActivationPayload(payload);
+        const payload = construirPayloadSincronizacionActivacion(formulario);
 
         // El owner persistido es definitivo; la sesión actual solo autoriza
         // procesar pendientes cuyo usuario_id ya coincide.

@@ -4,6 +4,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const Module = require('node:module');
 const babel = require('@babel/core');
+const {
+  construirPayloadSincronizacionActivacion,
+  resolverProductosGuardados,
+} = require('../lib/activationRecord');
 
 const STORAGE_KEY = 'formularios_offline_v1';
 const LEGACY_KEY = 'formularios_locales';
@@ -128,6 +132,86 @@ test('un array vacio valido admite guardar normalmente', async () => {
   assert.equal(guardados.length, 1);
   assert.equal(guardados[0]._id_local, id);
   assert.equal(guardados[0].usuario_id, 'usuario-1');
+  assert.equal(guardados[0].id, id);
+});
+
+test('storage preserva UUID válido y conserva ID legacy inválido para reparación', async () => {
+  const uuid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const { storage, persisted } = loadStorage({ initial: { [STORAGE_KEY]: '[]' } });
+
+  await storage.guardarFormularioLocal({
+    usuario_id: 'usuario-1',
+    id: uuid,
+    nombres_cliente: 'Valido',
+  });
+  await storage.guardarFormularioLocal({
+    usuario_id: 'usuario-1',
+    id: 'identificador-legacy-largo-invalido',
+    nombres_cliente: 'Legacy',
+  });
+
+  const guardados = JSON.parse(persisted.get(STORAGE_KEY));
+  assert.equal(guardados.find((item) => item.nombres_cliente === 'Valido').id, uuid);
+  assert.equal(
+    guardados.find((item) => item.nombres_cliente === 'Legacy').id,
+    'identificador-legacy-largo-invalido',
+  );
+});
+
+test('Remesa conserva su booleano desde guardado elegible hasta el payload de sincronización', async () => {
+  const casos = [
+    {
+      nombre: 'elegible true',
+      tipo_grupo: 'tienda_barrio',
+      tipo_activacion: 'comercio',
+      seleccion: true,
+      esperado: true,
+    },
+    {
+      nombre: 'elegible false',
+      tipo_grupo: 'tienda_barrio',
+      tipo_activacion: 'comercio',
+      seleccion: false,
+      esperado: false,
+    },
+    {
+      nombre: 'no elegible true',
+      tipo_grupo: 'comercio',
+      tipo_activacion: 'reactivacion_comercio',
+      seleccion: true,
+      esperado: false,
+    },
+  ];
+
+  for (const [index, caso] of casos.entries()) {
+    const id = `10000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
+    const { storage } = loadStorage({ initial: { [STORAGE_KEY]: '[]' } });
+    const formulario = {
+      id,
+      usuario_id: 'usuario-1',
+      tipo_grupo: caso.tipo_grupo,
+      tipo_activacion: caso.tipo_activacion,
+      base_activacion: caso.tipo_grupo,
+      remesas: caso.seleccion,
+    };
+    const registro = {
+      ...formulario,
+      ...resolverProductosGuardados(formulario),
+    };
+
+    await storage.guardarFormularioLocal(registro);
+    const lectura = await storage.leerFormulariosLocalesSeguro();
+    assert.equal(lectura.status, 'ok', caso.nombre);
+    assert.equal(lectura.value.length, 1, caso.nombre);
+    const offline = lectura.value[0];
+    assert.equal(offline.remesas, caso.esperado, caso.nombre);
+    assert.equal(offline.id, id, `${caso.nombre}: UUID offline estable`);
+
+    const payload = construirPayloadSincronizacionActivacion(offline);
+    assert.equal(payload.remesas, caso.esperado, caso.nombre);
+    assert.equal(typeof payload.remesas, 'boolean', caso.nombre);
+    assert.equal(payload.id, id, `${caso.nombre}: UUID del payload estable`);
+  }
 });
 
 test('datos legacy validos migran sin cambiar registros existentes', async () => {
@@ -138,6 +222,21 @@ test('datos legacy validos migran sin cambiar registros existentes', async () =>
   assert.equal(guardados.length, 2);
   assert.equal(JSON.parse(persisted.get(STORAGE_KEY)).length, 2);
   assert.equal(persisted.get(LEGACY_KEY), legacy);
+});
+
+test('migración legacy conserva un ID explícito inválido y crea identidad local separada', async () => {
+  const legacyId = 'identificador-legacy-largo-invalido';
+  const legacy = JSON.stringify([{
+    id: legacyId,
+    usuario_id: 'usuario-1',
+    foto_url: 'file:///foto-pendiente.jpg',
+  }]);
+  const { storage } = loadStorage({ initial: { [LEGACY_KEY]: legacy } });
+
+  const [migrado] = await storage.obtenerFormulariosLocales();
+  assert.equal(migrado.id, legacyId);
+  assert.match(migrado._id_local, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(migrado.foto_url, 'file:///foto-pendiente.jpg');
 });
 
 test('legacy invalido no crea almacenamiento nuevo ni altera el original', async () => {

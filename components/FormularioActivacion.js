@@ -38,7 +38,11 @@ import {
 } from '../lib/galleryImageDownsampler';
 import { deduplicarPlazasPorEtiqueta, etiquetaPlaza, tienePlazaValida } from '../lib/plazas';
 import { withTimeout } from '../lib/asyncTimeout';
-import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from '../lib/elegibilidadReactivacion';
+import {
+  esFalloTransitorioElegibilidad,
+  requiereValidacionReactivacion,
+  validarElegibilidadReactivacion,
+} from '../lib/elegibilidadReactivacion';
 import { fechaBolivia, milisegundosHastaSiguienteDiaBolivia } from '../lib/fechaBolivia';
 import { resolverReglaFotografias } from '../lib/reglasFotografias';
 import {
@@ -50,6 +54,7 @@ import {
   resolverVisibilidadFotografias,
 } from '../lib/formularioActivacionRules';
 import { resolverElegibilidadProductos } from '../lib/elegibilidadProductos';
+import { resolverProductosGuardados } from '../lib/activationRecord';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { colors, spacing, fontSizes, radius, shadow } from '../styles/theme';
 import CameraEvidencia from './CameraEvidencia';
@@ -63,6 +68,7 @@ import {
 import { setEdicionActiva } from '../lib/edicionActiva';
 import { photoSizeBucket, recordEvent } from '../lib/telemetry';
 import { drenarEscriturasCoalescidas } from '../lib/offlineSafety';
+import { clasificarIdActivacion } from '../lib/activationUuid';
 
 const DEVICE_INFO = `react-native-${Platform.OS}`;
 const GPS_TIMEOUT_MS = 15000;
@@ -1913,14 +1919,17 @@ export default function FormularioActivacion({
     setEstadoGuardado('Guardando…');
     // Asegura fecha e id si no están seteados (fallback a hoy)
     const fecha = fechaBolivia();
-    const formId = formulario.id || uuidv4();
+    const idFormularioAusente = clasificarIdActivacion(formulario.id) === 'ausente';
+    const formId = idFormularioAusente
+      ? uuidv4()
+      : formulario.id;
     let formularioConBasicos = {
       ...formulario,
       fecha_activacion: fecha,
       id: formId,
       impulsador: normalizarNombreVisible(formulario.impulsador || usuario?.nombre || ''),
     };
-    if (formulario.fecha_activacion !== fecha || !formulario.id) {
+    if (formulario.fecha_activacion !== fecha || idFormularioAusente) {
       setFormulario(prev => ({ ...prev, fecha_activacion: fecha, id: formId }));
     }
 
@@ -1958,19 +1967,31 @@ export default function FormularioActivacion({
 
     try {
       const requiereElegibilidad = requiereValidacionReactivacion(formularioConBasicos.tipo_activacion);
+      let elegibilidadDiferida = false;
       if (isConnected && requiereElegibilidad) {
-        const elegibilidad = await validarElegibilidadReactivacion({
-          ci: formularioConBasicos.ci_cliente,
-          telefono: formularioConBasicos.telefono_cliente,
-          tipoActivacion: formularioConBasicos.tipo_activacion,
-          registroId: formId,
-          fechaReferencia: fecha,
-        });
-        if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
-        if (!elegibilidad.ok) {
-          setEstadoGuardado(`Error: ${elegibilidad.mensaje}`);
-          Alert.alert('Periodo mínimo no cumplido', enmascararMarcaVisible(elegibilidad.mensaje, usuario));
-          return;
+        try {
+          const elegibilidad = await validarElegibilidadReactivacion({
+            ci: formularioConBasicos.ci_cliente,
+            telefono: formularioConBasicos.telefono_cliente,
+            tipoActivacion: formularioConBasicos.tipo_activacion,
+            registroId: formId,
+            fechaReferencia: fecha,
+          });
+          if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
+          if (!elegibilidad.ok) {
+            setEstadoGuardado(`Error: ${elegibilidad.mensaje}`);
+            Alert.alert('Periodo mínimo no cumplido', enmascararMarcaVisible(elegibilidad.mensaje, usuario));
+            return;
+          }
+        } catch (error) {
+          // Solo timeout o fallo de red inequívoco: se difiere la validación
+          // y el guardado local continúa como pendiente. Cualquier otro
+          // error (auth, permisos, configuración, lógica) se propaga al
+          // manejo global de error, sin convertirlo en offline.
+          if (!esFalloTransitorioElegibilidad(error)) throw error;
+          if (!esSesionFormularioActual(sesionGuardado, propietarioGuardado)) return;
+          elegibilidadDiferida = true;
+          formDebug('elegibilidad de reactivación diferida por fallo de red', error?.message || String(error));
         }
       }
 
@@ -2037,12 +2058,11 @@ export default function FormularioActivacion({
 
       // Productos opcionales: solo se persisten como true si el tipo actual
       // los habilita; nunca se envían true para un producto no elegible.
-      const elegibilidadProductosGuardado = resolverElegibilidadProductos(formularioConBasicos);
+      const productosGuardados = resolverProductosGuardados(formularioConBasicos);
       const datosFormulario = {
         ...formularioConBasicos,
         base_activacion: baseActivacion,
-        creditos: elegibilidadProductosGuardado.creditos && formularioConBasicos.creditos === true,
-        remesas: elegibilidadProductosGuardado.remesas && formularioConBasicos.remesas === true,
+        ...productosGuardados,
         fecha_activacion: fecha,
         latitud,
         longitud,
@@ -2069,7 +2089,7 @@ export default function FormularioActivacion({
           status: 'pending',
           tries: 0,
           error: null,
-          requiresEligibilityCheck: !isConnected && requiereElegibilidad,
+          requiresEligibilityCheck: requiereElegibilidad && (elegibilidadDiferida || !isConnected),
           localPhotos: {
             // Incluye foto_url siempre que sea URI local (cubre evidencia
             // voluntaria de transeúnte); su ausencia sigue permitida.

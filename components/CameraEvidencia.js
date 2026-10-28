@@ -7,6 +7,7 @@ import { TimeoutError, withTimeout } from '../lib/asyncTimeout';
 import {
   crearIdCamara,
   finalizarHitoCamara,
+  marcarHitoCamaraInterrumpido,
   registrarErrorFoto,
   registrarHitoCamara,
 } from '../lib/photoDiagnostics';
@@ -46,6 +47,7 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
   const previewReportadoRef = useRef(false);
   const previewLayoutReportadoRef = useRef(false);
   const entregaPendienteRef = useRef(null);
+  const entregadaRef = useRef(false);
   const pictureSizeRef = useRef(PICTURE_SIZE_INICIAL);
   const resolviendoPictureSizeRef = useRef(false);
   const esperandoPictureSizeRef = useRef(false);
@@ -91,6 +93,9 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
       mountedRef.current = false;
       sessionRef.current += 1;
       cameraInstanceRef.current += 1;
+      if (!entregadaRef.current && cameraProcessIdRef.current) {
+        marcarHitoCamaraInterrumpido(cameraProcessIdRef.current).catch(() => {});
+      }
       if (temporizadorPictureSizeRef.current) {
         globalThis.clearTimeout(temporizadorPictureSizeRef.current);
         temporizadorPictureSizeRef.current = null;
@@ -117,8 +122,14 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     setPictureSize(PICTURE_SIZE_INICIAL);
     setModalShown(false);
     setCameraInstance(null);
-    if (!visible) return;
+    if (!visible) {
+      if (!entregadaRef.current && cameraProcessIdRef.current) {
+        finalizarHitoCamara(cameraProcessIdRef.current, 'SESSION_CLOSED').catch(() => {});
+      }
+      return;
+    }
     cameraProcessIdRef.current = crearIdCamara();
+    entregadaRef.current = false;
     previewReportadoRef.current = false;
     previewLayoutReportadoRef.current = false;
     entregaPendienteRef.current = null;
@@ -140,6 +151,7 @@ export default function CameraEvidencia({ visible, label, onCancel, onUse }) {
     entregaPendienteRef.current = null;
     setEntregaLista(false);
     if (!entrega?.uri) return;
+    entregadaRef.current = true;
     reportarHito('CAMERA_HANDOFF');
     onUse(entrega.uri, {
       width: entrega.width,

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Impulsa360",
     "slug": "impulsa360",
-    "version": "1.0.30",
+    "version": "1.0.32",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
@@ -33,13 +33,13 @@
         "backgroundColor": "#FFFFFF"
       },
       "package": "com.integrat360.impulsa360",
-      "versionCode": 82,
+      "versionCode": 84,
       "blockedPermissions": [
-  "android.permission.RECORD_AUDIO",
-  "android.permission.READ_MEDIA_IMAGES",
-  "android.permission.READ_MEDIA_VIDEO",
-  "android.permission.WRITE_EXTERNAL_STORAGE"
-]
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"

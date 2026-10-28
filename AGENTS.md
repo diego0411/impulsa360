@@ -3,7 +3,7 @@
 ## Project shape
 - React Native 0.81 + Expo 54 app, written in JS (no app TS). Entry: `index.js` -> `App.js`.
 - Android-first field app for activation capture with offline sync; backend is Supabase. UI, copy, and domain fields are in Spanish (Bolivia, `America/La_Paz`).
-- No navigation library is used in practice: `App.js` switches screens from the `vistaActiva` state and renders a custom tab bar. Screens live in `components/`; there are no route files.
+- No navigation library is used in practice: `@react-navigation/*` is installed but never imported in app code. `App.js` switches screens from the `vistaActiva` state and renders a custom tab bar. Screens live in `components/`; there are no route files.
 - `android/` and `ios/` are committed native projects. Android has custom Kotlin modules (`ExitInfoModule`, `ImageDownsamplerModule`) registered manually in `MainApplication.kt`.
 - `App.js` is a very large monolith (~90 KB) on purpose. Extend its existing hooks/guards rather than splitting or rewriting flows.
 
@@ -16,6 +16,7 @@
 - There is no useful typecheck: `npx tsc --noEmit` errors with TS18003 because sources are JS and `tsconfig.json` only includes `**/*.ts(x)`.
 - Android verification: `npx expo-doctor`, `npm run preflight:android`.
 - Release build: `npm run build:android:aab` (loads `.env`, runs preflight, then `:app:bundleRelease`). Artifact: `android/app/build/outputs/bundle/release/app-release.aab`.
+- `eas.json` exists but is not the release path used here: production has `appVersionSource: "remote"` + `autoIncrement: true`, which would bypass the gradle.properties versioning described below. Stick to the local Gradle flow unless EAS is explicitly requested.
 
 ## Config and release gotchas
 - `lib/config.js` reads only `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_ANON_KEY` at bundle time. The `app.json` `expo.extra.supabase*` fallback only satisfies preflight; it is not read at runtime. If env vars are missing, `lib/supabase.js` silently uses a no-op stub.
@@ -34,4 +35,4 @@
 
 ## Docs to trust
 - Current references: `docs/auditoria-documental-app-movil.md` and `docs/esquema-base-datos-impulsa360.md`.
-- `docs/cliente/04_documentacion_tecnica.md` is stale (Expo 52, version 1.0.10). Trust `package.json`, `app.json`, and `android/gradle.properties` over it.
+- The entire `docs/cliente/` folder is a frozen delivery snapshot pinned at version 1.0.10 (code 17), predating the current 1.0.30 (code 82). Trust `package.json`, `app.json`, and `android/gradle.properties` over it for anything version-, build-, or API-related.

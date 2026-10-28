@@ -58,11 +58,12 @@ test('Remesas se habilita en todos los subtipos de Tienda de Barrio', () => {
   }
 });
 
-test('Remesas se habilita en Transeúnte vigente y Comercio nuevo', () => {
+test('Remesas se habilita en Transeúnte vigente y Comercio (nuevo y limbo)', () => {
   const remesas = [
     ['transeunte', 'transeunte'],
     ['transeunte', 'reactivacion_transeunte'],
     ['comercio', 'comercio'],
+    ['comercio', 'limbo'],
   ];
   for (const [tipoGrupo, tipoActivacion] of remesas) {
     assert.equal(
@@ -76,7 +77,6 @@ test('Remesas se habilita en Transeúnte vigente y Comercio nuevo', () => {
 test('Remesas conserva deshabilitado en Comercio no nuevo, Cliente antiguo y Transeúnte legacy', () => {
   const sinRemesas = [
     ['comercio', 'reactivacion_comercio'],
-    ['comercio', 'limbo'],
     ['comercio', 'no_habilitado'],
     ['comercio', 'reimpresion_qr'],
     ['cliente_antiguo', 'cliente_antiguo'],
@@ -95,7 +95,6 @@ test('casos ambiguos, desconocidos o vacíos quedan con ambos deshabilitados', (
   const ambiguos = [
     {},
     { tipoGrupo: 'comercio', tipoActivacion: 'comercio', extra: true },
-    { tipoGrupo: 'comercio', tipoActivacion: 'limbo' },
     { tipoGrupo: 'comercio', tipoActivacion: 'no_habilitado' },
     { tipoGrupo: 'tienda_barrio', tipoActivacion: 'desconocido' },
     { tipoGrupo: 'transeunte', tipoActivacion: 'desconocido' },
