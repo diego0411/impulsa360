@@ -77,6 +77,10 @@ import {
 import { encontrarFotoHistoricaSegura } from './lib/historicalPhotoSelection';
 import { asegurarUuidActivacionPersistido } from './lib/activationUuid';
 import { construirPayloadSincronizacionActivacion } from './lib/activationRecord';
+import {
+  leerCatalogoUbicacionesCache,
+  obtenerCatalogoUbicaciones,
+} from './lib/catalogoUbicaciones';
 
 const MIN_BRANDED_INTRO_MS = 3200;
 const SESSION_TIMEOUT_MS = 8000;
@@ -378,6 +382,7 @@ function AppShell() {
   const [isInternetReachable, setIsInternetReachable] = useState(null);
   const [rolesCargaError, setRolesCargaError] = useState('');
   const [metricasVersion, setMetricasVersion] = useState(0);
+  const [ciudadesCatalogo, setCiudadesCatalogo] = useState([]);
   const syncingRef = useRef(false);
   const lastSyncRef = useRef(0);
   const syncGeneracionRef = useRef(0);
@@ -399,9 +404,16 @@ function AppShell() {
   const internetReachableRef = useRef(isInternetReachable);
   const formularioFlushRef = useRef(null);
   const navegacionFormularioRef = useRef(false);
+  const catalogoCacheCargaRef = useRef(null);
+  const catalogoActualizacionRef = useRef(null);
+  const ciudadesCatalogoRef = useRef(ciudadesCatalogo);
+  const catalogoMountedRef = useRef(true);
+  const connectedRef = useRef(isConnected);
   usuarioRef.current = usuario;
   sesionOnlineValidaRef.current = sesionOnlineValida;
   internetReachableRef.current = isInternetReachable;
+  connectedRef.current = isConnected;
+  ciudadesCatalogoRef.current = ciudadesCatalogo;
 
   useEffect(() => {
     pinUiMountedRef.current = true;
@@ -409,6 +421,58 @@ function AppShell() {
       pinUiMountedRef.current = false;
     };
   }, []);
+
+  const cargarCatalogoUbicacionesCache = useCallback(() => {
+    if (catalogoCacheCargaRef.current) return catalogoCacheCargaRef.current;
+    const carga = leerCatalogoUbicacionesCache()
+      .then((catalogo) => {
+        if (catalogoMountedRef.current && catalogo?.ciudades?.length) {
+          ciudadesCatalogoRef.current = catalogo.ciudades;
+          setCiudadesCatalogo(catalogo.ciudades);
+        }
+        return catalogo;
+      })
+      .catch(() => null);
+    catalogoCacheCargaRef.current = carga;
+    return carga;
+  }, []);
+
+  const refrescarCatalogoUbicaciones = useCallback(() => {
+    if (catalogoActualizacionRef.current) return catalogoActualizacionRef.current;
+    const actualizacion = (async () => {
+      await cargarCatalogoUbicacionesCache();
+      if (
+        !connectedRef.current
+        || internetReachableRef.current === false
+        || !sesionOnlineValidaRef.current
+        || !usuarioRef.current?.id
+        || logoutEnCursoRef.current
+      ) return ciudadesCatalogoRef.current;
+
+      const catalogo = await obtenerCatalogoUbicaciones({ isConnected: true });
+      if (catalogoMountedRef.current && catalogo?.ciudades?.length) {
+        ciudadesCatalogoRef.current = catalogo.ciudades;
+        setCiudadesCatalogo(catalogo.ciudades);
+      }
+      return catalogo?.ciudades || ciudadesCatalogoRef.current;
+    })()
+      .catch(() => ciudadesCatalogoRef.current)
+      .finally(() => {
+        if (catalogoActualizacionRef.current === actualizacion) {
+          catalogoActualizacionRef.current = null;
+        }
+      });
+    catalogoActualizacionRef.current = actualizacion;
+    return actualizacion;
+  }, [cargarCatalogoUbicacionesCache]);
+
+  useEffect(() => {
+    catalogoMountedRef.current = true;
+    cargarCatalogoUbicacionesCache();
+    return () => {
+      catalogoMountedRef.current = false;
+    };
+  }, [cargarCatalogoUbicacionesCache]);
 
   const contarFormulariosLocales = useCallback(async (ownerId = usuario?.id) => {
     const lectura = resolverLecturaPendientes(
@@ -1475,6 +1539,17 @@ function AppShell() {
   }, [isConnected, isInternetReachable, sesionOnlineValida, sincronizarFormularios]);
 
   useEffect(() => {
+    if (!usuario?.id || !sesionOnlineValida || !isConnected || isInternetReachable === false) return;
+    refrescarCatalogoUbicaciones();
+  }, [
+    isConnected,
+    isInternetReachable,
+    refrescarCatalogoUbicaciones,
+    sesionOnlineValida,
+    usuario?.id,
+  ]);
+
+  useEffect(() => {
     if (usuario?.id && isConnected) {
       refrescarConteoNoLeidas();
     }
@@ -1577,13 +1652,21 @@ function AppShell() {
         }
         verificarSesion().then((sesionValida) => {
           if (!sesionValida) return;
+          refrescarCatalogoUbicaciones();
           sincronizarFormularios({ showAlerts: false });
           refrescarConteoNoLeidas();
         });
       }
     });
     return () => sub.remove();
-  }, [isConnected, isInternetReachable, refrescarConteoNoLeidas, sincronizarFormularios, verificarSesion]);
+  }, [
+    isConnected,
+    isInternetReachable,
+    refrescarCatalogoUbicaciones,
+    refrescarConteoNoLeidas,
+    sincronizarFormularios,
+    verificarSesion,
+  ]);
 
   const cerrarSesion = async () => {
     const usuarioIdLogout = usuarioRef.current?.id || null;
@@ -1966,6 +2049,7 @@ function AppShell() {
         ) : (
           <FormularioActivacion
             cantidadOffline={lecturaPendientesError ? null : cantidadOffline}
+            ciudadesCatalogo={ciudadesCatalogo}
             contarFormulariosLocales={contarFormulariosLocales}
             isConnected={isConnected}
             onSincronizar={sincronizarFormularios}

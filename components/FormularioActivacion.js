@@ -69,6 +69,7 @@ import { setEdicionActiva } from '../lib/edicionActiva';
 import { photoSizeBucket, recordEvent } from '../lib/telemetry';
 import { drenarEscriturasCoalescidas } from '../lib/offlineSafety';
 import { clasificarIdActivacion } from '../lib/activationUuid';
+import { resolverCiudadGps } from '../lib/catalogoUbicaciones';
 
 const DEVICE_INFO = `react-native-${Platform.OS}`;
 const GPS_TIMEOUT_MS = 15000;
@@ -431,7 +432,10 @@ const resolverCiudadKey = (valor = '') => {
   const porKey = CIUDADES.find((c) => c.key === normalized);
   if (porKey) return porKey.key;
   const porLabel = CIUDADES.find((c) => normalizarCiudad(c.label) === normalized);
-  return porLabel?.key || '';
+  if (porLabel) return porLabel.key;
+  return Object.entries(CIUDAD_ALIASES).find(([, aliases]) => (
+    aliases.some((alias) => normalizarCiudad(alias) === normalized)
+  ))?.[0] || '';
 };
 
 const formularioInicial = {
@@ -481,6 +485,7 @@ const formularioInicial = {
 
 export default function FormularioActivacion({
   cantidadOffline,
+  ciudadesCatalogo = [],
   contarFormulariosLocales,
   isConnected,
   onRegistrarFlushBorrador,
@@ -1068,15 +1073,29 @@ export default function FormularioActivacion({
           ? TIPOS_CLIENTE_ANTIGUO
           : [];
 
+  const catalogoCiudadesDisponible = Array.isArray(ciudadesCatalogo) && ciudadesCatalogo.length > 0;
+  const opcionesCiudad = useMemo(() => {
+    const opciones = catalogoCiudadesDisponible
+      ? ciudadesCatalogo.map((ciudad) => ({ label: ciudad.nombre, value: ciudad.nombre }))
+      : CIUDADES.map((ciudad) => ({ label: ciudad.label, value: ciudad.key }));
+    const valorActual = formulario.ciudad_activacion;
+    if (valorActual && !opciones.some((opcion) => opcion.value === valorActual)) {
+      return [{ label: valorActual, value: valorActual }, ...opciones];
+    }
+    return opciones;
+  }, [catalogoCiudadesDisponible, ciudadesCatalogo, formulario.ciudad_activacion]);
   const ciudadSeleccionada = useMemo(
-    () => CIUDADES.find(c => c.key === formulario.ciudad_activacion) || null,
+    () => CIUDADES.find(c => c.key === resolverCiudadKey(formulario.ciudad_activacion)) || null,
     [formulario.ciudad_activacion],
   );
   const zonasDisponibles = useMemo(
     () => ciudadSeleccionada?.zonas || [],
     [ciudadSeleccionada],
   );
-  const ciudadLabel = ciudadSeleccionada?.label || formulario.ciudad_activacion || '';
+  const ciudadLabel = opcionesCiudad.find((opcion) => opcion.value === formulario.ciudad_activacion)?.label
+    || ciudadSeleccionada?.label
+    || formulario.ciudad_activacion
+    || '';
 
   useEffect(() => {
     if (!formulario.ciudad_activacion) return;
@@ -1190,12 +1209,17 @@ export default function FormularioActivacion({
     }));
   };
 
-  const resolverCiudadDesdeDireccion = (dir = {}) => {
-    const candidatos = [dir.city, dir.district, dir.subregion, dir.region, dir.name]
-      .filter(Boolean)
-      .map((v) => normalizarCiudad(v));
+  const resolverCiudadDesdeDireccion = useCallback((dir = {}) => {
+    const candidatos = [dir.city, dir.district, dir.subregion, dir.region, dir.name].filter(Boolean);
 
-    for (const candidato of candidatos) {
+    if (catalogoCiudadesDisponible) {
+      return resolverCiudadGps(candidatos, ciudadesCatalogo)?.nombre || '';
+    }
+    if (isConnected !== false) return '';
+
+    const candidatosNormalizados = candidatos.map((v) => normalizarCiudad(v));
+
+    for (const candidato of candidatosNormalizados) {
       const directa = resolverCiudadKey(candidato);
       if (directa) return directa;
 
@@ -1206,7 +1230,7 @@ export default function FormularioActivacion({
       }
     }
     return '';
-  };
+  }, [catalogoCiudadesDisponible, ciudadesCatalogo, isConnected]);
 
   const extraerUbicacionDerivada = (dir = {}) => ({
     distrito_gps: typeof dir.district === 'string' && dir.district.trim() ? dir.district.trim() : '',
@@ -1315,7 +1339,7 @@ export default function FormularioActivacion({
           }
           if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) return;
 
-          const ciudadGps = resolverCiudadDesdeDireccion(direccionGps) || resolverCiudadKey(usuario?.plaza);
+          const ciudadGps = resolverCiudadDesdeDireccion(direccionGps);
           const ubicacionDerivada = extraerUbicacionDerivada(direccionGps);
           if (!ciudadGps) {
             if (!silent) {
@@ -1357,25 +1381,37 @@ export default function FormularioActivacion({
     })();
     gpsSolicitudRef.current = solicitud;
     return solicitud;
-  }, [esSesionFormularioActual, usuario?.plaza]);
+  }, [esSesionFormularioActual, resolverCiudadDesdeDireccion]);
 
   // Auto-set de datos provenientes del usuario y fecha actual
   useEffect(() => {
     const hoy = fechaBolivia();
-    const ciudadUsuario = resolverCiudadKey(usuario?.plaza);
     const nombreUsuario = normalizarNombreVisible(usuario?.nombre || '');
     setFormulario(prev => ({
       ...prev,
       fecha_activacion: prev.fecha_activacion || hoy,
       impulsador: prev.impulsador || nombreUsuario || '',
-      ciudad_activacion: prev.ciudad_activacion || (!isConnected ? ciudadUsuario : '') || '',
     }));
-  }, [isConnected, usuario]);
+  }, [usuario]);
 
   useEffect(() => {
-    if (activacionGuardada || tieneCoordenadasValidas(formulario)) return;
+    if (isConnected !== false && !catalogoCiudadesDisponible) return;
+    if (
+      activacionGuardada
+      || tieneCoordenadasValidas({
+        latitud: formulario.latitud,
+        longitud: formulario.longitud,
+      })
+    ) return;
     detectarCiudadPorGps({ silent: true });
-  }, [activacionGuardada, detectarCiudadPorGps, formulario.latitud, formulario.longitud]);
+  }, [
+    activacionGuardada,
+    catalogoCiudadesDisponible,
+    detectarCiudadPorGps,
+    formulario.latitud,
+    formulario.longitud,
+    isConnected,
+  ]);
 
   const asociarOriginalPersistente = async ({ originalUri, fieldName, sesionFormulario, propietarioFormulario, marcarOriginalComoPropio }) => {
     if (!esSesionFormularioActual(sesionFormulario, propietarioFormulario)) {
@@ -1818,9 +1854,7 @@ export default function FormularioActivacion({
     if (!data.tipo_grupo) return 'Selecciona el tipo de activación (Tiendas de Barrio, Comercio, Transeúnte o Cliente antiguo).';
     if (!data.tipo_activacion) return 'Selecciona el tipo de activación específico.';
     if (obligatorios.ciudad_activacion && !data.ciudad_activacion) {
-      return isConnected === false
-        ? 'Selecciona la ciudad de activación.'
-        : 'No se pudo detectar la ciudad por GPS. Pulsa "Actualizar ubicación".';
+      return 'Selecciona la ciudad de activación.';
     }
     if (obligatorios.zona_activacion && !data.zona_activacion) return 'Selecciona la zona de activación.';
     if (!impulsadorActual) return 'No se pudo obtener el nombre del activador.';
@@ -2115,9 +2149,6 @@ export default function FormularioActivacion({
         ...formularioInicial,
         id: '',
         impulsador: normalizarNombreVisible(usuario?.nombre || ''),
-        ciudad_activacion: isConnected === false
-          ? resolverCiudadKey(usuario?.plaza)
-          : formularioConBasicos.ciudad_activacion,
       };
       // Guardado correcto: el borrador ya no se necesita.
       // eliminarBorrador solo se ejecuta si guardarFormularioLocal no lanzó.
@@ -2275,56 +2306,53 @@ export default function FormularioActivacion({
 
         <View style={[styles.card, styles.compactCard]}>
           <Text style={styles.sectionTitle}>Ubicación</Text>
-          {isConnected === false ? (
+          <Text style={styles.locationStatus}>
+            {detectandoCiudad
+              ? 'Detectando ubicación...'
+              : isConnected === false
+                ? 'Ubicación guardada para modo offline'
+                : ciudadLabel
+                  ? 'Ubicación obtenida'
+                  : 'Selecciona una ciudad o actualiza la ubicación'}
+          </Text>
+          {renderEtiquetaCampo('Ciudad de Activación', camposObligatorios.ciudad_activacion)}
+          <SelectorRN
+            selectedValue={formulario.ciudad_activacion}
+            onValueChange={(v) => {
+              ciudadManualRef.current = true;
+              setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' }));
+            }}
+            style={styles.picker}
+            options={[
+              { label: 'Seleccionar...', value: '' },
+              ...opcionesCiudad,
+            ]}
+          />
+          {isConnected !== false && (
             <>
-              <Text style={styles.locationStatus}>Ubicación guardada para modo offline</Text>
-              {renderEtiquetaCampo('Ciudad de Activación', camposObligatorios.ciudad_activacion)}
-              <SelectorRN
-                selectedValue={formulario.ciudad_activacion}
-                onValueChange={(v) => { ciudadManualRef.current = true; setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' })); }}
-                style={styles.picker}
-                options={[
-                  { label: 'Seleccionar...', value: '' },
-                  ...CIUDADES.map((item) => ({ label: item.label, value: item.key })),
-                ]}
-              />
-            </>
-          ) : (
-            <>
-              <Text style={styles.locationStatus}>
-                {detectandoCiudad
-                  ? 'Detectando ubicación...'
-                  : ciudadLabel
-                    ? 'Ubicación obtenida'
-                    : 'No se pudo obtener ubicación'}
-              </Text>
-              {!!ciudadLabel && (
-                <View style={styles.locationSummary}>
-                  <Text style={styles.helperLabel}>
-                    Ciudad detectada
-                    {camposObligatorios.ciudad_activacion ? <Text style={styles.requiredMark}> *</Text> : null}
-                  </Text>
-                  <Text style={styles.helperValue}>{ciudadLabel}</Text>
-                </View>
-              )}
-              {zonasDisponibles.length === 1 && !!formulario.zona_activacion && (
-                <View style={styles.locationSummary}>
-                  <Text style={styles.helperLabel}>
-                    Zona detectada
-                    {camposObligatorios.zona_activacion ? <Text style={styles.requiredMark}> *</Text> : null}
-                  </Text>
-                  <Text style={styles.helperValue}>{formulario.zona_activacion}</Text>
-                </View>
-              )}
               <TouchableOpacity
-                style={[styles.gpsButton, detectandoCiudad && styles.botonDisabled]}
+                style={[
+                  styles.gpsButton,
+                  (detectandoCiudad || !catalogoCiudadesDisponible) && styles.botonDisabled,
+                ]}
                 onPress={() => detectarCiudadPorGps()}
-                disabled={detectandoCiudad}
+                disabled={detectandoCiudad || !catalogoCiudadesDisponible}
                 activeOpacity={0.85}
               >
-                {detectandoCiudad ? <ActivityIndicator size="small" color="#FFFFFF" /> : <Text style={styles.gpsButtonText}>Actualizar ubicación</Text>}
+                {detectandoCiudad
+                  ? <ActivityIndicator size="small" color="#FFFFFF" />
+                  : <Text style={styles.gpsButtonText}>{catalogoCiudadesDisponible ? 'Actualizar ubicación' : 'Cargando ciudades...'}</Text>}
               </TouchableOpacity>
             </>
+          )}
+          {zonasDisponibles.length === 1 && !!formulario.zona_activacion && (
+            <View style={styles.locationSummary}>
+              <Text style={styles.helperLabel}>
+                Zona detectada
+                {camposObligatorios.zona_activacion ? <Text style={styles.requiredMark}> *</Text> : null}
+              </Text>
+              <Text style={styles.helperValue}>{formulario.zona_activacion}</Text>
+            </View>
           )}
         </View>
 
@@ -2464,6 +2492,17 @@ export default function FormularioActivacion({
                 { label: 'Seleccionar...', value: '' },
                 ...zonasDisponibles.map((zona) => ({ label: zona, value: zona })),
               ]}
+            />
+          </>
+        )}
+        {!!formulario.ciudad_activacion && zonasDisponibles.length === 0 && (
+          <>
+            {renderEtiquetaCampo('Zona de Activación', camposObligatorios.zona_activacion)}
+            <TextInput
+              style={styles.input}
+              value={formulario.zona_activacion}
+              onChangeText={(v) => actualizarCampo('zona_activacion', v)}
+              placeholder="Ingresa la zona"
             />
           </>
         )}
