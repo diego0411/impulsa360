@@ -36,7 +36,12 @@ import {
   puedeReducirImagenGaleria,
   reducirImagenGaleria,
 } from '../lib/galleryImageDownsampler';
-import { deduplicarPlazasPorEtiqueta, etiquetaPlaza, tienePlazaValida } from '../lib/plazas';
+import {
+  etiquetaPlaza,
+  filtrarPlazasTemporalesAutorizadas,
+  tienePlazaValida,
+  validarPlazaAutorizada,
+} from '../lib/plazas';
 import { withTimeout } from '../lib/asyncTimeout';
 import {
   esFalloTransitorioElegibilidad,
@@ -437,6 +442,11 @@ const resolverCiudadKey = (valor = '') => {
     aliases.some((alias) => normalizarCiudad(alias) === normalized)
   ))?.[0] || '';
 };
+
+const etiquetaCiudadHistorica = (valor = '') => String(valor)
+  .trim()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ');
 
 const formularioInicial = {
   tipo_grupo: '',
@@ -1074,16 +1084,26 @@ export default function FormularioActivacion({
           : [];
 
   const catalogoCiudadesDisponible = Array.isArray(ciudadesCatalogo) && ciudadesCatalogo.length > 0;
+  const ciudadCatalogoEquivalente = useMemo(() => (
+    catalogoCiudadesDisponible
+      ? resolverCiudadGps(formulario.ciudad_activacion, ciudadesCatalogo)
+      : null
+  ), [catalogoCiudadesDisponible, ciudadesCatalogo, formulario.ciudad_activacion]);
+  const valorCiudadSelector = ciudadCatalogoEquivalente?.nombre
+    || (!catalogoCiudadesDisponible ? resolverCiudadKey(formulario.ciudad_activacion) : '')
+    || formulario.ciudad_activacion;
   const opcionesCiudad = useMemo(() => {
     const opciones = catalogoCiudadesDisponible
       ? ciudadesCatalogo.map((ciudad) => ({ label: ciudad.nombre, value: ciudad.nombre }))
       : CIUDADES.map((ciudad) => ({ label: ciudad.label, value: ciudad.key }));
-    const valorActual = formulario.ciudad_activacion;
-    if (valorActual && !opciones.some((opcion) => opcion.value === valorActual)) {
-      return [{ label: valorActual, value: valorActual }, ...opciones];
+    if (valorCiudadSelector && !opciones.some((opcion) => opcion.value === valorCiudadSelector)) {
+      return [{
+        label: etiquetaCiudadHistorica(formulario.ciudad_activacion),
+        value: formulario.ciudad_activacion,
+      }, ...opciones];
     }
     return opciones;
-  }, [catalogoCiudadesDisponible, ciudadesCatalogo, formulario.ciudad_activacion]);
+  }, [catalogoCiudadesDisponible, ciudadesCatalogo, formulario.ciudad_activacion, valorCiudadSelector]);
   const ciudadSeleccionada = useMemo(
     () => CIUDADES.find(c => c.key === resolverCiudadKey(formulario.ciudad_activacion)) || null,
     [formulario.ciudad_activacion],
@@ -1092,9 +1112,9 @@ export default function FormularioActivacion({
     () => ciudadSeleccionada?.zonas || [],
     [ciudadSeleccionada],
   );
-  const ciudadLabel = opcionesCiudad.find((opcion) => opcion.value === formulario.ciudad_activacion)?.label
+  const ciudadLabel = opcionesCiudad.find((opcion) => opcion.value === valorCiudadSelector)?.label
     || ciudadSeleccionada?.label
-    || formulario.ciudad_activacion
+    || etiquetaCiudadHistorica(formulario.ciudad_activacion)
     || '';
 
   useEffect(() => {
@@ -1150,26 +1170,27 @@ export default function FormularioActivacion({
     () => Array.isArray(usuario?.plazas_temporales) ? usuario.plazas_temporales : [],
     [usuario?.plazas_temporales],
   );
-  const plazasTemporalesVisibles = useMemo(
-    () => deduplicarPlazasPorEtiqueta(plazasTemporales),
-    [plazasTemporales],
-  );
-  const plazaBaseLabel = enmascararMarcaVisible(etiquetaPlaza(usuario?.plaza, 'No especificada'), usuario);
   const plazaBaseValor = tienePlazaValida(usuario?.plaza) ? usuario.plaza : null;
-  const plazaTemporalSeleccionada = plazasTemporales.find(
+  const plazaBaseLabel = enmascararMarcaVisible(etiquetaPlaza(plazaBaseValor, 'Sin autorización'), usuario);
+  const plazasTemporalesVisibles = useMemo(
+    () => filtrarPlazasTemporalesAutorizadas(plazasTemporales, plazaBaseValor),
+    [plazaBaseValor, plazasTemporales],
+  );
+  const plazaTemporalSeleccionada = plazasTemporalesVisibles.find(
     (item) => item?.nombre === formulario.plaza_temporal,
   );
   const plazaSeleccionada = formulario.es_plaza_temporal && plazaTemporalSeleccionada
     ? `temporal:${plazaTemporalSeleccionada.id}`
-    : 'base';
+    : plazaBaseValor ? 'base' : '';
 
   const onPlazaChange = (value) => {
     if (value === 'base') {
+      if (!plazaBaseValor) return;
       setFormulario((prev) => ({ ...prev, es_plaza_temporal: false, plaza_temporal: null }));
       return;
     }
     const plazaId = String(value).replace(/^temporal:/, '');
-    const plaza = plazasTemporales.find((item) => item?.id === plazaId);
+    const plaza = plazasTemporalesVisibles.find((item) => item?.id === plazaId);
     if (!plaza) return;
     setFormulario((prev) => ({ ...prev, es_plaza_temporal: true, plaza_temporal: plaza.nombre }));
   };
@@ -1884,7 +1905,13 @@ export default function FormularioActivacion({
     if (obligatorios.comercio_fuera_mercado && data.comercio_fuera_mercado === null) return 'Indica si el comercio está fuera del mercado.';
     if (obligatorios.tipo_error && !data.tipo_error) return 'Selecciona el tipo de error.';
     if (obligatorios.descripcion_error && !textoSeguro(data.descripcion_error).trim()) return 'Describe el error.';
-    if (data.es_plaza_temporal && !plazasTemporales.some((item) => item?.nombre === data.plaza_temporal)) return 'La plaza temporal seleccionada no está autorizada.';
+    const errorPlaza = validarPlazaAutorizada({
+      plazaBase: plazaBaseValor,
+      plazasTemporales,
+      esPlazaTemporal: data.es_plaza_temporal,
+      plazaTemporal: data.plaza_temporal,
+    });
+    if (errorPlaza) return errorPlaza;
 
     if (!data.fecha_activacion) {
       return 'No se pudo obtener la fecha de activación.';
@@ -2317,7 +2344,7 @@ export default function FormularioActivacion({
           </Text>
           {renderEtiquetaCampo('Ciudad de Activación', camposObligatorios.ciudad_activacion)}
           <SelectorRN
-            selectedValue={formulario.ciudad_activacion}
+            selectedValue={valorCiudadSelector}
             onValueChange={(v) => {
               ciudadManualRef.current = true;
               setFormulario((prev) => ({ ...prev, ciudad_activacion: v, zona_activacion: '' }));
@@ -2508,7 +2535,11 @@ export default function FormularioActivacion({
         )}
         <>
           <Text style={styles.label}>Ubicación de Interés (Eventos)</Text>
-          {plazasTemporalesVisibles.length === 0 ? (
+          {!plazaBaseValor && plazasTemporalesVisibles.length === 0 ? (
+              <View style={styles.fixedPlaza}>
+                <Text style={styles.fixedPlazaText}>Sin plaza autorizada</Text>
+              </View>
+            ) : plazasTemporalesVisibles.length === 0 ? (
               <View style={styles.fixedPlaza}>
                 <Text style={styles.plazaTag}>Base</Text>
                 <Text style={styles.fixedPlazaText}>{plazaBaseLabel}</Text>
@@ -2519,7 +2550,7 @@ export default function FormularioActivacion({
                 onValueChange={onPlazaChange}
                 style={styles.picker}
                 options={[
-                  { label: `Base · ${plazaBaseLabel}`, value: 'base' },
+                  ...(plazaBaseValor ? [{ label: `Base · ${plazaBaseLabel}`, value: 'base' }] : []),
                   ...plazasTemporalesVisibles.map((plaza) => ({
                     label: `Temporal · ${enmascararMarcaVisible(plaza.nombre_legible || etiquetaPlaza(plaza.nombre, plaza.nombre), usuario)}`,
                     value: `temporal:${plaza.id}`,

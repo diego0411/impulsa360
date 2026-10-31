@@ -38,6 +38,11 @@ import {
   puedeConsultarHistorialRemoto,
 } from '../lib/historialActivaciones';
 import { resolverLecturaPendientes } from '../lib/offlineSafety';
+import {
+  booleanPretty,
+  resolverGrupoActivacion,
+  resolverIndicadorReactivacion,
+} from '../lib/detalleActivacion';
 
 const PAGE_SIZE = 20;
 const QUERY_TIMEOUT_MS = 10000;
@@ -1022,8 +1027,10 @@ export default function FormulariosPorImpulsador({
 
                 {/* Campos principales */}
                 {renderCampo('Fecha', (detalle.fecha_activacion || detalle.creado_en || detalle.created_at || '').toString().slice(0,10))}
+                {renderCampo('Grupo de activación', resolverGrupoActivacion(detalle) || '—')}
                 {renderCampo('Tipo de activación', detalle.tipo_activacion, usuario)}
-                {renderCampo('Reactivación comercio', booleanPretty(!!detalle.es_reactivacion || !!detalle.reactivacion_comercio))}
+                {renderCampo('Reactivación', booleanPretty(resolverIndicadorReactivacion(detalle)))}
+                {renderCampo('Base de activación', detalle.base_activacion, usuario)}
                 {renderCampo('Tipo de comercio', detalle.tipo_comercio, usuario)}
                 {renderCampo('Tamaño de tienda', detalle.tamano_tienda, usuario)}
                 {renderCampo('Tipo de tienda', detalle.tipo_tienda, usuario)}
@@ -1035,6 +1042,7 @@ export default function FormulariosPorImpulsador({
                 {renderCampo('Teléfono', detalle.telefono_cliente, usuario)}
                 {renderCampo('Email', detalle.email_cliente, usuario)}
                 {renderCampo('Plaza', etiquetaPlaza(detalle.plaza), usuario)}
+                {renderCampo('Es plaza temporal', detalle.es_plaza_temporal == null ? null : booleanPretty(detalle.es_plaza_temporal))}
                 {renderCampo('Plaza temporal', detalle.es_plaza_temporal ? etiquetaPlaza(detalle.plaza_temporal) : null, usuario)}
                 {renderCampo('Impulsador', detalle.impulsador, usuario)}
 
@@ -1046,11 +1054,17 @@ export default function FormulariosPorImpulsador({
                 {renderCampo('P2P', booleanPretty(detalle.p2p))}
                 {renderCampo('QR físico', booleanPretty(detalle.qr_fisico))}
                 {renderCampo('Respaldo', booleanPretty(detalle.respaldo))}
+                {renderCampo('Créditos', booleanPretty(detalle.creditos))}
+                {renderCampo('Remesas', booleanPretty(detalle.remesas))}
                 {renderCampo('¿Hubo error?', booleanPretty(detalle.hubo_error))}
                 {!!detalle.hubo_error && renderCampo('Tipo de error', detalle.tipo_error, usuario)}
                 {!!detalle.hubo_error && renderCampo('Descripción de error', detalle.descripcion_error, usuario)}
 
                 {/* Ubicación */}
+                {renderCampo('Ciudad de activación', detalle.ciudad_activacion, usuario)}
+                {renderCampo('Zona de activación', detalle.zona_activacion, usuario)}
+                {renderCampo('Distrito GPS', detalle.distrito_gps, usuario)}
+                {renderCampo('Región GPS', detalle.region_gps, usuario)}
                 {(detalle.latitud || detalle.longitud) && renderCampo('Ubicación', `${detalle.latitud ?? '—'}, ${detalle.longitud ?? '—'}`)}
               </ScrollView>
             ) : (
@@ -1084,10 +1098,6 @@ function renderCampo(label, value, usuario) {
     </View>
   );
 }
-function booleanPretty(v) {
-  return v === true ? 'Sí' : v === false ? 'No' : '—';
-}
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,

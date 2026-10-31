@@ -17,6 +17,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { supabase } from '../lib/supabase';
 import { normalizarNombreVisible } from '../lib/identity';
 import { obtenerPlazasTemporales } from '../lib/plazasTemporales';
+import { resolverPlazaBaseAutorizada } from '../lib/plazas';
 import { withTimeout, isTimeoutError } from '../lib/asyncTimeout';
 import { enmascararMarcaVisible } from '../lib/brandMask';
 import { secureLocalStorage } from '../lib/secureLocalStorage';
@@ -521,14 +522,13 @@ export default function AuthScreen({ onLogin }) {
       const nombrePerfil = normalizarNombreVisible(perfil?.nombre || '');
       const nombreCache = normalizarNombreVisible(usuarioCache?.nombre || '');
       const nombreMetadata = normalizarNombreVisible(usuario.user_metadata?.nombre || '');
-      const plazaPerfil = normalizarNombreVisible(perfil?.plaza || '');
-      const plazaCache = normalizarNombreVisible(usuarioCache?.plaza || '');
+      const plazaPerfil = resolverPlazaBaseAutorizada(perfil);
 
       const usuarioFinal = {
         id: usuario.id,
         email: usuario.email,
         nombre: nombrePerfil || nombreCache || nombreMetadata || usuario.email,
-        plaza: plazaPerfil || plazaCache || 'No especificada',
+        plaza: plazaPerfil || 'No especificada',
         plazas_temporales: plazasTemporales,
         rol: rolPrincipal,
         ...estadoRoles.camposUsuario,

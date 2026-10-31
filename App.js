@@ -24,7 +24,7 @@ import { leerRegistroSeguro, secureLocalStorage } from './lib/secureLocalStorage
 import { colors, spacing, fontSizes } from './styles/theme';
 import { normalizarNombreVisible } from './lib/identity';
 import { enmascararMarcaVisible } from './lib/brandMask';
-import { tienePlazaValida } from './lib/plazas';
+import { resolverPlazaBaseAutorizada, tienePlazaValida } from './lib/plazas';
 import { obtenerPlazasTemporales } from './lib/plazasTemporales';
 import { withTimeout } from './lib/asyncTimeout';
 import { requiereValidacionReactivacion, validarElegibilidadReactivacion } from './lib/elegibilidadReactivacion';
@@ -76,7 +76,10 @@ import {
 } from './lib/offlineSafety';
 import { encontrarFotoHistoricaSegura } from './lib/historicalPhotoSelection';
 import { asegurarUuidActivacionPersistido } from './lib/activationUuid';
-import { construirPayloadSincronizacionActivacion } from './lib/activationRecord';
+import {
+  completarIdentidadSincronizacion,
+  construirPayloadSincronizacionActivacion,
+} from './lib/activationRecord';
 import {
   leerCatalogoUbicacionesCache,
   obtenerCatalogoUbicaciones,
@@ -1049,10 +1052,12 @@ function AppShell() {
         const nombreImpulsador = normalizarNombreVisible(usuario?.nombre || '');
         const plazaFallback = tienePlazaValida(usuario?.plaza) ? usuario.plaza : null;
         const datosConUsuario = {
-          ...payload,
+          ...completarIdentidadSincronizacion(payload, {
+            ownerId,
+            nombreImpulsador,
+            email: usuario?.email,
+          }),
           id: recordId,
-          usuario_id: ownerId,
-          impulsador: payload.impulsador || nombreImpulsador || usuario?.email || '',
           plaza: payload.plaza || plazaFallback,
           estado_sync: 'online',
         };
@@ -1314,8 +1319,7 @@ function AppShell() {
         const nombrePerfil = normalizarNombreVisible(perfil.nombre || '');
         const nombreCache = normalizarNombreVisible(cacheMismoUsuario?.nombre || '');
         const nombreMetadata = normalizarNombreVisible(user.user_metadata?.nombre || '');
-        const plazaPerfil = normalizarNombreVisible(perfil.plaza || '');
-        const plazaCache = normalizarNombreVisible(cacheMismoUsuario?.plaza || '');
+        const plazaPerfil = resolverPlazaBaseAutorizada(perfil);
         const plazasTemporales = await obtenerPlazasTemporales({
           activadorId: perfil.usuario_id,
           usuarioId: user.id,
@@ -1359,7 +1363,7 @@ function AppShell() {
           id: user.id,
           email: user.email,
           nombre: nombrePerfil || nombreCache || nombreMetadata || user.email,
-          plaza: plazaPerfil || plazaCache || 'No especificada',
+          plaza: plazaPerfil || 'No especificada',
           plazas_temporales: plazasTemporales,
           rol: rolPrincipal,
           ...estadoRoles.camposUsuario,
